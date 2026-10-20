@@ -1,0 +1,23 @@
+# Рабочая машина — Windows, целевые системы узлов — Linux.
+# Без этих правил autocrlf ломает скрипты на узле (shebang с \r не исполняется).
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.go text eol=lf
+*.sql text eol=lf
+*.tf text eol=lf
+*.tpl text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+*.md text eol=lf
+
+# Бинарные и ключевые артефакты — не трогаем
+*.png binary
+*.jpg binary
+*.gz binary
+*.wintun binary
+*.exe binary
+*.dll binary
+*.mobileprovision binary
