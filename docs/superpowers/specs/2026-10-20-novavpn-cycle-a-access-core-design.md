@@ -128,14 +128,35 @@ Answer `desired`:
 
 ### 4.2 Применение: diff, а не full replace
 
-Агент читает текущее состояние через `wgctrl-go`, сравнивает с desired и выполняет только отличия. Причина не в эффективности, а в корректности: `wg setconf` семантически сбрасывает набор пиеров, и полная перезапись конфига на каждой синхронизации обрывала бы handshake у всех живых клиентов каждые 30 секунд.
+Закрыто измерениями S3 (2026-10-20): [ADR-004](../../adr/0004-wireguard-peer-apply.md), журнал —
+[docs/spikes/2026-10-20-s1-s3-wireguard-netlink.md](../../spikes/2026-10-20-s1-s3-wireguard-netlink.md).
 
-Удаление одиночного пиера — вопрос, который нельзя закрыть словами «сделаем как syncconf». В WireGuard netlink удаление выражается операцией `peer … remove` (как в `wg(8)`), но у `wgctrl-go` публичный API — `SetDevice` с флагом `ReplacePeers`. Поэтому:
+Факт, который определил дизайн: `ConfigureDevice(ReplacePeers=true)` **пересоздаёт каждого
+пиера**, даже когда отправленная конфигурация байт-в-байт совпадает с живой. В A/B-прогоне
+неизменённый пиер, несущий непрерывный трафик, переподключался в 12/12 циклов, а его
+счётчики rx/tx откатывались назад в 4/12. Тот же цикл per-peer операциями — 0/12
+переподключений и монотонные счётчики. Потерь ICMP не было ни в одном режиме, поэтому
+аргумент против full replace не «обрыв соединения», а handshake-церемониал на каждом цикле
+и уничтожение байтовой телеметрии, на которой держатся ADR-006 и «распределение нагрузки»
+из ТЗ §9.
 
-- **S3 (spike, обязательный до имплементации provisioner):** измерить, сохраняет ли `SetDevice(ReplacePeers=true)` для не изменённых пиеров их handshake-состояние, и умеет ли выбранная версия библиотеки удалять одного пиера без касания остальных.
-- Если нет — агент уходит на прямой `genetlink` (`golang.org/x/sys/unix`) с операциями `WG_CMD_NEW_DEVICE`/per-peer attributes, то есть ровно то, что делает `wg syncconf`. Фоллбэк предусмотрен в дизайне, а не «разберёмся в процессе».
+Правила `provisioner` (полная формулировка — в ADR-004):
 
-Решение по исходу S3 фиксируется как ADR-004 до написания provisioner.
+- `Config.ReplacePeers` — всегда `false`, включая первое применение: пустое live-множество
+  означает, что дельта равна всему desired, и пиеры добавляются per-peer операциями.
+- Сравнение desired↔live по нормализованным полям пиера (публичный ключ, endpoint,
+  множество allowed-IP, persistent-keepalive). Совпавший пиер в netlink не отправляется.
+- Отзыв — `PeerConfig{PublicKey: …, Remove: true}`. Измерено: набор 2 → 1 за ~0.5 мс,
+  соседний пиер сохраняет handshake и счётчики, маршрут до отозванного адреса
+  становится недоступен немедленно (`Destination Host Unreachable`), повторная выдача
+  восстанавливает связность в том же цикле.
+- Счётчики снимаются **до** применения изменений: пересоздание пиера обнуляет rx/tx в ядре.
+
+WireGuard-устройство создаётся через rtnetlink (`ip link add dev wg0 type wireguard`) —
+в зафиксированной версии `wgctrl` нет `AddDevice`. Прямой `genetlink` не нужен: фоллбэк,
+заложенный в предыдущей редакции этого раздела, снят по итогам S3, потому что библиотека
+умеет и штучное удаление, и штучное обновление (`Remove`, `UpdateOnly`, `ReplaceAllowedIPs`),
+и по поведению совпадает с `wg(8)`.
 
 ### 4.3 Тайминги и поведение при отказах
 
@@ -307,19 +328,23 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 
 | # | Вопрос | Исход | Блокирует |
 |---|---|---|---|
-| S1 | Догрузка `wireguard` в привилегированном контейнере Docker Desktop и рабочий netlink-контур | доказано на уровне ядра (модуль есть); подтверждается при первой сборке harness | provisioner, E2E |
+| S1 | Догрузка `wireguard` в привилегированном контейнере Docker Desktop и рабочий netlink-контур | **выполнен 2026-10-20.** `--privileged` не нужен: хватает `CAP_NET_ADMIN`; `/dev/net/tun` не требуется; `wgctrl` из контейнера работает. Загрузка модуля остаётся root-шагом на хосте. Журнал S1/S3 | provisioner, E2E — **разблокировано** |
 | S2 | unbound в контейнере + корректность harness для детекта off-tunnel DNS | ADR-005 | DNS-часть E2E |
-| S3 | Сохраняет ли `SetDevice(ReplacePeers=true)` handshake неизменённых пиеров; умеет ли `wgctrl-go` удалять одного пиера | ADR-004: wgctrl-go или прямой genetlink | provisioner |
+| S3 | Сохраняет ли `SetDevice(ReplacePeers=true)` handshake неизменённых пиеров; умеет ли `wgctrl-go` удалять одного пиера | **выполнен 2026-10-20.** Нет — full replace пересоздаёт всех (12/12 переподключений неизменённого пиера, откат счётчиков). Да — `PeerConfig.Remove` удаляет штучно. ADR-004 принят: `wgctrl-go` + diff-apply, фоллбэк в прямой `genetlink` снят | provisioner — **разблокирован** |
 | S4 | Механизм установки туннеля и kill switch на Windows (WFP-сервис / WNA / официальная служба) | ADR-008 | цикл E |
 | S5 | Восстановление denylist после потери Redis | процедура + ADR-003 | release-критерий |
 
-S3 — не косметика: если full replace сбрасывает handshake, «отзыв за 30 с» превращается в «все клиенты переподключаются каждые 30 с», и это надо обнаружить до написания половины агента.
+Страх, из-за которого S3 был обязательным, подтвердился частично: full replace действительно
+сбрасывает состояние всех пиеров каждые 30 с, но это не обрыв трафика (потерь ICMP не
+замерено), а потеря handshake-состояния и счётчиков. Опаснее второго оказалось первое для
+телеметрии, поэтому правило «снимать счётчики до применения» вошло в ADR-004, а не осталось
+наблюдением.
 
 ---
 
 ## 11. Развёртывание и эксплуатация (ТЗ §15)
 
-- `infrastructure/docker/docker-compose.dev.yml`: `postgres:17`, `redis:7`, `api`, `node-agent` (privileged, `NET_ADMIN`+`NET_RAW`, загрузка модуля), `client`, `probe`.
+- `infrastructure/docker/docker-compose.dev.yml`: `postgres:17`, `redis:7`, `api`, `node-agent` (`cap_add: [NET_ADMIN, NET_RAW]`, **без** `privileged` и **без** `/dev/net/tun` — проверено S1; загрузка модуля `wireguard` остаётся шагом хоста), `client`, `probe`.
 - `Dockerfile.api`, `Dockerfile.node-agent`: многоэтапная сборка, финальный статический исполняемый файл, distroless-подобная база, non-root user.
 - `infrastructure/ansible/roles/novavpn_node`: `wireguard-tools`, `unbound`, агент как systemd-юнит с bounding set capabilities (не root), `sysctl.d` drop-in для `ip_forward`, MASQUERADE в **отдельной nftables table**, а не правкой чужого ruleset; `0600` на ключ; пред-выгрузка состояния (`iptables-save`/`nft list ruleset`, маршруты, интерфейсы) и **авто-откат по таймеру**, если SSH не восстанавливается. `sysctl` и `modprobe wireguard` требуют root — это отдельный, единственный шаг с повышенными правами.
 - `infrastructure/ansible/roles/unbound`: `log-queries: no`, restricted client CIDR, no-recursion извне.
@@ -370,7 +395,7 @@ apps/                            # появляется в C/E: web, admin, desk
 | 001 | Модульный монолит + отдельный процесс агента | микросервисы (запрет ТЗ §10 без необходимости) |
 | 002 | Pull-синхронизация desired set, diff-apply, отзыв ≤ 30 с | push на агент (нужен ingress + TLS на каждом узле, больше поверхность); рендер `.conf` + SSH-деплой (нет живых метрик, медленный отзыв) |
 | 003 | Access-JWT + denylist в Redis + durable отзыв семьи refresh | opaque-токены на всё (каждый запрос → хранилище, хуже масштабирование ТЗ §13) |
-| 004 | netlink diff-apply с удалением одиночного пиера | `wg syncconf` через subprocess (shell из управляющего кода против духа ТЗ §5); full replace каждый цикл (обрывы handshake) |
+| 004 | [netlink diff-apply через `wgctrl-go`](../../adr/0004-wireguard-peer-apply.md): `ReplacePeers` запрещён, отзыв — `PeerConfig.Remove`, счётчики снимаются до применения. Подтверждено S3 | прямой `genetlink` (не нужен: библиотека умеет штучные операции, измерено); `wg syncconf` через subprocess (shell из управляющего кода против ТЗ §5); full replace каждый цикл (пересоздаёт пиеров, теряет handshake и счётчики) |
 | 005 | unbound-рекурсор на узле, `log-queries: no` | DoT-форвардинг (внешняя зависимость, first-hop задержка); публичные резолверы (QNAME третьей стороне) |
 | 006 | Агрегат байт на устройство-сутки, пер-пиерные счётчики — только в Redis с TTL | счётчики на профиль/сессию (пары «время+объём» сопоставимы с трассами на выходе); полный отказ от байт-данных (ломает ТЗ §9 «распределение нагрузки») |
 | 007 | Отключение IPv6 на клиенте (A) → опционально ULA + NAT66 позже | `::/0` без адреса = тихий blackhole, невозможно диагностировать |
@@ -380,4 +405,4 @@ apps/                            # появляется в C/E: web, admin, desk
 
 ## 15. Следующий шаг
 
-Спецификация фиксируется в репозитории, после вашего ревью — `superpowers:writing-plans` и декомпозиция A в план имплементации с чек-пойнтами: `S1/S3 spikes → migrations + sqlc → auth/devices/entitlements → desired-set + nodeapi → provisioner/collector → agent → harness + E2E → Ansible роль → CI → docs`.
+Спецификация фиксируется в репозитории, S1 и S3 закрыты 2026-10-20, provisioner разблокирован. Дальше — `superpowers:writing-plans` и декомпозиция A в план имплементации с чек-пойнтами: `(S1/S3 — сделано) → migrations + sqlc → auth/devices/entitlements → desired-set + nodeapi → provisioner/collector → agent → harness + E2E → Ansible роль → CI → docs`.
