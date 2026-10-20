@@ -1,0 +1,48 @@
+# Рабочие файлы агента и дампы источников ТЗ
+.scratch/
+
+# Секреты и локальное окружение (§15: не включать приватные ключи, токены, пароли)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+id_ed25519*
+secrets/
+infrastructure/ansible/*.retry
+
+# Приватные ключи WireGuard, создаваемые узлом локально
+etc_priv/
+*.wgkey
+node_private_key
+
+# Артефакты сборки
+/services/api/bin/
+/services/node-agent/bin/
+/dist/
+/build/
+*.exe
+
+# Go
+/vendor/
+coverage.out
+*.test
+
+# Node / фронтенд (появится в цикле C)
+node_modules/
+apps/web/dist/
+apps/admin/dist/
+
+# Превью и локальные данные БД
+/pgdata/
+/redis-data/
+*.sqlite
+*.db
+
+# Редакторы и ОС
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
