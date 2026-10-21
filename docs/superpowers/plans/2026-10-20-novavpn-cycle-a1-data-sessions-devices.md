@@ -739,13 +739,16 @@ CREATE UNIQUE INDEX profiles_one_active_per_device_server
 
 CREATE TABLE tunnel_addresses (
     server_id    uuid NOT NULL REFERENCES vpn_servers(id) ON DELETE CASCADE,
-    address      inet PRIMARY KEY,
+    address      inet NOT NULL,
+    -- Первичный ключ — пара (сервер, адрес), а не адрес: пулы разных серверов могут
+    -- совпадать, и один и тот же адрес в двух пулах — норма (спецификация §6).
     -- Назначение хранится здесь, чтобы аллокация шла под блокировкой строки сервера:
     -- коллизия адреса невозможна конструктивно (спецификация §6).
     allocated_to uuid REFERENCES vpn_profiles(id) ON DELETE SET NULL,
     -- Освобождается не сразу, а по истечении окна переиспользования (§7.2).
     released_at  timestamptz,
     reusable_at  timestamptz,
+    PRIMARY KEY (server_id, address),
     CONSTRAINT addresses_window CHECK (released_at IS NULL OR reusable_at IS NULL
                                        OR reusable_at >= released_at)
 );
@@ -785,6 +788,12 @@ INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, pu
 VALUES ('00000000-0000-4000-8000-000000000f02', '00000000-0000-4000-8000-000000000f01',
         'nl-ams-1', 'nl-ams-1.novavpn.example', 51820,
         'wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iA=', '10.99.7.0/24', 'example-hosting');
+-- второй узел в той же локации и с тем же пулом: нужен для блока (d)
+INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, public_key,
+                         address_pool_v4, provider)
+VALUES ('00000000-0000-4000-8000-000000000f0a', '00000000-0000-4000-8000-000000000f01',
+        'nl-ams-2', 'nl-ams-2.novavpn.example', 51820,
+        'qTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iB=', '10.99.7.0/24', 'example-hosting');
 INSERT INTO users (id, email, password_hash)
 VALUES ('00000000-0000-4000-8000-000000000f03', 'seed@novavpn.example',
         '$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0aW9uZQ$aGFzaGFzaGFzaGFzaGFzaGFzaA');
@@ -818,12 +827,16 @@ VALUES ('00000000-0000-4000-8000-000000000f08', '00000000-0000-4000-8000-0000000
         'superseded', 'rotating_old_key');
 ROLLBACK TO c;   -- ← profiles_peer_state
 
--- (d) адрес в tunnel_addresses уникален в пределах сервера (PK), но одинаковый адрес
---     на двух серверах — норма: второй вставкой это и проверяем.
+-- (d) адрес уникален в пределах сервера (PK), но одинаковый адрес на двух серверах — норма:
+--     вторая вставка (другой сервер) обязана пройти, третья (тот же сервер и адрес) — упасть.
 SAVEPOINT d;
 INSERT INTO tunnel_addresses (server_id, address)
 VALUES ('00000000-0000-4000-8000-000000000f02', '10.99.7.42/32');
-ROLLBACK TO d;   -- ← вторая вставка того же (server, address) падает на PRIMARY KEY
+INSERT INTO tunnel_addresses (server_id, address)
+VALUES ('00000000-0000-4000-8000-000000000f0a', '10.99.7.42/32');
+INSERT INTO tunnel_addresses (server_id, address)
+VALUES ('00000000-0000-4000-8000-000000000f02', '10.99.7.42/32');
+ROLLBACK TO d;   -- ← третья вставка того же (server, address) падает на PRIMARY KEY
 
 -- (e) координаты вне диапазона:
 SAVEPOINT e;
@@ -838,8 +851,10 @@ Run: сохранить скрипт в `out/constraints.sql` (каталог и
 ```bash
 # До задачи 5 база — одноразовый контейнер `novavpn-pg-a1` (задача 2, шаг 3);
 # с задачи 5 те же два шага делаются через compose-service `postgres`.
-docker cp out/constraints.sql novavpn-pg-a1:/tmp/constraints.sql
-docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -f /tmp/constraints.sql
+# Флаг MSYS_NO_PATHCONV=1 обязателен обоим командам: без него Git Bash превращает
+# /tmp/constraints.sql в путь Windows, и psql сообщает «No such file or directory».
+MSYS_NO_PATHCONV=1 docker cp out/constraints.sql novavpn-pg-a1:/tmp/constraints.sql
+MSYS_NO_PATHCONV=1 docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -f /tmp/constraints.sql
 ```
 (Без `-v ON_ERROR_STOP=1`: нам нужно увидеть все пять ошибок, а не остановиться на первой.)
 
@@ -847,8 +862,8 @@ Expected: **пять ошибок**, по одной на блоки (a)–(e), 
 `duplicate key value violates unique constraint "profiles_one_active_per_device_server"`,
 `profiles_revoked_at`, `profiles_peer_state`,
 `duplicate key value violates unique constraint "tunnel_addresses_pkey"`,
-`server_locations_lat_check`. Блок (d) обязан упасть на **втором** INSERT (первый —
-валидная вставка), блок (e) — на `lat = 95`.
+`server_locations_lat_check`. Блок (d) обязан упасть на **третьем** INSERT (первые два —
+валидные вставки: один и тот же адрес на двух разных серверах), блок (e) — на `lat = 95`.
 
 - [ ] **Step 4: Коммит**
 
