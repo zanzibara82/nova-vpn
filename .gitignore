@@ -23,6 +23,7 @@ etc_priv/
 node_private_key
 
 # Артефакты сборки
+/out/
 /services/api/bin/
 /services/node-agent/bin/
 /dist/
