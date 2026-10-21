@@ -2138,9 +2138,9 @@ func RatePerMinute(perMin float64) float64 { return perMin / 60_000.0 }
 // Middleware пишет 429 в документированном конверте и ставит Retry-After.
 // name участвует в имени ключа, чтобы разные маршруты не отъедали бюджет друг у друга.
 // ВНИМАНИЕ К ЕДИНИЦАМ: rate — это токенов за МИЛЛИСЕКУНДУ, потому что bucketLua
-// считает elapsed в мс. 0.01 = 10 в секунду = 600 в минуту. Вызов снаружи делает
-// httpx.RatePerMinute (задача 18), а не голое число: «20 в минуту», записанное как 20,
-// дало бы 20 000 запросов в секунду и молча отключило бы лимит.
+// считает elapsed в мс. 0.01 = 10 в секунду = 600 в минуту. Наружу передают результат
+// httpx.RatePerMinute (она объявлением выше), а не голое число: «20 в минуту», записанное
+// как 20, дало бы 20 000 запросов в секунду и молча отключило бы лимит.
 func (l *Limiter) Middleware(name string, rate float64, burst int, key func(*http.Request) string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
