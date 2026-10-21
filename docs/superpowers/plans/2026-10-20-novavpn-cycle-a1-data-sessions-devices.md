@@ -1045,10 +1045,35 @@ Run (после применения 0001 и 0002): `psql -v ON_ERROR_STOP=1 -f 
 затем down, затем up; затем скрипт проверок (тот же порядок `docker compose cp` +
 `psql -f /tmp/plans_checks.sql`, что в задаче 3):
 
+Проверки ссылаются на родителей из задач 2–3 (пользователь `…f03`, устройство `…f04`, узел
+`…f02`), поэтому сначала прогоняется и коммитится сид `out/seed.sql`, затем идёт скрипт ниже.
+Сид нужен отдельным файлом, а не «seed-блоком задачи 3»: `out/constraints.sql` заканчивается
+`ROLLBACK` и родителей после себя не оставляет.
+
+```sql
+-- out/seed.sql — родители для проверок задач 3 и 4. ON CONFLICT, чтобы запускать дважды
+-- на уже наполненной базе.
+INSERT INTO server_locations (id, country_code, city, lat, lon, timezone)
+VALUES ('00000000-0000-4000-8000-000000000f01', 'NL', 'Amsterdam', 52.3738, 4.8910, 'Europe/Amsterdam')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, public_key,
+                         address_pool_v4, provider)
+VALUES ('00000000-0000-4000-8000-000000000f02', '00000000-0000-4000-8000-000000000f01',
+        'nl-ams-1', 'nl-ams-1.novavpn.example', 51820,
+        'wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iA=', '10.99.7.0/24', 'example-hosting')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO users (id, email, password_hash)
+VALUES ('00000000-0000-4000-8000-000000000f03', 'seed@novavpn.example',
+        '$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0aW9uZQ$aGFzaGFzaGFzaGFzaGFzaGFzaA')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO devices (id, user_id, public_key, platform, name)
+VALUES ('00000000-0000-4000-8000-000000000f04', '00000000-0000-4000-8000-000000000f03',
+        'wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iI=', 'linux', 'seed')
+ON CONFLICT (id) DO NOTHING;
+```
+
 ```sql
 BEGIN;
--- Скрипт рассчитывает на строку узла из seed-блока задачи 3; если база чистая —
--- выполнить сначала seed из того файла, затем этот.
 SAVEPOINT a;
 INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, reason, request_id)
 VALUES (NULL, 'server_created', 'vpn_server', '00000000-0000-4000-8000-000000000f02', '', 'req-1');
@@ -1069,14 +1094,14 @@ SAVEPOINT d;
 INSERT INTO device_day_traffic (user_id, device_id, day, rx_bytes, tx_bytes)
 VALUES ('00000000-0000-4000-8000-000000000f03', '00000000-0000-4000-8000-000000000f04',
         current_date, -1, 0);
-ROLLBACK TO d;   -- ← device_day_trafficRx_bytes_check (имя по умолчанию, сверить с выводом)
+ROLLBACK TO d;   -- ← device_day_traffic_rx_bytes_check
 ROLLBACK;
 ```
 
 Expected: **четыре ошибки** — `admin_audit_reason`, `bootstrap_window`,
-`plans_device_limit`, `…_rx_bytes_check` (последняя — имя констрейнта PostgreSQL
-генерирует сам; в журнале проверки записать фактическое). `repeat`/`decode` существуют в
- PostgreSQL 17 и возвращают 32 нулевых байта — ровно столько, сколько требует
+`plans_device_limit`, `device_day_traffic_rx_bytes_check` (имя последней генерирует
+PostgreSQL, проверено на живом сервере 17.11). `repeat`/`decode` существуют в
+PostgreSQL 17 и возвращают 32 нулевых байта — ровно столько, сколько требует
 `octet_length(token_hash) = 32`.
 
 - [ ] **Step 4: Проверить, что `internal-default` пережил down/up ровно один раз**
