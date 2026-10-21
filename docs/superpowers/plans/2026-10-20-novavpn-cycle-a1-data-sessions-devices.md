@@ -305,7 +305,7 @@ func Load(getenv func(string) string) (Config, error) {
 		return c, fmt.Errorf("NOVAVPN_ALLOW_INSECURE_API: %w", err)
 	}
 	if insecure && c.Env != EnvDev {
-		return c, errors.New("NOVAVPN_ALLOW_INSECURE_API is refused outside dev: TLS verification is not optional in prod")
+		return c, errors.New("insecure API transport is refused outside dev: TLS verification is not optional in prod (NOVAVPN_ALLOW_INSECURE_API)")
 	}
 	c.AllowInsecureAPI = insecure
 	return c, nil
@@ -318,6 +318,12 @@ func orDefault(v, def string) string {
 	return v
 }
 ```
+
+Слово `insecure` в тексте отказа написано строчными намеренно: шаг 1 проверяет
+`strings.Contains(err.Error(), "insecure")`, а это сравнение регистрозависимо, и одно только
+имя переменной `NOVAVPN_ALLOW_INSECURE_API` его не удовлетворяет (заглавные к строчным не
+равны). Имя переменной оставлено в конце сообщения, чтобы по тексту ошибки было понятно,
+какую именно настройку отклонили.
 
 - [ ] **Step 4: Makefile — единственный способ собрать и протестировать**
 
@@ -424,7 +430,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 golan
 
 Только то, что существует в A-1: разбор подкоманды `serve` (HTTP-сервер со
 `GET /debug/health`) и подкоманда `migrate`. Здесь `migrate` — заглушка
-`errors.New("migrations land in task 3")`: она падает громко, а не молча делает вид.
+`errors.New("migrations land in task 5")`: она падает громко, а не молча делает вид.
 Реализацию (`up|all|version` поверх пакета `internal/db/migrate`, который появляется в
 задаче 5) пишет задача 5, там же в этот `switch` вставляется ветка; задача 18 к
 `migrate` не притрагивается.
@@ -463,7 +469,7 @@ func run(args []string, getenv func(string) string) error {
 	case "serve":
 		return serve(cfg)
 	case "migrate":
-		return errors.New("migrations land in task 3")
+		return errors.New("migrations land in task 5")
 	case "":
 		return errors.New("usage: novavpn-api serve|migrate <up|all>")
 	default:

@@ -1,0 +1,5 @@
+.git
+.scratch
+out
+node_modules
+*.log
