@@ -235,6 +235,8 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 | `connection_events` | `event enum('profile_issued','profile_revoked','profile_expired','peer_applied','peer_removed','handshake_observed','handshake_failed','node_stale','connection_error')`, `detail jsonb` — **только коды ошибок и версии, не содержимое трафика** |
 | `device_day_traffic` | `pk(user_id, device_id, day)`, `rx_bytes`, `tx_bytes` — единственный персистентный след объёмов (решение: агрегат на устройство-сутки) |
 | `admin_users`, `admin_audit_logs` | `admin_audit_logs(admin_id, action, target_type, target_id, reason not null, created_at)` |
+| `idempotency_keys` | `unique(user_id, route, idem_key)`; `request_hash` — sha256 тела, по нему определяется конфликт содержимого при повторе ключа; `response_status`/`response_body` и `completed_at` — различают «запрос в полёте» от готового ответа. **Появилась на этапе планирования цикла A-1:** без неё заголовку `Idempotency-Key` из §5.2 негде храниться |
+| `bootstrap_tokens` | `token_hash unique` (sha256 от высокоэнтропийного секрета), `server_id`, `expires_at`, `used_at`, `revoked_at` — одноразовый токен для enroll узла (§4.1); приватного ключа узла здесь нет. **Появился на этапе планирования цикла A-1** |
 
 **Счётчики байт по пиерам** из отчёта узла нужны для расчёта загрузки и дельт, но в БД не лежат: хранятся как мгновенные значения в Redis с TTL и сворачиваются в `device_day_traffic`. Так «нагрузка узла» (ТЗ §4) доступна, а пер-сессонный лог объёмов — нет.
 
@@ -260,7 +262,7 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 
 ### 7.4 Лимит устройств (ТЗ §5)
 
-Жёсткая часть: `count(devices where revoked_at is null)` по entitlement-лимитy — гарантировано БД. Конечная часть: «одновременно подключённых» узлы видят локально, control plane узнаёт из отчётов; превышение → излишние пиеры помечаются к снятию по LRU(последний handshake) и уходят в течение интервала синхронизации. Мгновенно отказать лишнему соединению WireGuard не может, и это ограничение, а не задача «доделать».
+Жёсткая часть: `count(devices where revoked_at is null)` по лимиту entitlement — гарантировано БД. Конечная часть: «одновременно подключённых» узлы видят локально, control plane узнаёт из отчётов; превышение → излишние пиеры помечаются к снятию по LRU(последний handshake) и уходят в течение интервала синхронизации. Мгновенно отказать лишнему соединению WireGuard не может, и это ограничение, а не задача «доделать».
 
 ### 7.5 Незапланированная недоступность узла
 
