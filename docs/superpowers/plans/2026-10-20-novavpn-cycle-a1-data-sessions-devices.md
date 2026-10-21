@@ -594,24 +594,28 @@ DROP TYPE IF EXISTS user_status;
 
 Run:
 ```bash
-make up-dev
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  exec -T postgres psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
+# `infrastructure/docker/docker-compose.dev.yml` создаёт задача 5, поэтому до неё база
+# поднимается одноразовым контейнером с тем же пользователем и той же БД. С задачи 5
+# вместо этих двух строк — `make up-dev`.
+docker rm -f novavpn-pg-a1 2>/dev/null; docker run -d --name novavpn-pg-a1 \
+  -e POSTGRES_USER=nova -e POSTGRES_PASSWORD=nova -e POSTGRES_DB=novavpn postgres:17
+docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
   -f - < migrations/0001_identity.up.sql
 ```
-Expected: без ошибок, `CREATE TABLE` ×3.
+Expected: без ошибок, `CREATE TABLE` ×3. Состояние контейнера — одноразовое, в дерево
+репозитория не попадает; после проверки его можно удалить `docker rm -f novavpn-pg-a1`.
 
 Run (обратный порядок, чтобы down не упал на зависимостях):
 ```bash
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  exec -T postgres psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
+docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
   -f - < migrations/0001_identity.down.sql
 ```
 Expected: без ошибок.
 
 - [ ] **Step 4: Проверить, что констрейнты действительно отсекают мусор**
 
-Run: `make up-dev`, затем тот же `psql` с up-миграцией и тремя запросами:
+Run: применить up-миграцию к одноразовому контейнеру из шага 3 (с задачи 5 — после
+`make up-dev`), затем тот же `psql` с тремя запросами:
 
 ```sql
 -- (a) блокировка без причины
@@ -766,7 +770,8 @@ DROP TYPE IF EXISTS maintenance_status;
 
 - [ ] **Step 3: Проверить синтаксис и констрейнты**
 
-Run: `make up-dev`, затем прогнать up → down → up через `psql -v ON_ERROR_STOP=1 -f - < …sql`
+Run: поднять базу (до задачи 5 — одноразовый контейнер `novavpn-pg-a1`, команда в задаче 2,
+шаг 3; с задачи 5 — `make up-dev`), затем прогнать up → down → up через `psql -v ON_ERROR_STOP=1 -f - < …sql`
 (команда из задачи 2, шаг 3) и нижеуказанный скрипт проверок. Он сам создаёт себе
 родительские строки, поэтому запускается одним куском:
 
@@ -831,10 +836,10 @@ ROLLBACK;
 
 Run: сохранить скрипт в `out/constraints.sql` (каталог игнорируется) и выполнить:
 ```bash
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  cp out/constraints.sql postgres:/tmp/constraints.sql
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  exec -T postgres psql -U nova -d novavpn -f /tmp/constraints.sql
+# До задачи 5 база — одноразовый контейнер `novavpn-pg-a1` (задача 2, шаг 3);
+# с задачи 5 те же два шага делаются через compose-service `postgres`.
+docker cp out/constraints.sql novavpn-pg-a1:/tmp/constraints.sql
+docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -f /tmp/constraints.sql
 ```
 (Без `-v ON_ERROR_STOP=1`: нам нужно увидеть все пять ошибок, а не остановиться на первой.)
 
