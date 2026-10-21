@@ -1,6 +1,15 @@
 GO_IMAGE ?= golang:1.25-alpine
 DB_IMAGE ?= postgres:17
 REDIS_IMAGE ?= redis:7
+
+# Хостовы порты dev-стека. Занятые по умолчанию — не гипотеза: на этой машине 5432
+# держит служба postgresql-x64-17, а 6379 — локальный redis, и connect с тестового
+# контейнера уходит в чужой сервер (SASL-ошибка на несуществующую роль). Порты
+# переопределяют одной строкой: make integration POSTGRES_HOST_PORT=5433.
+POSTGRES_HOST_PORT ?= 5432
+REDIS_HOST_PORT ?= 6379
+# Compose читает порты из окружения процесса, поэтому их передают именно ему.
+DEV_ENV = POSTGRES_HOST_PORT=$(POSTGRES_HOST_PORT) REDIS_HOST_PORT=$(REDIS_HOST_PORT)
 COMPOSE   := docker compose -f infrastructure/docker/docker-compose.dev.yml
 ENV_FILE  := infrastructure/docker/.env.dev
 
@@ -9,8 +18,8 @@ ENV_FILE  := infrastructure/docker/.env.dev
 # отдельно: .env.dev описывает запуск бинарника с хоста. Флаг -e важнее
 # --env-file, так что значения из файла не перебивают эти.
 # host-gateway нужен Linux-движку; Docker Desktop резолвит имя и без него.
-DB_URL_INTEG     := postgres://nova:nova@host.docker.internal:5432/novavpn?sslmode=disable
-REDIS_ADDR_INTEG := host.docker.internal:6379
+DB_URL_INTEG     := postgres://nova:nova@host.docker.internal:$(POSTGRES_HOST_PORT)/novavpn?sslmode=disable
+REDIS_ADDR_INTEG := host.docker.internal:$(REDIS_HOST_PORT)
 
 DOCKER_FLAGS := -v "$(CURDIR):/src" -w /src \
 	-v novavpn-gomod:/go/pkg/mod -v novavpn-gocache:/root/.cache/go-build \
@@ -47,8 +56,10 @@ mod:
 	$(docker-go) mod tidy
 
 up-dev:
-	$(COMPOSE) up -d postgres redis
-	$(COMPOSE) exec -T postgres pg_isready -U nova -d novavpn -q
+	# --wait обязателен: без него `up -d` возвращается сразу, а `pg_isready` в следующей
+	# строке застает инициализацию кластера и уходит с кодом 2 (проверено на этом стеке).
+	$(DEV_ENV) $(COMPOSE) up -d --wait postgres redis
+	$(DEV_ENV) $(COMPOSE) exec -T postgres pg_isready -U nova -d novavpn -q
 
 down-dev:
 	$(COMPOSE) down -v

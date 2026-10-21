@@ -334,6 +334,15 @@ func orDefault(v, def string) string {
 GO_IMAGE ?= golang:1.25-alpine
 DB_IMAGE ?= postgres:17
 REDIS_IMAGE ?= redis:7
+
+# Хостовы порты dev-стека. Занятые по умолчанию — не гипотеза: на этой машине 5432
+# держит служба postgresql-x64-17, а 6379 — локальный redis, и connect с тестового
+# контейнера уходит в чужой сервер (SASL-ошибка на несуществующую роль). Порты
+# переопределяют одной строкой: make integration POSTGRES_HOST_PORT=5433.
+POSTGRES_HOST_PORT ?= 5432
+REDIS_HOST_PORT ?= 6379
+# Compose читает порты из окружения процесса, поэтому их передают именно ему.
+DEV_ENV = POSTGRES_HOST_PORT=$(POSTGRES_HOST_PORT) REDIS_HOST_PORT=$(REDIS_HOST_PORT)
 COMPOSE   := docker compose -f infrastructure/docker/docker-compose.dev.yml
 ENV_FILE  := infrastructure/docker/.env.dev
 
@@ -342,8 +351,8 @@ ENV_FILE  := infrastructure/docker/.env.dev
 # отдельно: .env.dev описывает запуск бинарника с хоста. Флаг -e важнее
 # --env-file, так что значения из файла не перебивают эти.
 # host-gateway нужен Linux-движку; Docker Desktop резолвит имя и без него.
-DB_URL_INTEG     := postgres://nova:nova@host.docker.internal:5432/novavpn?sslmode=disable
-REDIS_ADDR_INTEG := host.docker.internal:6379
+DB_URL_INTEG     := postgres://nova:nova@host.docker.internal:$(POSTGRES_HOST_PORT)/novavpn?sslmode=disable
+REDIS_ADDR_INTEG := host.docker.internal:$(REDIS_HOST_PORT)
 
 DOCKER_FLAGS := -v "$(CURDIR):/src" -w /src \
 	-v novavpn-gomod:/go/pkg/mod -v novavpn-gocache:/root/.cache/go-build \
@@ -380,8 +389,10 @@ mod:
 	$(docker-go) mod tidy
 
 up-dev:
-	$(COMPOSE) up -d postgres redis
-	$(COMPOSE) exec -T postgres pg_isready -U nova -d novavpn -q
+	# --wait обязателен: без него `up -d` возвращается сразу, а `pg_isready` в следующей
+	# строке застает инициализацию кластера и уходит с кодом 2 (проверено на этом стеке).
+	$(DEV_ENV) $(COMPOSE) up -d --wait postgres redis
+	$(DEV_ENV) $(COMPOSE) exec -T postgres pg_isready -U nova -d novavpn -q
 
 down-dev:
 	$(COMPOSE) down -v
@@ -415,6 +426,7 @@ $(ENV_FILE):
 
 sqlc-generate:
 	docker run --rm -v "$(CURDIR):/src" -w /src sqlc/sqlc:1.27.0 generate
+
 ```
 
 `go.mod` создаётся одной строкой внутри контейнера (на хосте Go нет):
@@ -1141,13 +1153,23 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - Consumes: `migrations/*.sql`, `config.Config.DatabaseURL`.
 - Produces: `migrate.Up(ctx, url string) (uint, error)` и
   `migrate.Steps(ctx, url string, n int) (uint, error)` — оба возвращают применённую версию;
+  `Steps` считает концы цепочки достижимыми: `n = -1<<31` откатывает до нуля и на чистой базе,
+  и с недосчитанными шагами (`ErrShortLimit`), а не возвращает ошибку;
   `migrations.FS embed.FS`; CLI-команда `novavpn-api migrate up|all|version`.
 
 - [ ] **Step 1: compose-стэк для разработки и тестов**
 
-`infrastructure/docker/docker-compose.dev.yml`:
+`infrastructure/docker/docker-compose.dev.yml` (имя и порты — не косметика: без `name:`
+Compose берёт имя каталога первого файла, то есть `docker`, а `make down-dev` снимает тома
+`-v` — в общем пространстве имён это чужие данные; порты параметризуются, потому что на
+машине разработчика 5432 и 6379 уже заняты локальными службами):
 
 ```yaml
+# Имя обязательно: без него Compose берёт имя каталога первого файла, то есть «docker».
+# `make down-dev` снимает `-v`, а в общем пространстве имён уже есть чужие
+# docker-compose.dev.yml (на этом хосте — проект cms) — без имени удалились бы чужие тома.
+name: novavpn-dev
+
 services:
   postgres:
     image: postgres:17
@@ -1155,7 +1177,7 @@ services:
       POSTGRES_USER: nova
       POSTGRES_PASSWORD: nova
       POSTGRES_DB: novavpn
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nova -d novavpn"]
       interval: 2s
@@ -1164,7 +1186,7 @@ services:
   redis:
     image: redis:7
     command: ["redis-server", "--save", "", "--appendonly", "no"]
-    ports: ["6379:6379"]
+    ports: ["${REDIS_HOST_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -1352,14 +1374,35 @@ func Steps(ctx context.Context, url string, n int) (uint, error) {
 		return 0, err
 	}
 	defer m.Close()
-	if err := m.Steps(n); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+	if n < 0 {
+		// На чистой базе откатывать нечего, а golang-migrate при шаге вниз читает
+		// down-файл версии 0 и возвращает fs.ErrNotExist («file does not exist»),
+		// а не ErrNoChange. Проверено на postgres:17 с пустой schema_migrations.
+		if _, _, verr := m.Version(); errors.Is(verr, migrate.ErrNilVersion) {
+			return 0, nil
+		}
+	}
+	if err := m.Steps(n); err != nil && !errors.Is(err, migrate.ErrNoChange) && !isLimit(err) {
 		return 0, err
 	}
 	return version(m)
 }
 
+// isLimit — «шагов запрошено больше, чем есть файлов». О значении судят по обоим
+// концам цепочки: n = -1<<31 означает «до нуля» и упирается в этот случай штатно
+// (проверено: `migrate all` на версии 3 давал «limit 2147483645 short» с кодом 1).
+// Поэтому он не ошибка, а достигнутый конец схемы.
+func isLimit(err error) bool {
+	var short migrate.ErrShortLimit
+	return errors.As(err, &short)
+}
+
 func version(m *migrate.Migrate) (uint, error) {
 	v, dirty, err := m.Version()
+	if errors.Is(err, migrate.ErrNilVersion) {
+		// Схема без единой миграции — это версия 0, а не ошибка.
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -1369,6 +1412,9 @@ func version(m *migrate.Migrate) (uint, error) {
 	return v, nil
 }
 ```
+
+Тип ошибки — `migrate.ErrShortLimit{Short uint}` (в v4.20.1; `ErrLimitSteps` его именем не
+называется, `errors.Is` не срабатывает, нужен `errors.As`).
 
 Блокировку параллельных применений `golang-migrate` берёт на себя сама (`Lock()` внутри
 `m.Up()`/`m.Steps()` через advisory lock PostgreSQL); отдельный `m.Lock()` в коде не нужен
@@ -1407,7 +1453,10 @@ case "migrate":
 
 Run: `make up-dev && make integration`
 Expected: PASS. Если первый `migrate down all` падает на зависимостях между 0002 и 0003 —
-порядок `DROP` в down-файлах неверен, чинить там, а не в тесте.
+порядок `DROP` в down-файлах неверен, чинить там, а не в тесте. Если SASL-ошибка на роли
+`nova` — порт 5432 на хосте занят локальной службой postgres, и ответ уходит не в dev-стек;
+тогда `make up-dev integration POSTGRES_HOST_PORT=5433 REDIS_HOST_PORT=16379`. Проверено на
+такой машине: с дефолтным портом тест падал на «role "nova" …», с 5433 — зелёный.
 
 ```bash
 git add migrations/embed.go internal/db/migrate infrastructure/docker tests/integration services/api go.mod go.sum Makefile

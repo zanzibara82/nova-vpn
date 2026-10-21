@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 
 	"github.com/novavpn/novavpn/internal/config"
+	"github.com/novavpn/novavpn/internal/db/migrate"
 )
 
 func main() {
@@ -31,7 +34,26 @@ func run(args []string, getenv func(string) string) error {
 	case "serve":
 		return serve(cfg)
 	case "migrate":
-		return errors.New("migrations land in task 5")
+		if fs.NArg() < 2 {
+			return errors.New("usage: novavpn-api migrate up|all|version")
+		}
+		ctx := context.Background()
+		switch fs.Arg(1) {
+		case "up":
+			v, err := migrate.Up(ctx, cfg.DatabaseURL)
+			fmt.Println("version", v)
+			return err
+		case "all":
+			v, err := migrate.Steps(ctx, cfg.DatabaseURL, -1<<31)
+			fmt.Println("reverted to", v)
+			return err
+		case "version":
+			v, err := migrate.Steps(ctx, cfg.DatabaseURL, 0)
+			fmt.Println("version", v)
+			return err
+		default:
+			return errors.New("usage: novavpn-api migrate up|all|version")
+		}
 	case "":
 		return errors.New("usage: novavpn-api serve|migrate <up|all>")
 	default:
