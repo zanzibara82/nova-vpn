@@ -4264,8 +4264,8 @@ func TestRejectsNonCanonicalLastChar(t *testing.T) {
 func TestRejectsMalformed(t *testing.T) {
 	for _, bad := range []string{
 		"", "   ", "not-base64-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!=",
-		canonicalZeros[:42],            // без '=' → длина 43
-		canonicalZeros + "=",           // длина 45
+		canonicalZeros[:42],  // без '=' → длина 43
+		canonicalZeros + "=", // длина 45
 		strings.ToLower(canonicalZeros),
 		base64.URLEncoding.EncodeToString(make([]byte, 32)) + "==", // url-safe форма
 	} {
@@ -4277,7 +4277,8 @@ func TestRejectsMalformed(t *testing.T) {
 
 func TestRejectsNewlineAndWhitespaceInside(t *testing.T) {
 	// Ключ с переносом строки — классика «пропустили из буфера обмена»:
-	// StdEncoding.DecodeString его не примет, но проверка длины обязана отработать раньше.
+	// проверка длины обязана отработать раньше декодирования — вход с переносом
+	// длиннее 44 символов.
 	if _, err := ParsePublicKey(canonicalZeros[:20] + "\n" + canonicalZeros[20:]); err == nil {
 		t.Fatal("key with newline accepted")
 	}
@@ -4320,8 +4321,8 @@ import (
 const keyLen = 32
 
 var (
-	ErrKeyLength     = errors.New("wireguard public key must be 32 bytes")
-	ErrKeyNotBase64  = errors.New("wireguard public key is not valid base64")
+	ErrKeyLength       = errors.New("wireguard public key must be 32 bytes")
+	ErrKeyNotBase64    = errors.New("wireguard public key is not valid base64")
 	ErrKeyNotCanonical = errors.New("wireguard public key is not canonical base64")
 )
 
@@ -4346,7 +4347,7 @@ func ParsePublicKey(b64 string) ([32]byte, error) {
 	if len(b64) != 44 || b64[43] != '=' {
 		return out, ErrKeyLength
 	}
-	raw, err := base64.StdEncoding.Strict().DecodeString(b64)
+	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return out, ErrKeyNotBase64
 	}
@@ -4360,6 +4361,14 @@ func ParsePublicKey(b64 string) ([32]byte, error) {
 	return out, nil
 }
 ```
+
+Примечание (правка против исходного брифа): блок использовал `base64.StdEncoding.Strict()` —
+в Go 1.25 строгий декодер **отклоняет** ненулевые spare-биты как ошибку декодирования, и
+`TestRejectsNonCanonicalLastChar` падал с `ErrKeyNotBase64` вместо `ErrKeyNotCanonical`.
+Предпосылка «декодер молча проглатывает» верна только для нестрогого `DecodeString` — он и
+используется; каноничность (spare-биты, регистр) ловит перекодировка по §5.2. Комментарий
+теста про перенос строки тоже исправлен: нестрогий `DecodeString` сам пропускает `\r\n`,
+поэтому страхует проверка длины до декодирования.
 
 Проверка «ключ — валидная точка curve25519» в A-1 **не** делается: WireGuard принимает
 любые 32 байта, а `ScalarMult` с малым порядком — это вопрос анализа ключа, который в
