@@ -1271,6 +1271,16 @@ func TestMigrationsUpToDownToUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
+	// Схема сейчас будет пересоздана: закэшированные prepared-стейтменты общего
+	// пула устареют («cached plan must not change result type»). Пул
+	// инвалидируется — следующий тест создаст новый.
+	t.Cleanup(func() {
+		if sharedPool != nil {
+			sharedPool.Close()
+			sharedPool = nil
+		}
+	})
+
 	if _, err := migrate.Steps(ctx, databaseURL(t), -1<<31); err != nil {
 		t.Fatalf("migrate down all: %v", err)
 	}
@@ -2861,9 +2871,9 @@ func TestRejectsEmptyAndShort(t *testing.T) {
 func TestVerifyRejectsMalformedHash(t *testing.T) {
 	for _, bad := range []string{
 		"", "not-a-hash",
-		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",     // не argon2id
-		"$argon2id$v=19$m=1024,t=3,p=4$c2FsdA$aGFzaA",     // слабый параметр
-		"$argon2id$v=19$m=65536,t=3,p=4$!!$aGFzaA",        // мусор в соли
+		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // не argon2id
+		"$argon2id$v=19$m=1024,t=3,p=4$c2FsdA$aGFzaA", // слабый параметр
+		"$argon2id$v=19$m=65536,t=3,p=4$!!$aGFzaA",    // мусор в соли
 	} {
 		if VerifyPassword(bad, "anything-long-enough") {
 			t.Errorf("VerifyPassword accepted %q", truncate(bad))
@@ -3326,7 +3336,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   refreshTTL time.Duration, log *slog.Logger) *auth.SessionService`;
   `(*SessionService).NewSession(ctx, userID uuid.UUID, ip *netip.Addr) (auth.Session, error)`,
   `(*SessionService).Rotate(ctx, raw string, ip *netip.Addr) (auth.Session, error)`,
-  `(*SessionService).Revoke(ctx, raw string) error`,
+  `(*SessionService).Revoke(ctx, raw, access string) error`,
   `auth.Session{AccessToken string; RefreshToken string; AccessExpiresAt, RefreshExpiresAt time.Time}`,
   `auth.ErrInvalidRefreshToken`, `auth.ErrExpiredRefreshToken`, `auth.ErrAccountLocked`.
   Повторное использование отозванного токена → `RevokeRefreshFamily(..., 'reuse_detected')`.
@@ -3368,8 +3378,8 @@ func TestParseRefreshRejectsJunk(t *testing.T) {
 	for _, bad := range []string{
 		"", "a", "a.b", ".", "###.###",
 		base64.URLEncoding.EncodeToString([]byte("not-a-uuid")) + ".AAAAAAAA",
-		uuid.NewString() + ".",     // пустой секрет
-		uuid.NewString() + ".a.b",  // лишняя часть
+		uuid.NewString() + ".",         // пустой секрет
+		uuid.NewString() + ".a.b",      // лишняя часть
 		uuid.NewString() + ".AAAAAAA=", // base64url с паддингом — другая каноническая форма
 	} {
 		if _, _, err := parseRefresh(bad); err == nil {
@@ -3462,18 +3472,18 @@ func hashSecret(secret []byte) []byte {
 }
 
 type Session struct {
-	AccessToken     string
-	RefreshToken    string
-	AccessExpiresAt time.Time
+	AccessToken      string
+	RefreshToken     string
+	AccessExpiresAt  time.Time
 	RefreshExpiresAt time.Time
 }
 
 type SessionService struct {
-	q         *db.Queries
-	iss       *Issuer
-	deny      Denylist
+	q          *db.Queries
+	iss        *Issuer
+	deny       Denylist
 	refreshTTL time.Duration
-	log       *slog.Logger
+	log        *slog.Logger
 }
 
 func NewSessionService(q *db.Queries, iss *Issuer, deny Denylist, refreshTTL time.Duration, log *slog.Logger) *SessionService {
@@ -3537,7 +3547,7 @@ func (s *SessionService) Rotate(ctx context.Context, raw string, ip *netip.Addr)
 	}
 	if err != nil {
 		return Session{}, fmt.Errorf("rotate refresh: %w", err)
-	}	// rotated.UserID — тот же пользователь, что и у семьи: mint подписывает access
+	} // rotated.UserID — тот же пользователь, что и у семьи: mint подписывает access
 	// на субъекта, а не на идентификатор семьи.
 	return s.mint(ctx, rotated.UserID, fam, next, family.ExpiresAt)
 }
@@ -3600,8 +3610,6 @@ import (
 	"log/slog"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 
 	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/db"
@@ -3713,6 +3721,22 @@ import (
 	"github.com/novavpn/novavpn/internal/db"
 )
 
+// Один пул на весь прогон: интеграционные тесты их создают десятки, а
+// pg_max_connections на dev-стеке конечен.
+var sharedPool *pgxpool.Pool
+
+func pool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	if sharedPool == nil {
+		p, err := db.Pool(context.Background(), databaseURL(t))
+		if err != nil {
+			t.Fatalf("pool: %v", err)
+		}
+		sharedPool = p
+	}
+	return sharedPool
+}
+
 func bytes32ForTests() []byte { return []byte("integration-secret-0000000000000000") }
 
 func redisClient(t *testing.T) *redis.Client {
@@ -3743,9 +3767,10 @@ func seedUser(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
 		t.Fatalf("InsertUser: %v", err)
 	}
 	if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
-		ID: uuid.New(), UserID: id,
-		PlanID:  uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
-		StartsAt: time.Now(), 
+		ID:       uuid.New(),
+		UserID:   id,
+		PlanID:   uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
+		StartsAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("InsertSubscription: %v", err)
 	}
@@ -3753,15 +3778,18 @@ func seedUser(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
 }
 ```
 
-`pool(t)` в этом файле уже лежит (задача 9, шаг 4) — вторая копия недопустима:
-в одном пакете две функции с одним именем не компилируются.
+Блок — файл целиком после шага: `pool` перенесён из задачи 9 без изменений,
+вторая копия недопустима (в одном пакете две функции с одним именем не
+компилируются).
 
 - [ ] **Step 5: Прогнать и коммитить**
 
 Run: `make unit && make integration`
 Expected: PASS. Если `TestRefreshRotationAndReuse` падает на «family was not revoked»,
 проверить, что `RotateRefresh` в `identity.sql` имеет `AND revoked_at IS NULL` — без него
-ветка переиспользования не закрывает доступ.
+ветка переиспользования не закрывает доступ. Если падает на «cached plan must not
+change result type» — тест миграций не инвалидировал общий пул после пересоздания
+схемы (блок задачи 5).
 
 ```bash
 git add internal/auth tests/integration internal/db/query/identity.sql
