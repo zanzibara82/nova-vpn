@@ -203,6 +203,7 @@ WireGuard-устройство создаётся через rtnetlink (`ip link
 ### 5.2 Сквозные требования ТЗ §10
 
 - **Единый формат ошибки:** `{"error":{"code":"device_limit_reached","message":"…","details":{…},"request_id":"…"}}`. Коды стабильны и документированы в OpenAPI; `request_id` совпадает с journal entry.
+- **Язык сообщений:** продукт русскоязычный (решение 2026-10-22) — сообщения прикладного HTTP-слоя (регистрация, вход, устройства) пишутся по-русски; инфраструктурные строки middleware (идемпотентность, лимиты) остаются английскими, клиенты ориентируются на стабильные коды; `locale` по умолчанию — `ru` (раздел 6).
 - **Идемпотентность критических операций:** `Idempotency-Key` обязателен на `POST /devices`, `POST …/profiles`, `…/keys/rotate`. Повтор с тем же ключом возвращает первый результат; конфликт тела с сохранённым — `409 idempotency_key_conflict`.
 - **Авторизация** на всех маршрутах, кроме register/login/refresh; проверка права на объект, а не только факта аутентификации (матрица «роль × маршрут» как тест — ТЗ §10 и ТЗ §14).
 - **Rate limiting:** login/register — по IP и по аккаунту с прогрессивной задержкой; выдача профилей — 30/мин на пользователя; узловый префикс — по узлу. Redis token bucket, fail-open (раздел 4.3).
@@ -221,7 +222,7 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 
 | Таблица | Ключевые ограничения и зачем |
 |---|---|
-| `users` | `email citext unique`; `password_hash`; `status enum('active','locked','deleted')`; `locked_reason` (для ТЗ §9); `email_verified_at` (заполняется в D); `locale` (en по умолчанию) |
+| `users` | `email citext unique`; `password_hash`; `status enum('active','locked','deleted')`; `locked_reason` (для ТЗ §9); `email_verified_at` (заполняется в D); `locale` (ru по умолчанию) |
 | `devices` | `public_key` канонический base64; `unique(user_id, public_key)`; `revoked_at`; `rotation_of device_id` — ссылка на предка для overlap; `platform` |
 | `refresh_token_families` | `family_id`, `current_token_hash unique`, `revoked_at`, `ip inet null` (только для анти-злоупотреблений, retention 90 дн.) |
 | `server_locations` | `country_code`, `city`, `lat numeric(9,6)`, `lon numeric(9,6)`, `timezone` — координаты для карты (C), данные каталога с A |
@@ -260,7 +261,7 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 
 ### 7.4 Лимит устройств (ТЗ §5)
 
-Жёсткая часть: `count(devices where revoked_at is null)` по entitlement-лимитy — гарантировано БД. Конечная часть: «одновременно подключённых» узлы видят локально, control plane узнаёт из отчётов; превышение → излишние пиеры помечаются к снятию по LRU(последний handshake) и уходят в течение интервала синхронизации. Мгновенно отказать лишнему соединению WireGuard не может, и это ограничение, а не задача «доделать».
+Жёсткая часть: `count(devices where revoked_at is null)` по лимиту entitlement — гарантировано БД. Конечная часть: «одновременно подключённых» узлы видят локально, control plane узнаёт из отчётов; превышение → излишние пиеры помечаются к снятию по LRU(последний handshake) и уходят в течение интервала синхронизации. Мгновенно отказать лишнему соединению WireGuard не может, и это ограничение, а не задача «доделать».
 
 ### 7.5 Незапланированная недоступность узла
 
