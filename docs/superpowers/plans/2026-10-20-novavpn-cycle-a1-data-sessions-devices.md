@@ -3962,7 +3962,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -3995,6 +3994,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -4012,11 +4012,11 @@ func TestEntitlementsForUser(t *testing.T) {
 
 	// Пользователь без подписки → явная ошибка, а не дефолтный лимит.
 	userless := seedUserWithoutPlan(t, ctx, q)
-	if _, err := svc.ForUser(ctx, userless); err == nil || !errorsIs(err, entitlements.ErrNoActiveSubscription) {
+	if _, err := svc.ForUser(ctx, userless); err == nil || !errors.Is(err, entitlements.ErrNoActiveSubscription) {
 		t.Fatalf("ForUser(no subscription) = %v, want ErrNoActiveSubscription", err)
 	}
 
-	user := seedUser(t, ctx, q) // создаёт подписку internal-default (см. задачу 12, helpers)
+	user := seedUser(t, ctx, q, true) // создаёт подписку internal-default (см. задачу 12, helpers)
 	e, err := svc.ForUser(ctx, user)
 	if err != nil {
 		t.Fatalf("ForUser: %v", err)
@@ -4035,23 +4035,45 @@ func TestEntitlementsForUser(t *testing.T) {
 func TestUnknownSelectorIsAnErrorNotATicket(t *testing.T) {
 	ctx := context.Background()
 	q := db.New(pool(t))
-	if err := q.InsertPlan(ctx, db.InsertPlanParams{
-		ID: uuid.New(), Slug: "selector-test-" + uuid.NewString()[:8],
+	slug := "selector-test-" + uuid.NewString()[:8]
+	if _, err := q.InsertPlan(ctx, db.InsertPlanParams{
+		ID: uuid.New(), Slug: slug,
 		DeviceLimit: 5, ServerSelector: "country=DE",
 	}); err != nil {
 		t.Fatalf("InsertPlan: %v", err)
 	}
-	user := seedUserWithPlan(t, ctx, q, "selector-test-…")
+	user := seedUserWithPlan(t, ctx, q, slug)
 	if _, err := entitlements.New(q).ForUser(ctx, user); err == nil {
 		t.Fatal("selector 'country=DE' accepted in cycle A")
 	}
 }
 ```
 
-`errorsIs` — `errors.Is`; `seedUserWithoutPlan`, `seedUserWithPlan` и запрос `InsertPlan`
-дописываются в `tests/integration/helpers_test.go` и `internal/db/query/plans.sql`:
+Хелперы `seedUserWithoutPlan`, `seedUserWithPlan` дописываются в
+`tests/integration/helpers_test.go`, запросы `InsertPlan`/`PlanIDBySlug` — в
+`internal/db/query/plans.sql`:
 
 ```sql
+-- name: LiveSubscriptionByUser :one
+SELECT s.id AS subscription_id, s.user_id, s.status, s.starts_at, s.ends_at, s.source,
+       p.id AS plan_id, p.slug, p.device_limit, p.server_selector,
+       p.traffic_quota_bytes, p.trial_days
+FROM subscriptions s
+JOIN subscription_plans p ON p.id = s.plan_id
+WHERE s.user_id = $1 AND s.status = 'active'
+  AND (s.ends_at IS NULL OR s.ends_at > now())
+ORDER BY s.starts_at DESC
+LIMIT 1;
+
+-- name: PlanBySlug :one
+SELECT id, slug, device_limit, server_selector, traffic_quota_bytes, trial_days
+FROM subscription_plans WHERE slug = $1;
+
+-- name: InsertSubscription :one
+INSERT INTO subscriptions (id, user_id, plan_id, status, starts_at, ends_at, source)
+VALUES ($1, $2, $3, 'active', $4, $5, 'manual')
+RETURNING id;
+
 -- name: InsertPlan :one
 INSERT INTO subscription_plans (id, slug, device_limit, server_selector, traffic_quota_bytes)
 VALUES ($1, $2, $3, $4, $5)
@@ -4061,8 +4083,115 @@ RETURNING id;
 SELECT id FROM subscription_plans WHERE slug = $1;
 ```
 
-`seedUserWithPlan` берёт `PlanIDBySlug` и вставляет подписку; `seedUserWithoutPlan` —
-`seedUser` без блока `InsertSubscription` (вынести в хелпере флаг `withPlan bool`).
+`seedUser` получает флаг `withPlan bool` (вынос блока `InsertSubscription` в
+условие): `seedUserWithoutPlan` — это `seedUser(..., false)`, `seedUserWithPlan`
+берёт `PlanIDBySlug` и вставляет подписку на заданный план. Файл
+`helpers_test.go` целиком после шага:
+
+```go
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/novavpn/novavpn/internal/auth"
+	"github.com/novavpn/novavpn/internal/db"
+)
+
+// Один пул на весь прогон: интеграционные тесты их создают десятки, а
+// pg_max_connections на dev-стеке конечен.
+var sharedPool *pgxpool.Pool
+
+func pool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	if sharedPool == nil {
+		p, err := db.Pool(context.Background(), databaseURL(t))
+		if err != nil {
+			t.Fatalf("pool: %v", err)
+		}
+		sharedPool = p
+	}
+	return sharedPool
+}
+
+func bytes32ForTests() []byte { return []byte("integration-secret-0000000000000000") }
+
+func redisClient(t *testing.T) *redis.Client {
+	t.Helper()
+	addr := os.Getenv("NOVAVPN_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("NOVAVPN_REDIS_ADDR is not set; run `make up-dev` first")
+	}
+	c := redis.NewClient(&redis.Options{Addr: addr})
+	if err := c.Ping(context.Background()).Err(); err != nil {
+		t.Fatalf("redis at %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+func seedUser(t *testing.T, ctx context.Context, q *db.Queries, withPlan bool) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	hash, err := auth.HashPassword("integration-password-123")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	if _, err := q.InsertUser(ctx, db.InsertUserParams{
+		ID: id, Email: "seed-" + id.String()[:8] + "@novavpn.test",
+		PasswordHash: hash, Locale: "ru",
+	}); err != nil {
+		t.Fatalf("InsertUser: %v", err)
+	}
+	if withPlan {
+		if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
+			ID:       uuid.New(),
+			UserID:   id,
+			PlanID:   uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
+			StartsAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("InsertSubscription: %v", err)
+		}
+	}
+	return id
+}
+
+func seedUserWithoutPlan(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
+	return seedUser(t, ctx, q, false)
+}
+
+func seedUserWithPlan(t *testing.T, ctx context.Context, q *db.Queries, slug string) uuid.UUID {
+	t.Helper()
+	id := seedUser(t, ctx, q, false)
+	planID, err := q.PlanIDBySlug(ctx, slug)
+	if err != nil {
+		t.Fatalf("PlanIDBySlug: %v", err)
+	}
+	if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
+		ID:       uuid.New(),
+		UserID:   id,
+		PlanID:   planID,
+		StartsAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("InsertSubscription: %v", err)
+	}
+	return id
+}
+```
+
+Этот блок заменяет блок хелперов задачи 12: сигнатура `seedUser` изменилась, и
+оба вызова в `tests/integration/refresh_test.go` (задача 12) обновлены на
+`seedUser(t, ctx, q, true)`. Блок задачи 12 остаётся историческим состоянием
+файла.
 
 - [ ] **Step 5: Прогнать и коммитить**
 
@@ -4071,7 +4200,8 @@ Expected: PASS. `TestUnknownSelectorIsAnErrorNotATicket` обязан упаст
 не на вставке: в этом смысл проверки.
 
 ```bash
-git add internal/entitlements internal/db/tx.go internal/db tests/integration/entitlements_test.go
+git add internal/entitlements internal/db/tx.go internal/db \
+  tests/integration/{entitlements_test.go,helpers_test.go,refresh_test.go}
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(entitlements): права из плана с явной отказкой на неизвестный selector"
 ```
