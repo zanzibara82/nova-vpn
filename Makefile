@@ -64,8 +64,10 @@ up-dev:
 down-dev:
 	$(COMPOSE) down -v
 
+# ./... а не ./tests/integration/...: тегированные тесты живут и внутри пакетов
+# (internal/httpx — лимитер задачи 8), цель обязана гнать все.
 integration:
-	$(docker-go-int) test -count=1 -tags=integration ./tests/integration/...
+	$(docker-go-int) test -count=1 -tags=integration ./...
 
 migrate-up: $(ENV_FILE)
 	$(docker-go-app) run -mod=mod ./services/api/cmd/novavpn-api migrate up
