@@ -646,7 +646,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - Consumes: `users`, `devices` (0001).
 - Produces: `server_locations`, `vpn_servers`, `node_credentials`, `vpn_profiles`,
   `tunnel_addresses`; тип `profile_status` с значениями `active`, `superseded`, `revoked`,
-  `expired` и `node_state` = `rotating_old_key`. Индекс `profiles_one_active_per_device_server`
+  `expired` и `peer_state` = `rotating_old_key`. Индекс `profiles_one_active_per_device_server`
   — механизм, на котором держится «двойная выдача невозможна» (спецификация §6).
 
 - [ ] **Step 1: Написать up-миграцию**
@@ -1451,7 +1451,7 @@ sql:
 ```
 
 `inet` — адрес (`netip.Addr`), `cidr` — сеть (`netip.Prefix`); `refresh_token_families.ip`
-и `connection_events.client_ip` хранят адрес, а не сеть, поэтому дальнейшие задачи
+и `vpn_profiles.address_v4` хранят адрес, а не сеть, поэтому дальнейшие задачи
 (задачи 12, 17) работают с `*netip.Addr`. Проверено генерацией 1.27.0: `citext`
 распознан как `string`, `inet`/`cidr` легли в `netip` без переделок. Если в более
 новом sqlc `inet` или `cidr` упорно мапится в `[]byte` — убрать оба вложенных
@@ -2578,8 +2578,9 @@ func (p *PGIdempotency) Claim(ctx context.Context, userID uuid.UUID, route, key 
 }
 
 func (p *PGIdempotency) Complete(ctx context.Context, userID uuid.UUID, route, key string, status int, body []byte) error {
+	statusCode := int32(status)
 	return p.q.CompleteIdempotencyKey(ctx, db.CompleteIdempotencyKeyParams{
-		UserID: userID, Route: route, IdemKey: key, ResponseStatus: int32(status), ResponseBody: body,
+		UserID: userID, Route: route, IdemKey: key, ResponseStatus: &statusCode, ResponseBody: body,
 	})
 }
 
@@ -3326,12 +3327,14 @@ func (s *SessionService) Rotate(ctx context.Context, raw string, ip *netip.Addr)
 		return Session{}, ErrInvalidRefreshToken
 	}
 	if time.Now().After(family.ExpiresAt) {
-		_ = s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: "expired"})
+		reason := "expired"
+		_ = s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: &reason})
 		return Session{}, ErrExpiredRefreshToken
 	}
 	if subtle.ConstantTimeCompare(family.CurrentTokenHash, hashSecret(secret)) != 1 {
 		// Секрет не текущий, а семья живая → этот токен уже поменяли. Отзываем всех.
-		if err := s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: "reuse_detected"}); err != nil {
+		reason := "reuse_detected"
+		if err := s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: &reason}); err != nil {
 			s.log.Error("revoke family on reuse", "err", err)
 		}
 		s.log.Warn("refresh token reuse detected, family revoked", "user_id", family.UserID)
@@ -3369,8 +3372,9 @@ func (s *SessionService) Revoke(ctx context.Context, raw, access string) error {
 		// Невалидный access не блокирует отзыв семьи: logout обязан сработать и
 		// когда клиент принёс просроченный access.
 	}
+	reason := "logout"
 	return s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{
-		ID: uuid.MustParse(fam), RevokeReason: "logout",
+		ID: uuid.MustParse(fam), RevokeReason: &reason,
 	})
 }
 
@@ -3594,7 +3598,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `(*Service).ForUser(ctx context.Context, userID uuid.UUID) (Entitlement, error)`,
   `entitlements.GrantDefaultPlanTx(ctx context.Context, q *db.Queries, userID uuid.UUID, slug string) error`,
   `entitlements.ErrNoActiveSubscription`,
-  `db.RunInTx(ctx context.Context, pool db.DBTX, fn func(*db.Queries) error) error`.
+  `db.RunInTx(ctx context.Context, pool *pgxpool.Pool, fn func(*db.Queries) error) error`.
   `ServerSelector` в A принимает только `"all"` — права на конкретные узлы появляются в A-2
   вместе с каталогом, здесь поле только читается и передаётся дальше.
 
