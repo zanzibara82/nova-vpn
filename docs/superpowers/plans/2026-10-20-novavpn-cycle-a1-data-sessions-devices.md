@@ -2966,13 +2966,14 @@ func VerifyPassword(phc, password string) bool {
 	if err != nil || len(want) < 16 {
 		return false
 	}
-	got := argon2.IDKey([]byte(password), salt, t, m, p, uint32(len(want)))
+	got := argon2.IDKey([]byte(password), salt, t, m, uint8(p), uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 ```
 
-`len(password) < MinPasswordLen*1` — опечатка-страховка в коде плана; заменить на
-`len(password) < MinPasswordLen` при наборе (пояснение про UTF-8 остаётся).
+`argon2.IDKey(... m, p, ...)` — в коде плана число потоков приводится как `uint8(p)`;
+x/crypto v0.53.0 принимает его только как uint8 (блок плана приведён к файлу
+байт-в-байт).
 
 - [ ] **Step 4: Прогнать**
 
@@ -2983,7 +2984,7 @@ Expected: PASS. Время `TestHashProducesVerifiablePHC` ≈ 100–300 мс н
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/auth
+git add internal/auth go.mod go.sum
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(auth): argon2id с фиксированными параметрами и отказом на malformed-хэше"
 ```
