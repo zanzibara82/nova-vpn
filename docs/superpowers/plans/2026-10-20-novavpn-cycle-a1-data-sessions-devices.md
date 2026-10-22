@@ -519,7 +519,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 ### Task 2: Миграция 0001 — пользователи, refresh-семьи, устройства
 
 **Files:**
-- Create: `migrations/0001_identity.up.sql`, `migrations/0001_identity.down.sql`
+- Create: `migrations/0001_identity.up.sql`, `migrations/0001_identity.down.sql`,
+  `migrations/0005_users_locale_default_ru.up.sql`,
+  `migrations/0005_users_locale_default_ru.down.sql` (поправка 2026-10-22 — язык продукта, см. примечание после шага 5)
 
 **Interfaces:**
 - Consumes: PostgreSQL 17 (образ `postgres:17`, пользователь `nova`, БД `novavpn`).
@@ -656,6 +658,29 @@ git add migrations/0001_identity.up.sql migrations/0001_identity.down.sql
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(db): схема идентификации — пользователи, refresh-семьи, устройства"
 ```
+
+**Поправка 2026-10-22 — язык продукта русский** (решение «продукт русскоязычный»):
+миграция `0001` выгружена с `DEFAULT 'en'` и историю не переписывает, поэтому дефолт
+локали меняет отдельная пара `0005`. Текст блока `0001` выше остаётся без изменений —
+это байт-в-байт содержание закоммиченного файла.
+
+`migrations/0005_users_locale_default_ru.up.sql`:
+
+```sql
+-- Решение 2026-10-22: язык интерфейса продукта — русский, locale по умолчанию — 'ru'.
+-- 0001 выгружена с DEFAULT 'en'; историю не переписываем — дефолт меняет эта пара.
+ALTER TABLE users
+    ALTER COLUMN locale SET DEFAULT 'ru';
+```
+
+`migrations/0005_users_locale_default_ru.down.sql`:
+
+```sql
+ALTER TABLE users
+    ALTER COLUMN locale SET DEFAULT 'en';
+```
+
+Применяется обычным раннером (`make migrate-up`), проверка up→down→up — в задаче 5.
 
 ---
 
@@ -2398,7 +2423,7 @@ func seedIdemUser(t *testing.T, ctx context.Context, id uuid.UUID) {
 		ID:           id,
 		Email:        id.String() + "@example.com",
 		PasswordHash: "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
-		Locale:       "en",
+		Locale:       "ru",
 	}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
@@ -2749,6 +2774,12 @@ ALTER TABLE idempotency_keys
 ALTER TABLE idempotency_keys
     ALTER COLUMN response_body TYPE jsonb USING convert_from(response_body, 'UTF8')::jsonb;
 ```
+
+Поправка 2026-10-22: язык продукта — русский, поэтому сид пользователя использует
+`Locale: "ru"` (как и сиды задач 12 и 17); дефолт колонки меняет миграция `0005`
+(примечание в задаче 2). Сообщения middleware этой задачи остаются английскими — это
+инфраструктурные строки, клиенты ориентируются на коды (спецификация цикла A, единый
+формат ошибки); прикладные сообщения HTTP-слоя (задачи 15, 17, 18) — по-русски.
 
 - [ ] **Step 5: Прогнать и коммитить**
 
@@ -3705,7 +3736,7 @@ func seedUser(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
 	}
 	if _, err := q.InsertUser(ctx, db.InsertUserParams{
 		ID: id, Email: "seed-" + id.String()[:8] + "@novavpn.test",
-		PasswordHash: hash, Locale: "en",
+		PasswordHash: hash, Locale: "ru",
 	}); err != nil {
 		t.Fatalf("InsertUser: %v", err)
 	}
@@ -4639,7 +4670,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	// при этом проверяется всегда — иначе тест с nil-хранилищем проходил бы молча.
 	if r.Header.Get("Idempotency-Key") == "" {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrIdempotencyKeyRequired,
-			"Idempotency-Key is required for device registration", nil)
+			"заголовок Idempotency-Key обязателен при регистрации устройства", nil)
 		return
 	}
 	var wrapped http.Handler = http.HandlerFunc(h.registerInner)
@@ -4652,7 +4683,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) registerInner(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
-		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 		return
 	}
 	var in struct {
@@ -4661,7 +4692,7 @@ func (h *Handler) registerInner(w http.ResponseWriter, r *http.Request) {
 		Name      string `json:"name"`
 	}
 	if err := httpx.DecodeJSON(r, &in, 1<<14); err != nil {
-		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest, "invalid request body", nil)
+		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest, "некорректное тело запроса", nil)
 		return
 	}
 	d, err := h.svc.Register(r.Context(), userID, RegisterInput{
@@ -4672,41 +4703,41 @@ func (h *Handler) registerInner(w http.ResponseWriter, r *http.Request) {
 		_ = httpx.WriteJSON(w, http.StatusCreated, toView(d))
 	case errors.Is(err, ErrInvalidKey):
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"public_key must be canonical base64 of 32 bytes",
+			"public_key должен быть каноническим base64 от 32 байт",
 			map[string]any{"field": "public_key"})
 	case errors.Is(err, ErrInvalidPlatform):
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"unsupported platform", map[string]any{"field": "platform"})
+			"неподдерживаемая платформа", map[string]any{"field": "platform"})
 	case errors.Is(err, ErrInvalidName):
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"name must be 1..64 characters", map[string]any{"field": "name"})
+			"имя должно быть от 1 до 64 символов", map[string]any{"field": "name"})
 	case errors.Is(err, ErrDeviceLimit):
 		lim := 0
 		if e, err := h.svc.ent.ForUser(r.Context(), userID); err == nil {
 			lim = e.DeviceLimit
 		}
 		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrDeviceLimitReached,
-			"device limit reached for this plan", map[string]any{"limit": lim})
+			"лимит устройств этого плана исчерпан", map[string]any{"limit": lim})
 	case errors.Is(err, ErrDuplicateKey):
 		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrDuplicateDevice,
-			"a device with this public key already exists", nil)
+			"устройство с таким публичным ключом уже существует", nil)
 	case errors.Is(err, entitlements.ErrNoActiveSubscription):
 		httpx.WriteError(w, r, http.StatusForbidden, httpx.ErrForbidden,
-			"no active subscription", nil)
+			"нет активной подписки", nil)
 	default:
-		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "internal error", nil)
+		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "внутренняя ошибка", nil)
 	}
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
-		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 		return
 	}
 	items, err := h.svc.List(r.Context(), userID)
 	if err != nil {
-		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "internal error", nil)
+		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "внутренняя ошибка", nil)
 		return
 	}
 	out := make([]deviceView, 0, len(items))
@@ -6004,12 +6035,12 @@ func Middleware(sess *SessionService, deny Denylist) func(http.Handler) http.Han
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			value := Bearer(r)
 			if value == "" {
-				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 				return
 			}
 			claims, err := sess.ParseAccess(value)
 			if err != nil || claims.UserID == uuid.Nil {
-				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 				return
 			}
 			blocked, err := deny.Contains(r.Context(), claims.JTI)
@@ -6022,7 +6053,7 @@ func Middleware(sess *SessionService, deny Denylist) func(http.Handler) http.Han
 				blocked = false
 			}
 			if blocked {
-				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(httpx.WithUserID(r.Context(), claims.UserID)))
@@ -6312,7 +6343,7 @@ type refreshRequest struct {
 func (h *Handler) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := httpx.DecodeJSON(r, dst, maxAuthBody); err != nil {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"body must be a single JSON object with the documented fields", nil)
+			"тело должно быть одним JSON-объектом с полями из документации", nil)
 		return false
 	}
 	return true
@@ -6323,7 +6354,7 @@ func (h *Handler) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 func (h *Handler) internal(w http.ResponseWriter, r *http.Request, err error) {
 	h.log.Error("auth: internal error",
 		"err", err, "request_id", httpx.RequestIDFromContext(r.Context()))
-	httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "internal error", nil)
+	httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "внутренняя ошибка", nil)
 }
 
 func (h *Handler) writeSession(w http.ResponseWriter, status int, s Session) {
@@ -6354,7 +6385,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	email, ok := normalizeEmail(in.Email)
 	if !ok {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"email must be a single address of at most 254 characters",
+			"email должен быть одним адресом не длиннее 254 символов",
 			map[string]any{"field": "email"})
 		return
 	}
@@ -6363,13 +6394,13 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		// Пока не создан ни пользователь, ни подписка: до HashPassword доходить
 		// не должно — иначе слабый пароль уже оставил бы строку в users.
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"password must be 10..1024 bytes", map[string]any{"field": "password"})
+			"пароль должен быть от 10 до 1024 байт", map[string]any{"field": "password"})
 		return
 	}
 	userID := uuid.New()
 	err = db.RunInTx(r.Context(), h.pool, func(q *db.Queries) error {
 		if _, err := q.InsertUser(r.Context(), db.InsertUserParams{
-			ID: userID, Email: email, PasswordHash: hash, DisplayName: nil, Locale: "en",
+			ID: userID, Email: email, PasswordHash: hash, DisplayName: nil, Locale: "ru",
 		}); err != nil {
 			return err
 		}
@@ -6378,7 +6409,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if isEmailTaken(err) {
 			httpx.WriteError(w, r, http.StatusConflict, httpx.ErrEmailTaken,
-				"email is already registered", map[string]any{"field": "email"})
+				"email уже зарегистрирован", map[string]any{"field": "email"})
 			return
 		}
 		h.internal(w, r, err)
@@ -6422,7 +6453,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	if user.Status != db.UserStatusActive {
 		h.log.Warn("login on non-active account", "user_id", user.ID, "status", string(user.Status))
 		httpx.WriteError(w, r, http.StatusForbidden, httpx.ErrAccountLocked,
-			"account is locked", nil)
+			"учётная запись заблокирована", nil)
 		return
 	}
 	h.guard.Reset(r.Context(), email, ipStr)
@@ -6451,7 +6482,7 @@ func (h *Handler) penalize(w http.ResponseWriter, r *http.Request, email, ip str
 		}
 	}
 	httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrInvalidCredentials,
-		"email or password is incorrect", nil)
+		"неверный email или пароль", nil)
 }
 
 func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
@@ -6463,7 +6494,7 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 	// «слишком короткий» — это нарушение схемы, а не «токена нет».
 	if n := len(in.RefreshToken); n < 40 || n > 512 {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"refresh_token must be 40..512 characters", map[string]any{"field": "refresh_token"})
+			"refresh_token должен быть от 40 до 512 символов", map[string]any{"field": "refresh_token"})
 		return
 	}
 	sess, err := h.sess.Rotate(r.Context(), in.RefreshToken, ClientIP(r))
@@ -6476,10 +6507,10 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("refresh rejected", "err", err,
 			"request_id", httpx.RequestIDFromContext(r.Context()))
 		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrRefreshTokenInvalid,
-			"refresh token is invalid", nil)
+			"неверный refresh-токен", nil)
 	case errors.Is(err, ErrAccountLocked):
 		httpx.WriteError(w, r, http.StatusForbidden, httpx.ErrAccountLocked,
-			"account is locked", nil)
+			"учётная запись заблокирована", nil)
 	default:
 		h.internal(w, r, err)
 	}
@@ -6497,7 +6528,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 			h.log.Warn("logout with undecodable refresh token",
 				"request_id", httpx.RequestIDFromContext(r.Context()))
 			httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrRefreshTokenInvalid,
-				"refresh token is invalid", nil)
+				"неверный refresh-токен", nil)
 			return
 		}
 		h.internal(w, r, err)
@@ -6539,7 +6570,7 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated,
-			"authentication required", nil)
+			"требуется аутентификация", nil)
 		return
 	}
 	q := db.New(h.pool)
@@ -6548,7 +6579,7 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		// Подписанный jti живой, пользователя нет: это не «нет права», а «нет
 		// субъекта» — 401, и denylist тут не при чём.
 		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated,
-			"authentication required", nil)
+			"требуется аутентификация", nil)
 		return
 	}
 	if err != nil {
@@ -7195,10 +7226,10 @@ func Envelope(routes PatternResolver) http.Handler {
 		if allow := allowedMethods(routes, r); len(allow) > 0 {
 			w.Header().Set("Allow", strings.Join(allow, ", "))
 			WriteError(w, r, http.StatusMethodNotAllowed, ErrMethodNotAllowed,
-				"method not allowed for this route", map[string]any{"allowed": allow})
+				"метод не разрешён для этого маршрута", map[string]any{"allowed": allow})
 			return
 		}
-		WriteError(w, r, http.StatusNotFound, ErrNotFound, "route not found", nil)
+		WriteError(w, r, http.StatusNotFound, ErrNotFound, "маршрут не найден", nil)
 	})
 }
 
@@ -7357,7 +7388,7 @@ func Logging(next http.Handler, routes PatternResolver, log *slog.Logger) http.H
 				// Если обработчик уже начал писать тело, дописывать конверт
 				// нельзя: клиент получил бы JSON в середине ответа.
 				WriteError(sw, req, http.StatusInternalServerError, ErrInternal,
-					"internal error", nil)
+					"внутренняя ошибка", nil)
 			}
 		}()
 

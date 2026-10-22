@@ -27,7 +27,7 @@ func seedIdemUser(t *testing.T, ctx context.Context, id uuid.UUID) {
 		ID:           id,
 		Email:        id.String() + "@example.com",
 		PasswordHash: "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
-		Locale:       "en",
+		Locale:       "ru",
 	}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
