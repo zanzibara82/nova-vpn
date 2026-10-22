@@ -1,0 +1,693 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NovaVPN — Дизайн-система</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ---------- tokens ---------- */
+:root {
+  --nv-bg: #0A0E1A;
+  --nv-surface-1: #121828;
+  --nv-surface-2: #1A2135;
+  --nv-border: #232B3F;
+  --nv-input-border: #5B6B94;
+  --nv-text-1: #F3F5FA;
+  --nv-text-2: #A6B0C3;
+  --nv-text-muted: #7C86A3;
+  --nv-accent: #5180F4;
+  --nv-accent-strong: #3D66CE;
+  --nv-accent-soft: rgba(81, 128, 244, .06);
+  --nv-success: #34D399;
+  --nv-warning: #FBBF24;
+  --nv-danger: #F87171;
+  --nv-success-soft: rgba(52, 211, 153, .12);
+  --nv-warning-soft: rgba(251, 191, 36, .12);
+  --nv-danger-soft: rgba(248, 113, 113, .12);
+  --nv-radius-s: 6px;
+  --nv-radius-m: 10px;
+  --nv-radius-l: 14px;
+  --nv-shadow-card: 0 1px 2px rgba(0, 0, 0, .4);
+  --nv-shadow-dialog: 0 8px 24px rgba(0, 0, 0, .5);
+}
+:root[data-theme="light"] {
+  --nv-bg: #F6F8FC;
+  --nv-surface-1: #FFFFFF;
+  --nv-surface-2: #EFF2F8;
+  --nv-border: #DCE2EE;
+  --nv-input-border: #7F8CA8;
+  --nv-text-1: #131A29;
+  --nv-text-2: #47536B;
+  --nv-text-muted: #647084;
+  --nv-accent: #3D66CE;
+  --nv-accent-strong: #2F55B8;
+  --nv-accent-soft: rgba(61, 102, 206, .10);
+  --nv-success: #047857;
+  --nv-warning: #92400E;
+  --nv-danger: #B91C1C;
+  --nv-success-soft: rgba(4, 120, 87, .12);
+  --nv-warning-soft: rgba(146, 64, 14, .12);
+  --nv-danger-soft: rgba(185, 28, 28, .12);
+  --nv-shadow-card: 0 1px 2px rgba(19, 26, 41, .06);
+  --nv-shadow-dialog: 0 8px 24px rgba(19, 26, 41, .12);
+}
+
+/* ---------- base ---------- */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--nv-bg);
+  color: var(--nv-text-1);
+  font: 400 15px/23px Inter, "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--nv-accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, .mono { font-family: "JetBrains Mono", Consolas, monospace; font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
+:focus-visible { outline: 2px solid var(--nv-accent); outline-offset: 2px; }
+
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 24px;
+  background: color-mix(in srgb, var(--nv-bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--nv-border);
+}
+.topbar__brand { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.topbar__mark {
+  width: 12px; height: 12px; border-radius: 999px;
+  background: var(--nv-accent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--nv-accent) 40%, transparent);
+}
+.topbar__sub { color: var(--nv-text-muted); font-weight: 400; }
+
+.layout { display: flex; gap: 32px; max-width: 1180px; margin: 0 auto; padding: 24px; }
+.rail { flex: 0 0 200px; position: sticky; top: 72px; align-self: flex-start; }
+.rail ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.rail a {
+  display: block; padding: 7px 12px; border-radius: var(--nv-radius-s);
+  color: var(--nv-text-2); font-size: 13px; line-height: 18px;
+}
+.rail a:hover { background: var(--nv-surface-2); color: var(--nv-text-1); text-decoration: none; }
+.content { flex: 1 1 auto; min-width: 0; }
+
+.section { margin: 0 0 56px; scroll-margin-top: 84px; }
+.section__label {
+  margin: 0 0 4px; font-size: 11px; line-height: 16px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .08em; color: var(--nv-text-muted);
+}
+.section__title { margin: 0 0 8px; font-size: 20px; line-height: 28px; font-weight: 600; }
+.section__lead { margin: 0 0 24px; color: var(--nv-text-2); max-width: 640px; }
+
+.card {
+  background: var(--nv-surface-1);
+  border: 1px solid var(--nv-border);
+  border-radius: var(--nv-radius-m);
+  box-shadow: var(--nv-shadow-card);
+  padding: 24px;
+  margin: 0 0 20px;
+}
+.card__title { margin: 0 0 4px; font-size: 17px; line-height: 24px; font-weight: 600; }
+.card__note { margin: 0 0 16px; color: var(--nv-text-muted); font-size: 13px; line-height: 18px; }
+
+.row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start; }
+.row--center { align-items: center; }
+
+.sample-tag {
+  display: inline-block; margin-left: 8px; padding: 1px 8px;
+  border: 1px solid var(--nv-border); border-radius: 999px;
+  color: var(--nv-text-muted); font-size: 11px; line-height: 16px;
+  vertical-align: 2px;
+}
+
+/* ---------- palette ---------- */
+.swatch-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+.swatch { border: 1px solid var(--nv-border); border-radius: var(--nv-radius-s); overflow: hidden; }
+.swatch__chip { height: 56px; }
+.swatch__meta { padding: 8px 10px; background: var(--nv-surface-1); }
+.swatch__name { font-size: 12px; line-height: 16px; font-weight: 600; }
+.swatch__hex { font-family: "JetBrains Mono", Consolas, monospace; font-size: 11px; line-height: 16px; color: var(--nv-text-muted); }
+
+/* ---------- typography ---------- */
+.specimen { padding: 14px 0; border-bottom: 1px solid var(--nv-border); }
+.specimen:last-child { border-bottom: 0; }
+.specimen__meta { display: flex; gap: 8px; align-items: baseline; margin-bottom: 4px; }
+.specimen__role { font-size: 12px; font-weight: 600; color: var(--nv-text-2); }
+.specimen__size { font-family: "JetBrains Mono", Consolas, monospace; font-size: 11px; color: var(--nv-text-muted); }
+.specimen__text { margin: 0; color: var(--nv-text-1); }
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* ---------- controls ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  height: 36px; padding: 0 16px;
+  border: 1px solid transparent; border-radius: var(--nv-radius-s);
+  font: 500 15px/23px Inter, "Segoe UI", system-ui, sans-serif;
+  cursor: pointer; white-space: nowrap;
+}
+.btn--s { height: 28px; padding: 0 12px; font-size: 13px; line-height: 18px; }
+.btn--primary { background: var(--nv-accent-strong); color: #FFFFFF; }
+.btn--primary:hover { filter: brightness(1.08); }
+.btn--secondary { background: var(--nv-surface-2); color: var(--nv-text-1); border-color: var(--nv-border); }
+.btn--secondary:hover { border-color: var(--nv-input-border); }
+.btn--ghost { background: transparent; color: var(--nv-accent); }
+.btn--ghost:hover { background: var(--nv-accent-soft); }
+.btn--danger { background: transparent; color: var(--nv-danger); border-color: color-mix(in srgb, var(--nv-danger) 45%, transparent); }
+.btn--danger:hover { background: var(--nv-danger-soft); }
+.btn:disabled { background: var(--nv-surface-2); color: var(--nv-text-muted); border-color: transparent; cursor: not-allowed; }
+
+.field { display: flex; flex-direction: column; gap: 6px; max-width: 320px; }
+.field__label { font-size: 13px; line-height: 18px; color: var(--nv-text-2); }
+.input, .select {
+  height: 36px; padding: 0 12px; width: 100%;
+  background: var(--nv-surface-2); color: var(--nv-text-1);
+  border: 1px solid var(--nv-input-border); border-radius: var(--nv-radius-s);
+  font: 400 15px/23px Inter, "Segoe UI", system-ui, sans-serif;
+}
+:root[data-theme="light"] .input, :root[data-theme="light"] .select { background: var(--nv-surface-1); }
+.input::placeholder { color: var(--nv-text-muted); }
+.input--error { border-color: var(--nv-danger); }
+.field__error { font-size: 13px; line-height: 18px; color: var(--nv-danger); }
+
+.check { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
+.check input { position: absolute; opacity: 0; pointer-events: none; }
+.check__box {
+  width: 18px; height: 18px; flex: 0 0 18px;
+  border: 1px solid var(--nv-input-border); border-radius: 4px;
+  background: var(--nv-surface-2); position: relative;
+}
+.check input:checked + .check__box { background: var(--nv-accent-strong); border-color: var(--nv-accent-strong); }
+.check input:checked + .check__box::after {
+  content: ""; position: absolute; left: 5px; top: 1px;
+  width: 5px; height: 10px; border: solid #FFFFFF; border-width: 0 2px 2px 0; transform: rotate(45deg);
+}
+.check input:focus-visible + .check__box { outline: 2px solid var(--nv-accent); outline-offset: 2px; }
+
+.switch { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; pointer-events: none; }
+.switch__track {
+  width: 38px; height: 22px; flex: 0 0 38px; border-radius: 999px;
+  background: var(--nv-surface-2); border: 1px solid var(--nv-input-border);
+  position: relative; transition: background .15s ease, border-color .15s ease;
+}
+.switch__track::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 16px; height: 16px; border-radius: 999px; background: var(--nv-text-2);
+  transition: transform .15s ease, background .15s ease;
+}
+.switch input:checked + .switch__track { background: var(--nv-accent-strong); border-color: var(--nv-accent-strong); }
+.switch input:checked + .switch__track::after { transform: translateX(16px); background: #FFFFFF; }
+.switch input:focus-visible + .switch__track { outline: 2px solid var(--nv-accent); outline-offset: 2px; }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 10px; border-radius: 999px;
+  font-size: 13px; line-height: 18px; font-weight: 500;
+}
+.badge__dot { width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+.badge--success { color: var(--nv-success); background: var(--nv-success-soft); }
+.badge--warning { color: var(--nv-warning); background: var(--nv-warning-soft); }
+.badge--danger { color: var(--nv-danger); background: var(--nv-danger-soft); }
+.badge--muted { color: var(--nv-text-muted); background: var(--nv-surface-2); }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 12px; border-radius: 999px;
+  color: var(--nv-accent); background: var(--nv-accent-soft);
+  font-size: 13px; line-height: 18px; font-weight: 500;
+}
+
+/* ---------- table ---------- */
+.table { width: 100%; border-collapse: collapse; }
+.table th {
+  text-align: left; padding: 8px 12px;
+  font-size: 13px; line-height: 18px; font-weight: 500; color: var(--nv-text-muted);
+  border-bottom: 1px solid var(--nv-border);
+}
+.table td { padding: 12px; font-size: 15px; line-height: 23px; border-bottom: 1px solid var(--nv-border); }
+.table tbody tr:hover { background: var(--nv-surface-2); }
+.table .mono { word-break: break-all; }
+
+/* ---------- dialog ---------- */
+.dialog {
+  max-width: 400px; margin: 0 auto;
+  background: var(--nv-surface-1);
+  border: 1px solid var(--nv-border); border-radius: var(--nv-radius-l);
+  box-shadow: var(--nv-shadow-dialog);
+  padding: 24px;
+}
+.dialog__title { margin: 0 0 8px; font-size: 17px; line-height: 24px; font-weight: 600; }
+.dialog__text { margin: 0 0 20px; color: var(--nv-text-2); }
+.dialog__actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ---------- toast ---------- */
+.toast {
+  display: flex; align-items: center; gap: 10px;
+  max-width: 420px; margin: 0 auto 12px;
+  background: var(--nv-surface-2);
+  border: 1px solid var(--nv-border); border-radius: var(--nv-radius-m);
+  box-shadow: var(--nv-shadow-card);
+  padding: 12px 16px; font-size: 13px; line-height: 18px;
+}
+.toast__dot { width: 8px; height: 8px; border-radius: 999px; flex: 0 0 8px; }
+.toast--success .toast__dot { background: var(--nv-success); }
+.toast--danger .toast__dot { background: var(--nv-danger); }
+
+/* ---------- link ring ---------- */
+.ring-stage { display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+.ring-button { background: none; border: 0; padding: 0; cursor: pointer; }
+.ring { width: 96px; height: 96px; display: block; }
+.ring circle {
+  fill: none; stroke-width: 4; stroke-linecap: round;
+  stroke: var(--nv-text-muted);
+  stroke-dasharray: 136.2 27.2;
+  transition: stroke .2s ease;
+}
+.ring--connecting circle { stroke: var(--nv-accent); }
+.ring--connecting .ring__spin { animation: spin 1.2s linear infinite; transform-origin: 48px 48px; }
+.ring--connected circle {
+  stroke: var(--nv-accent);
+  filter: drop-shadow(0 0 6px color-mix(in srgb, var(--nv-accent) 35%, transparent));
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.ring-status { display: flex; flex-direction: column; gap: 2px; }
+.ring-status__label { font-weight: 600; }
+.ring-status__hint { color: var(--nv-text-muted); font-size: 13px; line-height: 18px; }
+@media (prefers-reduced-motion: reduce) {
+  .ring--connecting .ring__spin { animation: none; }
+  .switch__track, .switch__track::after { transition: none; }
+}
+
+/* ---------- contrast table ---------- */
+.contrast-table { width: 100%; border-collapse: collapse; font-size: 13px; line-height: 18px; }
+.contrast-table th, .contrast-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--nv-border); }
+.contrast-table th { color: var(--nv-text-muted); font-weight: 500; }
+.contrast-table td:not(:first-child) { font-family: "JetBrains Mono", Consolas, monospace; }
+
+.footer { border-top: 1px solid var(--nv-border); padding: 24px; color: var(--nv-text-muted); font-size: 13px; line-height: 18px; }
+.footer p { margin: 0 0 4px; max-width: 1180px; margin-inline: auto; }
+
+@media (max-width: 900px) {
+  .layout { flex-direction: column; padding: 16px; }
+  .rail { flex: none; position: static; }
+  .rail ul { flex-direction: row; flex-wrap: wrap; }
+  .topbar { padding: 12px 16px; }
+  .card { padding: 16px; }
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="topbar__mark" aria-hidden="true"></span>
+    NovaVPN
+    <span class="topbar__sub">Дизайн-система</span>
+  </div>
+  <button class="btn btn--secondary btn--s" id="theme-toggle" type="button" aria-pressed="false">Светлая тема</button>
+</header>
+
+<div class="layout">
+  <nav class="rail" aria-label="Разделы">
+    <ul>
+      <li><a href="#overview">Обзор</a></li>
+      <li><a href="#palette">Палитра</a></li>
+      <li><a href="#typography">Типографика</a></li>
+      <li><a href="#components">Компоненты</a></li>
+      <li><a href="#ring">Кольцо связи</a></li>
+      <li><a href="#contrast">Аудит контраста</a></li>
+    </ul>
+  </nav>
+
+  <main class="content">
+
+    <section class="section" id="overview">
+      <p class="section__label">Обзор</p>
+      <h1 class="section__title">Один визуальный язык для всех поверхностей</h1>
+      <p class="section__lead">
+        Премиальные тёмные поверхности с холодным синим подтоном, один сдержанный акцент и один
+        запоминающийся элемент — кольцо связи. Эта страница — живой справочник палитры,
+        типографики и базовых компонентов. Письменная спецификация —
+        <code>docs/superpowers/specs/2026-10-22-novavpn-design-system-blue-black.md</code>.
+      </p>
+      <div class="card">
+        <p class="card__title">Правила, действующие везде</p>
+        <ul class="card__note" style="margin:0; padding-left:20px; color:var(--nv-text-2);">
+          <li>Тёмная тема — по умолчанию; светлая — та же структура с другими значениями.</li>
+          <li>Синий появляется только там, где сообщает факт: взаимодействие, выбор, соединение.</li>
+          <li>Каждая пара «текст / граница» проверена расчётом контраста (см. Аудит контраста).</li>
+          <li>Статусы сообщают факты: Подключено, Отключено, Ошибка — и ничего больше.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section" id="palette">
+      <p class="section__label">Палитра</p>
+      <h2 class="section__title">Токены</h2>
+      <p class="section__lead">
+        Семантические CSS-переменные с префиксом <code>--nv-</code>. Компоненты ссылаются на
+        токены, а не на сырые hex-значения. Переключите тему в шапке — образцы ниже отражают
+        активную тему.
+      </p>
+
+      <div class="card">
+        <p class="card__title">Поверхности и текст</p>
+        <div class="swatch-grid">
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-bg)"></div><div class="swatch__meta"><div class="swatch__name">bg</div><div class="swatch__hex" data-hex>--nv-bg</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-surface-1)"></div><div class="swatch__meta"><div class="swatch__name">surface-1</div><div class="swatch__hex" data-hex>--nv-surface-1</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-surface-2)"></div><div class="swatch__meta"><div class="swatch__name">surface-2</div><div class="swatch__hex" data-hex>--nv-surface-2</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-input-border)"></div><div class="swatch__meta"><div class="swatch__name">input-border</div><div class="swatch__hex" data-hex>--nv-input-border</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-text-1)"></div><div class="swatch__meta"><div class="swatch__name">text-1</div><div class="swatch__hex" data-hex>--nv-text-1</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-text-2)"></div><div class="swatch__meta"><div class="swatch__name">text-2</div><div class="swatch__hex" data-hex>--nv-text-2</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-text-muted)"></div><div class="swatch__meta"><div class="swatch__name">text-muted</div><div class="swatch__hex" data-hex>--nv-text-muted</div></div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="card__title">Акцент и статусы</p>
+        <div class="swatch-grid">
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-accent)"></div><div class="swatch__meta"><div class="swatch__name">accent</div><div class="swatch__hex" data-hex>--nv-accent</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-accent-strong)"></div><div class="swatch__meta"><div class="swatch__name">accent-strong</div><div class="swatch__hex" data-hex>--nv-accent-strong</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-surface-1)"><span style="display:block;width:100%;height:100%;background:var(--nv-accent-soft)"></span></div><div class="swatch__meta"><div class="swatch__name">accent-soft on surface-1</div><div class="swatch__hex">смешение, см. спек</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-success)"></div><div class="swatch__meta"><div class="swatch__name">success</div><div class="swatch__hex" data-hex>--nv-success</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-warning)"></div><div class="swatch__meta"><div class="swatch__name">warning</div><div class="swatch__hex" data-hex>--nv-warning</div></div></div>
+          <div class="swatch"><div class="swatch__chip" style="background:var(--nv-danger)"></div><div class="swatch__meta"><div class="swatch__name">danger</div><div class="swatch__hex" data-hex>--nv-danger</div></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="typography">
+      <p class="section__label">Типографика</p>
+      <h2 class="section__title">Inter для чтения, JetBrains Mono для машин</h2>
+      <p class="section__lead">
+        Ключи, адреса и идентификаторы набираются моно с переносом по символам.
+        Числовые колонки используют табличные цифры.
+      </p>
+      <div class="card">
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">display</span><span class="specimen__size">Inter 600 · 28/36</span></div>
+          <p class="specimen__text" style="font-size:28px;line-height:36px;font-weight:600;margin:0;">Все ваши устройства — один туннель.</p>
+        </div>
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">title-1</span><span class="specimen__size">Inter 600 · 20/28</span></div>
+          <p class="specimen__text" style="font-size:20px;line-height:28px;font-weight:600;">Устройства</p>
+        </div>
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">title-2</span><span class="specimen__size">Inter 600 · 17/24</span></div>
+          <p class="specimen__text" style="font-size:17px;line-height:24px;font-weight:600;">Удалить устройство?</p>
+        </div>
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">body</span><span class="specimen__size">Inter 400 · 15/23</span></div>
+          <p class="specimen__text">Устройство будет отключено, и для повторного подключения его нужно добавить заново.</p>
+        </div>
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">small</span><span class="specimen__size">Inter 400 · 13/18</span></div>
+          <p class="specimen__text" style="font-size:13px;line-height:18px;">Подключалось 2 минуты назад</p>
+        </div>
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">micro-label</span><span class="specimen__size">Inter 600 · 11/16 · +0.08em</span></div>
+          <p class="section__label" style="margin:0;">Управление устройствами</p>
+        </div>
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">mono</span><span class="specimen__size">JetBrains Mono 400 · 13/20</span></div>
+          <p class="specimen__text mono">wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iJ=</p>
+        </div>
+        <div class="specimen">
+          <div class="specimen__meta"><span class="specimen__role">табличные цифры</span><span class="specimen__size">Inter · tnum</span></div>
+          <p class="specimen__text tnum mono" style="font-family:Inter,'Segoe UI',system-ui,sans-serif;">8,192 &nbsp; 1,024 &nbsp; 2,048 &nbsp; 16,384</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="components">
+      <p class="section__label">Компоненты</p>
+      <h2 class="section__title">Базовые компоненты</h2>
+      <p class="section__lead">
+        Кнопки называют действие, ошибки объясняют, как исправить, а демо-данные всегда помечены.
+      </p>
+
+      <div class="card">
+        <p class="card__title">Кнопки</p>
+        <p class="card__note">Варианты: основная, вторичная, бесконтурная, опасная. Размеры: m (36 px), s (28 px).</p>
+        <div class="row">
+          <button class="btn btn--primary" type="button">Подключить</button>
+          <button class="btn btn--secondary" type="button">Добавить устройство</button>
+          <button class="btn btn--ghost" type="button">Подробнее</button>
+          <button class="btn btn--danger" type="button">Удалить устройство</button>
+          <button class="btn btn--primary btn--s" type="button">Сохранить изменения</button>
+          <button class="btn btn--secondary" type="button" disabled>Сохранение…</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="card__title">Поля</p>
+        <p class="card__note">Поле, состояние ошибки и селект делят один каркас. Подписи объясняют, ошибки направляют.</p>
+        <div class="row" style="gap:24px;">
+          <label class="field">
+            <span class="field__label">Имя устройства</span>
+            <input class="input" type="text" placeholder="Например, рабочий ноутбук">
+          </label>
+          <label class="field">
+            <span class="field__label">Имя устройства</span>
+            <input class="input input--error" type="text" value="R" aria-invalid="true">
+            <span class="field__error">Используйте 2–64 символа. Это имя видно только вам.</span>
+          </label>
+          <label class="field">
+            <span class="field__label">Платформа</span>
+            <select class="select">
+              <option>macOS</option>
+              <option>Windows</option>
+              <option>Linux</option>
+              <option>Android</option>
+              <option>iOS</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="card__title">Выбор</p>
+        <p class="card__note">Чекбокс и переключатель. Включённое состояние никогда не опирается только на цвет.</p>
+        <div class="row" style="gap:24px;">
+          <label class="check"><input type="checkbox" checked><span class="check__box"></span>Оставаться в системе</label>
+          <label class="switch"><input type="checkbox" checked><span class="switch__track"></span>Подключаться при запуске</label>
+          <label class="switch"><input type="checkbox"><span class="switch__track"></span>Автоподключение</label>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="card__title">Бейджи и чипы</p>
+        <p class="card__note">Статусы сообщают факты; чипы отмечают выбор.</p>
+        <div class="row">
+          <span class="badge badge--success"><span class="badge__dot"></span>Подключено</span>
+          <span class="badge badge--warning"><span class="badge__dot"></span>Подключается</span>
+          <span class="badge badge--muted"><span class="badge__dot"></span>Отключено</span>
+          <span class="badge badge--warning"><span class="badge__dot"></span>Истекает</span>
+          <span class="badge badge--danger"><span class="badge__dot"></span>Ошибка</span>
+          <span class="chip">Все устройства</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="card__title">Карточка устройства</p>
+        <div class="row" style="gap:20px;">
+          <div class="card" style="margin:0;min-width:280px;flex:1;">
+            <div class="row--center" style="display:flex;justify-content:space-between;margin-bottom:8px;">
+              <p class="card__title" style="margin:0;">MacBook Pro</p>
+              <span class="badge badge--success"><span class="badge__dot"></span>Подключено</span>
+            </div>
+            <p class="mono" style="margin:0 0 4px;color:var(--nv-text-2);">wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iJ=</p>
+            <p class="card__note" style="margin:0 0 12px;">macOS · Добавлено 12 октября 2026</p>
+            <div class="row">
+              <button class="btn btn--secondary btn--s" type="button">Переименовать</button>
+              <button class="btn btn--danger btn--s" type="button">Удалить</button>
+            </div>
+          </div>
+          <div class="card" style="margin:0;min-width:280px;flex:1;">
+            <div class="row--center" style="display:flex;justify-content:space-between;margin-bottom:8px;">
+              <p class="card__title" style="margin:0;">Pixel 8</p>
+              <span class="badge badge--muted"><span class="badge__dot"></span>Отключено</span>
+            </div>
+            <p class="mono" style="margin:0 0 4px;color:var(--nv-text-2);">cR8uX1yB4cD6eF8gH0iJwTpNl3mZ3GJdF0nQ2hK2sV7pR9u</p>
+            <p class="card__note" style="margin:0 0 12px;">Android · Добавлено 18 октября 2026</p>
+            <div class="row">
+              <button class="btn btn--secondary btn--s" type="button">Переименовать</button>
+              <button class="btn btn--danger btn--s" type="button">Удалить</button>
+            </div>
+          </div>
+        </div>
+        <p class="card__note" style="margin:12px 0 0;">Демо-данные — реальные устройства не показаны.</p>
+      </div>
+
+      <div class="card" style="overflow-x:auto;">
+        <p class="card__title">Таблица устройств<span class="sample-tag">Демо-данные</span></p>
+        <table class="table">
+          <thead>
+            <tr><th>Имя</th><th>Платформа</th><th>Публичный ключ</th><th>Статус</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>MacBook Pro</td><td>macOS</td>
+              <td class="mono">wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iJ=</td>
+              <td><span class="badge badge--success"><span class="badge__dot"></span>Подключено</span></td>
+            </tr>
+            <tr>
+              <td>Framework 13</td><td>Linux</td>
+              <td class="mono">v7pR9uX1yB4cD6eF8gH0iJwTpNl3mZ3GJdF0nQ2hK2s</td>
+              <td><span class="badge badge--muted"><span class="badge__dot"></span>Отключено</span></td>
+            </tr>
+            <tr>
+              <td>Pixel 8</td><td>Android</td>
+              <td class="mono">cR8uX1yB4cD6eF8gH0iJwTpNl3mZ3GJdF0nQ2hK2sV7pR9u</td>
+              <td><span class="badge badge--warning"><span class="badge__dot"></span>Подключается</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <p class="card__title">Диалог</p>
+        <p class="card__note">Подтверждение справа; опасное действие выделено вариантом, а не уговорами.</p>
+        <div class="dialog">
+          <p class="dialog__title">Удалить устройство?</p>
+          <p class="dialog__text">Устройство будет отключено, и для повторного подключения его нужно добавить заново.</p>
+          <div class="dialog__actions">
+            <button class="btn btn--secondary" type="button">Отмена</button>
+            <button class="btn btn--danger" type="button">Удалить устройство</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <p class="card__title">Уведомления</p>
+        <div class="toast toast--success"><span class="toast__dot"></span>Настройки сохранены</div>
+        <div class="toast toast--danger"><span class="toast__dot"></span>Не удалось подключиться. Проверьте сеть и попробуйте снова.</div>
+      </div>
+    </section>
+
+    <section class="section" id="ring">
+      <p class="section__label">Подпись</p>
+      <h2 class="section__title">Кольцо связи</h2>
+      <p class="section__lead">
+        Единственный запоминающийся элемент: кольцо 2 px с разрывом 60° — туннель. Это
+        единственное свечение в системе, и означает оно одно: соединение живо. Нажмите, чтобы
+        перебрать состояния.
+      </p>
+      <div class="card">
+        <div class="ring-stage">
+          <button class="ring-button" id="ring-demo" type="button" aria-label="Переключить состояние соединения">
+            <svg class="ring" id="ring-svg" viewBox="0 0 96 96" role="img">
+              <g class="ring__spin"><circle cx="48" cy="48" r="26" transform="rotate(-90 48 48)"></circle></g>
+            </svg>
+          </button>
+          <div class="ring-status">
+            <span class="ring-status__label" id="ring-label">Отключено</span>
+            <span class="ring-status__hint" id="ring-hint">Нажмите, чтобы подключить</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="contrast">
+      <p class="section__label">Аудит контраста</p>
+      <h2 class="section__title">Измерено, а не обещано</h2>
+      <p class="section__lead">
+        Каждая пара ниже вычислена по формуле относительной яркости WCAG
+        (<code>.scratch/contrast_audit.py</code>). Пороги: 4,5:1 для текста, 3:1 для границ
+        элементов управления.
+      </p>
+      <div class="card" style="overflow-x:auto;">
+        <table class="contrast-table">
+          <thead><tr><th>Пара</th><th>Тёмная</th><th>Светлая</th></tr></thead>
+          <tbody>
+            <tr><td>text-1 / bg</td><td>17.65</td><td>16.36</td></tr>
+            <tr><td>text-1 / surface-1</td><td>16.22</td><td>17.39</td></tr>
+            <tr><td>text-2 / surface-1</td><td>8.10</td><td>7.73</td></tr>
+            <tr><td>text-muted / surface-1</td><td>4.88</td><td>5.01</td></tr>
+            <tr><td>accent / bg</td><td>5.27</td><td>4.95</td></tr>
+            <tr><td>accent / surface-1</td><td>4.84</td><td>5.26</td></tr>
+            <tr><td>white / accent-strong</td><td>5.26</td><td>6.75</td></tr>
+            <tr><td>success / surface-1</td><td>9.20</td><td>5.48</td></tr>
+            <tr><td>warning / surface-1</td><td>10.60</td><td>7.09</td></tr>
+            <tr><td>danger / surface-1</td><td>6.40</td><td>6.47</td></tr>
+            <tr><td>accent / accent-soft chip</td><td>4.52</td><td>4.61</td></tr>
+            <tr><td>success / soft badge</td><td>7.39</td><td>4.63</td></tr>
+            <tr><td>warning / soft badge</td><td>8.35</td><td>5.88</td></tr>
+            <tr><td>danger / soft badge</td><td>5.42</td><td>5.29</td></tr>
+            <tr><td>input-border / surface-1</td><td>3.35</td><td>3.38</td></tr>
+            <tr><td>input-border / bg</td><td>3.65</td><td>3.18</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<footer class="footer">
+  <p>NovaVPN Дизайн-система · спек: docs/superpowers/specs/2026-10-22-novavpn-design-system-blue-black.md</p>
+  <p>Декоративные линии (<code>--nv-border</code>) освобождены от правила 3:1; каждая узнаваемая граница элемента управления использует <code>--nv-input-border</code>.</p>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var root = document.documentElement;
+  var toggle = document.getElementById("theme-toggle");
+
+  function syncThemeLabel() {
+    var dark = root.getAttribute("data-theme") !== "light";
+    toggle.textContent = dark ? "Светлая тема" : "Тёмная тема";
+    toggle.setAttribute("aria-pressed", String(!dark));
+  }
+  toggle.addEventListener("click", function () {
+    root.setAttribute("data-theme",
+      root.getAttribute("data-theme") === "light" ? "dark" : "light");
+    syncThemeLabel();
+  });
+  syncThemeLabel();
+
+  var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var ring = document.getElementById("ring-demo");
+  var svg = document.getElementById("ring-svg");
+  var label = document.getElementById("ring-label");
+  var hint = document.getElementById("ring-hint");
+  var state = "disconnected";
+  var timer = null;
+
+  function setState(next) {
+    state = next;
+    svg.classList.remove("ring--connecting", "ring--connected");
+    if (next === "connecting") {
+      svg.classList.add("ring--connecting");
+      label.textContent = "Подключается";
+      hint.textContent = "Устанавливаем туннель…";
+      if (!reduceMotion) {
+        timer = window.setTimeout(function () { setState("connected"); }, 1200);
+      } else {
+        setState("connected");
+      }
+    } else if (next === "connected") {
+      svg.classList.add("ring--connected");
+      label.textContent = "Подключено";
+      hint.textContent = "Нажмите, чтобы отключить";
+    } else {
+      label.textContent = "Отключено";
+      hint.textContent = "Нажмите, чтобы подключить";
+    }
+  }
+
+  ring.addEventListener("click", function () {
+    if (timer) { window.clearTimeout(timer); timer = null; }
+    if (state === "connected") { setState("disconnected"); }
+    else if (state === "disconnected") { setState("connecting"); }
+  });
+})();
+</script>
+</body>
+</html>
