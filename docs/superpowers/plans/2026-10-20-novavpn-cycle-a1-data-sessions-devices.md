@@ -3121,8 +3121,9 @@ type AccessToken struct {
 }
 
 type Claims struct {
-	UserID uuid.UUID
-	JTI    string
+	UserID    uuid.UUID
+	JTI       string
+	ExpiresAt time.Time
 }
 
 type Issuer struct {
@@ -3304,7 +3305,7 @@ Expected: `make unit` зелёный; `TestDenylistAddAndContains` и
 Обе проверки denylist используют ключ `deny:<jti>` — совпадение с планом восстановления S5.
 
 ```bash
-git add internal/auth
+git add internal/auth go.mod go.sum
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(auth): короткоживущий access JWT с jti и denylist в Redis"
 ```
