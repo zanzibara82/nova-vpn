@@ -2308,8 +2308,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Files:**
 - Create: `internal/httpx/idempotency.go`, `internal/db/query/idempotency.sql`,
-  `internal/httpx/context.go`, `tests/integration/helpers_test.go`,
-  `tests/integration/idempotency_test.go`
+  `internal/httpx/context.go`, `internal/httpx/idempotency_pg.go`,
+  `migrations/0004_idempotency_response_body_bytea.up.sql`,
+  `migrations/0004_idempotency_response_body_bytea.down.sql`,
+  `tests/integration/helpers_test.go`, `tests/integration/idempotency_test.go`
 - Modify: `internal/httpx/envelope.go` (коды уже объявлены — проверить, что
   `ErrIdempotencyKeyRequired`, `ErrIdempotencyConflict`, `ErrIdempotencyInProgress` на месте)
 
@@ -2382,8 +2384,25 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/httpx"
 )
+
+// seedIdemUser создаёт строку в users: idempotency_keys.user_id ссылается на
+// users(id) (FK ON DELETE CASCADE), а случайный UUID без строки не прошёл бы.
+// Имя отлично от seedUser задач 12+, чтобы не конфликтовать с будущим хелпером.
+func seedIdemUser(t *testing.T, ctx context.Context, id uuid.UUID) {
+	t.Helper()
+	q := db.New(pool(t))
+	if _, err := q.InsertUser(ctx, db.InsertUserParams{
+		ID:           id,
+		Email:        id.String() + "@example.com",
+		PasswordHash: "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
+		Locale:       "en",
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+}
 
 // mkIdempotency строит middleware поверх счётного обработчика: счётчик показывает,
 // что повтор не дошёл до бизнес-логики.
@@ -2405,22 +2424,23 @@ func TestIdempotentReplay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	user, idemKey := uuid.New(), uuid.NewString()
+	seedIdemUser(t, ctx, user)
 	calls := 0
 	h := mkIdempotency(t, &calls)
 	body := []byte(`{"public_key":"wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iJ=","platform":"linux","name":"laptop"}`)
 
-	run := func(payload []byte, withKey bool) *httptest.ResponseRecorder {
+	run := func(payload []byte, withKey bool, u uuid.UUID) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/devices", bytes.NewReader(payload)).WithContext(ctx)
 		req.Header.Set("Content-Type", "application/json")
 		if withKey {
 			req.Header.Set("Idempotency-Key", idemKey)
 		}
 		w := httptest.NewRecorder()
-		h.ServeHTTP(w, withUser(req, user))
+		h.ServeHTTP(w, withUser(req, u))
 		return w
 	}
 
-	first, second := run(body, true), run(body, true)
+	first, second := run(body, true, user), run(body, true, user)
 	if first.Code != http.StatusCreated || second.Code != http.StatusCreated {
 		t.Fatalf("statuses: %d / %d", first.Code, second.Code)
 	}
@@ -2436,19 +2456,21 @@ func TestIdempotentReplay(t *testing.T) {
 
 	// Тот же ключ, другое тело → 409 idempotency_key_conflict.
 	other := []byte(`{"public_key":"wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iK=","platform":"linux","name":"phone"}`)
-	w := run(other, true)
+	w := run(other, true, user)
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"code":"idempotency_key_conflict"`) {
 		t.Fatalf("conflict body = %d %s", w.Code, w.Body)
 	}
 
 	// Отсутствие обязательного ключа → 400 idempotency_key_required.
-	w = run(other, false)
+	w = run(other, false, user)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"code":"idempotency_key_required"`) {
 		t.Fatalf("missing key: %d %s", w.Code, w.Body)
 	}
 
 	// Другой пользователь с тем же ключом — не чужой результат (изолированный скоуп).
-	w = run(body, true)
+	user2 := uuid.New()
+	seedIdemUser(t, ctx, user2)
+	w = run(body, true, user2)
 	if w.Code != http.StatusCreated || !strings.Contains(w.Body.String(), `"call":2`) {
 		t.Fatalf("same key, second user must run fresh: %d %s", w.Code, w.Body)
 	}
@@ -2532,7 +2554,6 @@ import (
 	"crypto/sha256"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -2597,9 +2618,10 @@ func (i *Idempotency) Middleware(route string) func(http.Handler) http.Handler {
 					return
 				}
 				// Повтор: отдать сохранённый результат, бизнес-логику не трогать.
+				// ResponseStatus не nil: Complete пишет его вместе с completed_at.
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("Idempotency-Replayed", "true")
-				w.WriteHeader(existing.ResponseStatus)
+				w.WriteHeader(int(*existing.ResponseStatus))
 				_, _ = w.Write(existing.ResponseBody)
 				return
 			}
@@ -2620,8 +2642,8 @@ func (i *Idempotency) Middleware(route string) func(http.Handler) http.Handler {
 
 type captureWriter struct {
 	http.ResponseWriter
-	status   int
-	body     bytes.Buffer
+	status    int
+	body      bytes.Buffer
 	completed bool
 }
 
@@ -2646,10 +2668,8 @@ package httpx
 
 import (
 	"context"
-	"errors"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/novavpn/novavpn/internal/db"
 )
@@ -2659,18 +2679,19 @@ type PGIdempotency struct{ q *db.Queries }
 func NewPGIdempotency(pool db.DBTX) *PGIdempotency { return &PGIdempotency{q: db.New(pool)} }
 
 func (p *PGIdempotency) Claim(ctx context.Context, userID uuid.UUID, route, key string, hash []byte) (db.IdempotencyKey, bool, error) {
-	if err := p.q.ClaimIdempotencyKey(ctx, db.ClaimIdempotencyKeyParams{
+	inserted, err := p.q.ClaimIdempotencyKey(ctx, db.ClaimIdempotencyKeyParams{
 		ID: uuid.New(), UserID: userID, Route: route, IdemKey: key, RequestHash: hash,
-	}); err != nil {
+	})
+	if err != nil {
 		return db.IdempotencyKey{}, false, err
+	}
+	if inserted == 1 {
+		// ON CONFLICT DO NOTHING: строка вставлена → повтор не найден → слот наш.
+		return db.IdempotencyKey{}, false, nil
 	}
 	existing, err := p.q.LoadIdempotencyKey(ctx, db.LoadIdempotencyKeyParams{
 		UserID: userID, Route: route, IdemKey: key,
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Вставка прошла → повтор не найден → слот наш.
-		return db.IdempotencyKey{}, false, nil
-	}
 	if err != nil {
 		return db.IdempotencyKey{}, false, err
 	}
@@ -2691,12 +2712,43 @@ func (p *PGIdempotency) Abandon(ctx context.Context, userID uuid.UUID, route, ke
 }
 ```
 
-Одновременные Claim/Load не атомарны (между `:execrows` и `SELECT` теоретически влезает
-другой повторыш) — поэтому `CompleteIdempotencyKey` имеет `AND completed_at IS NULL`, а
-`response_status`/`response_body` в схеме nullable: при гонке победителя определяет БД по
-первой записанной версии, а не угадайка в Go. Если тест на гонку из шага 5 нестабилен,
-переносить Claim+Load в одну SQL-функцию (`RETURNING` через CTE) — но только после того,
-как нестабильность наблюдалась, а не заранее.
+Победителя при гонке определяет БД, а не угадайка в Go: `ClaimIdempotencyKey` — это
+`ON CONFLICT DO NOTHING` с `:execrows`, поэтому ровно одна из конкурирующих вставок
+вернёт 1 строку — слот берёт тот, кто вставил; остальные получают 0 и читают
+существующую строку через Load. `CompleteIdempotencyKey` имеет `AND completed_at IS
+NULL`, а `response_status`/`response_body` в схеме nullable: результат фиксирует
+первая запись. Если тест на гонку из шага 5 нестабилен, переносить Claim+Load в одну
+SQL-функцию (`RETURNING` через CTE) — но только после того, как нестабильность
+наблюдалась, а не заранее.
+
+Два расхождения со схемой задачи 4, закрытые миграцией `0004` (в **Files** выше):
+
+- `response_body` стал `bytea`, а не `jsonb`: jsonb нормализует порядок ключей и
+  пробелы, поэтому повтор ключа вернул бы клиенту другие байты, чем первый ответ, и
+  проверка `first.Body == second.Body` в тесте не прошла бы. Повтор обязан отдавать
+  первый результат байт-в-байт (§5.2). `convert_to` вместо `::text::bytea`, чтобы
+  escape-формат bytea не съедал бэкслеши в JSON-строках.
+- `idempotency_keys.user_id` ссылается на `users(id)` (FK ON DELETE CASCADE),
+  поэтому тест сидит пользователя хелпером `seedIdemUser` перед первым запросом —
+  случайный UUID без строки в `users` дал бы 500 на Claim.
+
+`migrations/0004_idempotency_response_body_bytea.up.sql`:
+
+```sql
+-- jsonb нормализует порядок ключей и пробелы: повтор Idempotency-Key отдал бы
+-- клиенту другие байты, чем первый ответ (§5.2 требует вернуть первый результат).
+-- bytea хранит тело как есть; convert_to вместо ::text::bytea, чтобы escape-формат
+-- bytea не съедал бэкслеши в JSON-строках.
+ALTER TABLE idempotency_keys
+    ALTER COLUMN response_body TYPE bytea USING convert_to(response_body::text, 'UTF8');
+```
+
+`migrations/0004_idempotency_response_body_bytea.down.sql`:
+
+```sql
+ALTER TABLE idempotency_keys
+    ALTER COLUMN response_body TYPE jsonb USING convert_from(response_body, 'UTF8')::jsonb;
+```
 
 - [ ] **Step 5: Прогнать и коммитить**
 
@@ -2704,7 +2756,9 @@ Run: `make up-dev && make integration`
 Expected: PASS — `TestIdempotentReplay` зелёный, `calls == 1` на втором запросе.
 
 ```bash
-git add internal/httpx internal/db tests/integration/idempotency_test.go
+git add internal/httpx internal/db migrations/0004_idempotency_response_body_bytea.up.sql \
+  migrations/0004_idempotency_response_body_bytea.down.sql \
+  tests/integration/idempotency_test.go tests/integration/helpers_test.go
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(httpx): идемпотентность критических операций с конфликтом тела"
 ```
