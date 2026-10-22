@@ -397,8 +397,10 @@ up-dev:
 down-dev:
 	$(COMPOSE) down -v
 
+# ./... а не ./tests/integration/...: тегированные тесты живут и внутри пакетов
+# (internal/httpx — лимитер задачи 8), цель обязана гнать все.
 integration:
-	$(docker-go-int) test -count=1 -tags=integration ./tests/integration/...
+	$(docker-go-int) test -count=1 -tags=integration ./...
 
 migrate-up: $(ENV_FILE)
 	$(docker-go-app) run -mod=mod ./services/api/cmd/novavpn-api migrate up
@@ -666,7 +668,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - Consumes: `users`, `devices` (0001).
 - Produces: `server_locations`, `vpn_servers`, `node_credentials`, `vpn_profiles`,
   `tunnel_addresses`; тип `profile_status` с значениями `active`, `superseded`, `revoked`,
-  `expired` и `node_state` = `rotating_old_key`. Индекс `profiles_one_active_per_device_server`
+  `expired` и `peer_state` = `rotating_old_key`. Индекс `profiles_one_active_per_device_server`
   — механизм, на котором держится «двойная выдача невозможна» (спецификация §6).
 
 - [ ] **Step 1: Написать up-миграцию**
@@ -1470,7 +1472,8 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Files:**
 - Create: `sqlc.yaml`, `internal/db/query/identity.sql`, `internal/db/query/plans.sql`,
-  `internal/db/query/devices.sql`, `internal/db/db.go` (конструктор пула)
+  `internal/db/query/devices.sql`, `internal/db/pool.go` (конструктор пула — не `db.go`:
+  файл с таким именем генерирует сам sqlc, и он затирает чужое содержимое)
 
 **Interfaces:**
 - Consumes: схема из задач 2–4.
@@ -1483,6 +1486,11 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   Все сигнатуры — `func (q *Queries) X(ctx context.Context, arg XParams) (Y, error)`;
   где аргумент один, sqlc оставляет скаляр (`UserByEmail(ctx, string)`,
   `CountLiveDevices(ctx, uuid.UUID)`). `New(*pgxpool.Pool) *Queries`.
+  Маппинг типов задан overrides в `sqlc.yaml` и сверен с генерацией 1.27.0:
+  `uuid` → `github.com/google/uuid.UUID` (зависимость приходит уже задачей 6, а не 9),
+  `timestamptz` → `time.Time`, nullable `timestamptz` → `*time.Time`, `inet`/`cidr` →
+  `netip.Addr`/`netip.Prefix`, `citext` → `string`. Nullable `uuid` остаётся
+  `pgtype.UUID` — в цикле A ни один запрос его не читает.
   Тип `db.Queries` принимает `DBTX`, поэтому тесты могут подменять слой БД.
   Перечисления из схемы приходят как `db.UserStatus`, `db.DevicePlatform`
   (определённые строки): в параметры — приведением `db.DevicePlatform(in.Platform)`,
@@ -1510,13 +1518,28 @@ sql:
         emit_json_tags: false
         emit_prepared_queries: false
         # NULL-колонки обязаны стать указателями (*time.Time, *int64, *netip.Addr),
-        # иначе «значение по умолчанию» и «значения нет» будет неотличимы — а это ровно
+        # иначе «значение по умолчанию» и «значения нет» будут неотличимы — а это ровно
         # та подмена, которую запрещает ТЗ §19.3 (метрики без замера = null).
         emit_pointers_for_null_types: true
         overrides:
           # Встроенный Go-тип — плоской строкой; тип из stdlib — вложенной формой.
           - db_type: "citext"
             go_type: "string"
+          # Без override uuid генерируется как pgtype.UUID, но все слои выше (задачи 7+)
+          # работают с google/uuid.UUID, а pgx/v5 умеет кодировать его нативно.
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+          # Без override timestamptz генерируется как pgtype.Timestamptz, а план задач
+          # 12/13/15 сравнивает и присваивает time.Time (ExpiresAt, CreatedAt, RevokedAt).
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+          # Nullable-колонки sqlc ищет отдельным ключом и берёт тип дословно, поэтому
+          # указатель задаётся явно: иначе «значения нет» слилось бы с нулевым временем.
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              type: "time.Time"
+              pointer: true
           - db_type: "cidr"
             go_type:
               import: "net/netip"
@@ -1528,14 +1551,16 @@ sql:
 ```
 
 `inet` — адрес (`netip.Addr`), `cidr` — сеть (`netip.Prefix`); `refresh_token_families.ip`
-и `connection_events.client_ip` хранят адрес, а не сеть, поэтому дальнейшие задачи
-(задачи 12, 17) работают с `*netip.Addr`. Если sqlc не распознает `citext` (расширение иногда требует полное имя `pg_catalog.citext`) — поправить префикс в этих строках, не трогая миграции. Если `inet`
-или `cidr` упорно мапится в `[]byte` — убрать оба вложенных override и преобразовать в
-`netip.Prefix` в слое, который их читает (`connections` появится в A-2). Любое из этих
-решений фиксируется комментарием над `overrides:` в том же коммите, что и сгенерированный
-код, чтобы следующий сборщик не гадал, почему конфиг такой.
+и `vpn_profiles.address_v4` хранят адрес, а не сеть, поэтому дальнейшие задачи
+(задачи 12, 17) работают с `*netip.Addr`. Проверено генерацией 1.27.0: `citext`
+распознан как `string`, `inet`/`cidr` легли в `netip` без переделок. Если в более
+новом sqlc `inet` или `cidr` упорно мапится в `[]byte` — убрать оба вложенных
+override и преобразовать в `netip.Prefix` в слое, который их читает (`connections`
+появится в A-2). Любое из этих решений фиксируется комментарием над `overrides:` в том
+же коммите, что и сгенерированный код, чтобы следующий сборщик не гадал, почему
+конфиг такой.
 
-`internal/db/db.go`:
+`internal/db/pool.go`:
 
 ```go
 package db
@@ -1822,18 +1847,18 @@ import (
 type ErrorCode string
 
 const (
-	ErrInvalidRequest          ErrorCode = "invalid_request"
-	ErrUnauthenticated         ErrorCode = "unauthenticated"
-	ErrAccountLocked           ErrorCode = "account_locked"
+	ErrInvalidRequest         ErrorCode = "invalid_request"
+	ErrUnauthenticated        ErrorCode = "unauthenticated"
+	ErrAccountLocked          ErrorCode = "account_locked"
 	ErrForbidden              ErrorCode = "forbidden"
-	ErrNotFound                ErrorCode = "not_found"
-	ErrConflict                ErrorCode = "conflict"
-	ErrDeviceLimitReached      ErrorCode = "device_limit_reached"
-	ErrDuplicateDevice         ErrorCode = "duplicate_device"
-	ErrIdempotencyKeyRequired  ErrorCode = "idempotency_key_required"
-	ErrIdempotencyConflict     ErrorCode = "idempotency_key_conflict"
-	ErrIdempotencyInProgress   ErrorCode = "idempotency_key_in_progress"
-	ErrRateLimited             ErrorCode = "rate_limited"
+	ErrNotFound               ErrorCode = "not_found"
+	ErrConflict               ErrorCode = "conflict"
+	ErrDeviceLimitReached     ErrorCode = "device_limit_reached"
+	ErrDuplicateDevice        ErrorCode = "duplicate_device"
+	ErrIdempotencyKeyRequired ErrorCode = "idempotency_key_required"
+	ErrIdempotencyConflict    ErrorCode = "idempotency_key_conflict"
+	ErrIdempotencyInProgress  ErrorCode = "idempotency_key_in_progress"
+	ErrRateLimited            ErrorCode = "rate_limited"
 	ErrInternal               ErrorCode = "internal"
 )
 
@@ -1985,7 +2010,7 @@ func DecodeJSON(r *http.Request, dst any, maxBytes int64) error {
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
-	if t := dec.Token(); !errors.Is(t, io.EOF) {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing JSON after object")
 	}
 	return nil
@@ -2179,7 +2204,7 @@ local elapsed = math.max(0, now - ts)
 if rate > 0 then tokens = math.min(burst, tokens + elapsed * rate) end
 local allowed = 0
 local wait_ms = 0
-if tokens >= 1 then allowed = 1 tokens = tokens - 1
+if tokens >= 1 then allowed = 1; tokens = tokens - 1
 elseif rate > 0 then wait_ms = math.ceil((1 - tokens) / rate * 1000) end
 redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
 local ttl = 1000
@@ -2189,8 +2214,8 @@ return {allowed, wait_ms}
 `
 
 type Limiter struct {
-	rdb *redis.Client
-	log *slog.Logger
+	rdb    *redis.Client
+	log    *slog.Logger
 	script *redis.Script
 }
 
@@ -2653,8 +2678,9 @@ func (p *PGIdempotency) Claim(ctx context.Context, userID uuid.UUID, route, key 
 }
 
 func (p *PGIdempotency) Complete(ctx context.Context, userID uuid.UUID, route, key string, status int, body []byte) error {
+	statusCode := int32(status)
 	return p.q.CompleteIdempotencyKey(ctx, db.CompleteIdempotencyKeyParams{
-		UserID: userID, Route: route, IdemKey: key, ResponseStatus: int32(status), ResponseBody: body,
+		UserID: userID, Route: route, IdemKey: key, ResponseStatus: &statusCode, ResponseBody: body,
 	})
 }
 
@@ -3401,12 +3427,14 @@ func (s *SessionService) Rotate(ctx context.Context, raw string, ip *netip.Addr)
 		return Session{}, ErrInvalidRefreshToken
 	}
 	if time.Now().After(family.ExpiresAt) {
-		_ = s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: "expired"})
+		reason := "expired"
+		_ = s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: &reason})
 		return Session{}, ErrExpiredRefreshToken
 	}
 	if subtle.ConstantTimeCompare(family.CurrentTokenHash, hashSecret(secret)) != 1 {
 		// Секрет не текущий, а семья живая → этот токен уже поменяли. Отзываем всех.
-		if err := s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: "reuse_detected"}); err != nil {
+		reason := "reuse_detected"
+		if err := s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{ID: family.ID, RevokeReason: &reason}); err != nil {
 			s.log.Error("revoke family on reuse", "err", err)
 		}
 		s.log.Warn("refresh token reuse detected, family revoked", "user_id", family.UserID)
@@ -3444,8 +3472,9 @@ func (s *SessionService) Revoke(ctx context.Context, raw, access string) error {
 		// Невалидный access не блокирует отзыв семьи: logout обязан сработать и
 		// когда клиент принёс просроченный access.
 	}
+	reason := "logout"
 	return s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{
-		ID: uuid.MustParse(fam), RevokeReason: "logout",
+		ID: uuid.MustParse(fam), RevokeReason: &reason,
 	})
 }
 
@@ -3669,7 +3698,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `(*Service).ForUser(ctx context.Context, userID uuid.UUID) (Entitlement, error)`,
   `entitlements.GrantDefaultPlanTx(ctx context.Context, q *db.Queries, userID uuid.UUID, slug string) error`,
   `entitlements.ErrNoActiveSubscription`,
-  `db.RunInTx(ctx context.Context, pool db.DBTX, fn func(*db.Queries) error) error`.
+  `db.RunInTx(ctx context.Context, pool *pgxpool.Pool, fn func(*db.Queries) error) error`.
   `ServerSelector` в A принимает только `"all"` — права на конкретные узлы появляются в A-2
   вместе с каталогом, здесь поле только читается и передаётся дальше.
 
