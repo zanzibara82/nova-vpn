@@ -20,6 +20,7 @@ type Querier interface {
 	DeviceByID(ctx context.Context, id uuid.UUID) (Device, error)
 	DeviceByUserAndKey(ctx context.Context, arg DeviceByUserAndKeyParams) (Device, error)
 	InsertDevice(ctx context.Context, arg InsertDeviceParams) (Device, error)
+	InsertPlan(ctx context.Context, arg InsertPlanParams) (uuid.UUID, error)
 	InsertRefreshFamily(ctx context.Context, arg InsertRefreshFamilyParams) (uuid.UUID, error)
 	InsertSubscription(ctx context.Context, arg InsertSubscriptionParams) (uuid.UUID, error)
 	InsertUser(ctx context.Context, arg InsertUserParams) (User, error)
@@ -29,6 +30,7 @@ type Querier interface {
 	LockUser(ctx context.Context, arg LockUserParams) error
 	MarkDeviceSeen(ctx context.Context, id uuid.UUID) error
 	PlanBySlug(ctx context.Context, slug string) (PlanBySlugRow, error)
+	PlanIDBySlug(ctx context.Context, slug string) (uuid.UUID, error)
 	PurgeExpiredIdempotencyKeys(ctx context.Context) error
 	// Ротация ищет семью по идентификатору из токена, а не по хэшу: именно это даёт
 	// детект переиспользования (секрет есть, но он не текущий → семья предательски отзывается).

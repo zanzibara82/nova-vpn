@@ -17,3 +17,11 @@ FROM subscription_plans WHERE slug = $1;
 INSERT INTO subscriptions (id, user_id, plan_id, status, starts_at, ends_at, source)
 VALUES ($1, $2, $3, 'active', $4, $5, 'manual')
 RETURNING id;
+
+-- name: InsertPlan :one
+INSERT INTO subscription_plans (id, slug, device_limit, server_selector, traffic_quota_bytes)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id;
+
+-- name: PlanIDBySlug :one
+SELECT id FROM subscription_plans WHERE slug = $1;

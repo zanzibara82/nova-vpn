@@ -16,7 +16,7 @@ func TestRefreshRotationAndReuse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	q := db.New(pool(t))
-	user := seedUser(t, ctx, q)
+	user := seedUser(t, ctx, q, true)
 	svc := auth.NewSessionService(q, auth.NewIssuer(bytes32ForTests(), 10*time.Minute),
 		auth.NewRedisDenylist(redisClient(t), slog.New(slog.DiscardHandler)),
 		24*time.Hour, slog.New(slog.DiscardHandler))
@@ -60,7 +60,7 @@ func TestRefreshRotationAndReuse(t *testing.T) {
 func TestRevokeAddsAccessJtiToDenylist(t *testing.T) {
 	ctx := context.Background()
 	q := db.New(pool(t))
-	user := seedUser(t, ctx, q)
+	user := seedUser(t, ctx, q, true)
 	deny := auth.NewRedisDenylist(redisClient(t), slog.New(slog.DiscardHandler))
 	svc := auth.NewSessionService(q, auth.NewIssuer(bytes32ForTests(), 10*time.Minute),
 		deny, 24*time.Hour, slog.New(slog.DiscardHandler))

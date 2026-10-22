@@ -12,6 +12,33 @@ import (
 	"github.com/google/uuid"
 )
 
+const insertPlan = `-- name: InsertPlan :one
+INSERT INTO subscription_plans (id, slug, device_limit, server_selector, traffic_quota_bytes)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id
+`
+
+type InsertPlanParams struct {
+	ID                uuid.UUID
+	Slug              string
+	DeviceLimit       int32
+	ServerSelector    string
+	TrafficQuotaBytes *int64
+}
+
+func (q *Queries) InsertPlan(ctx context.Context, arg InsertPlanParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, insertPlan,
+		arg.ID,
+		arg.Slug,
+		arg.DeviceLimit,
+		arg.ServerSelector,
+		arg.TrafficQuotaBytes,
+	)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const insertSubscription = `-- name: InsertSubscription :one
 INSERT INTO subscriptions (id, user_id, plan_id, status, starts_at, ends_at, source)
 VALUES ($1, $2, $3, 'active', $4, $5, 'manual')
@@ -112,4 +139,15 @@ func (q *Queries) PlanBySlug(ctx context.Context, slug string) (PlanBySlugRow, e
 		&i.TrialDays,
 	)
 	return i, err
+}
+
+const planIDBySlug = `-- name: PlanIDBySlug :one
+SELECT id FROM subscription_plans WHERE slug = $1
+`
+
+func (q *Queries) PlanIDBySlug(ctx context.Context, slug string) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, planIDBySlug, slug)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
 }

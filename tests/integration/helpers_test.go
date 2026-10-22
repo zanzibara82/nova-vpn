@@ -48,7 +48,7 @@ func redisClient(t *testing.T) *redis.Client {
 	return c
 }
 
-func seedUser(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
+func seedUser(t *testing.T, ctx context.Context, q *db.Queries, withPlan bool) uuid.UUID {
 	t.Helper()
 	id := uuid.New()
 	hash, err := auth.HashPassword("integration-password-123")
@@ -61,10 +61,34 @@ func seedUser(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
 	}); err != nil {
 		t.Fatalf("InsertUser: %v", err)
 	}
+	if withPlan {
+		if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
+			ID:       uuid.New(),
+			UserID:   id,
+			PlanID:   uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
+			StartsAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("InsertSubscription: %v", err)
+		}
+	}
+	return id
+}
+
+func seedUserWithoutPlan(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
+	return seedUser(t, ctx, q, false)
+}
+
+func seedUserWithPlan(t *testing.T, ctx context.Context, q *db.Queries, slug string) uuid.UUID {
+	t.Helper()
+	id := seedUser(t, ctx, q, false)
+	planID, err := q.PlanIDBySlug(ctx, slug)
+	if err != nil {
+		t.Fatalf("PlanIDBySlug: %v", err)
+	}
 	if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
 		ID:       uuid.New(),
 		UserID:   id,
-		PlanID:   uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
+		PlanID:   planID,
 		StartsAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("InsertSubscription: %v", err)
