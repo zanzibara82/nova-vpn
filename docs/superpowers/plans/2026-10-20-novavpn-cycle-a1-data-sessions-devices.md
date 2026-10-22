@@ -2104,7 +2104,7 @@ local elapsed = math.max(0, now - ts)
 if rate > 0 then tokens = math.min(burst, tokens + elapsed * rate) end
 local allowed = 0
 local wait_ms = 0
-if tokens >= 1 then allowed = 1 tokens = tokens - 1
+if tokens >= 1 then allowed = 1; tokens = tokens - 1
 elseif rate > 0 then wait_ms = math.ceil((1 - tokens) / rate * 1000) end
 redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
 local ttl = 1000
@@ -2114,8 +2114,8 @@ return {allowed, wait_ms}
 `
 
 type Limiter struct {
-	rdb *redis.Client
-	log *slog.Logger
+	rdb    *redis.Client
+	log    *slog.Logger
 	script *redis.Script
 }
 
