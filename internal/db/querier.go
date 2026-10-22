@@ -11,7 +11,12 @@ import (
 )
 
 type Querier interface {
+	// ON CONFLICT DO NOTHING вместо SELECT-then-INSERT: два одновременных повтора
+	// одного ключа не должны оба дойти до бизнес-логики.
+	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (int64, error)
+	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) error
 	CountLiveDevices(ctx context.Context, userID uuid.UUID) (int64, error)
+	DeleteIdempotencyKey(ctx context.Context, arg DeleteIdempotencyKeyParams) error
 	DeviceByID(ctx context.Context, id uuid.UUID) (Device, error)
 	DeviceByUserAndKey(ctx context.Context, arg DeviceByUserAndKeyParams) (Device, error)
 	InsertDevice(ctx context.Context, arg InsertDeviceParams) (Device, error)
@@ -20,9 +25,11 @@ type Querier interface {
 	InsertUser(ctx context.Context, arg InsertUserParams) (User, error)
 	LiveDevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error)
 	LiveSubscriptionByUser(ctx context.Context, userID uuid.UUID) (LiveSubscriptionByUserRow, error)
+	LoadIdempotencyKey(ctx context.Context, arg LoadIdempotencyKeyParams) (IdempotencyKey, error)
 	LockUser(ctx context.Context, arg LockUserParams) error
 	MarkDeviceSeen(ctx context.Context, id uuid.UUID) error
 	PlanBySlug(ctx context.Context, slug string) (PlanBySlugRow, error)
+	PurgeExpiredIdempotencyKeys(ctx context.Context) error
 	// Ротация ищет семью по идентификатору из токена, а не по хэшу: именно это даёт
 	// детект переиспользования (секрет есть, но он не текущий → семья предательски отзывается).
 	RefreshByID(ctx context.Context, id uuid.UUID) (RefreshTokenFamily, error)
