@@ -45,9 +45,9 @@ func TestRejectsEmptyAndShort(t *testing.T) {
 func TestVerifyRejectsMalformedHash(t *testing.T) {
 	for _, bad := range []string{
 		"", "not-a-hash",
-		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",     // не argon2id
-		"$argon2id$v=19$m=1024,t=3,p=4$c2FsdA$aGFzaA",     // слабый параметр
-		"$argon2id$v=19$m=65536,t=3,p=4$!!$aGFzaA",        // мусор в соли
+		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // не argon2id
+		"$argon2id$v=19$m=1024,t=3,p=4$c2FsdA$aGFzaA", // слабый параметр
+		"$argon2id$v=19$m=65536,t=3,p=4$!!$aGFzaA",    // мусор в соли
 	} {
 		if VerifyPassword(bad, "anything-long-enough") {
 			t.Errorf("VerifyPassword accepted %q", truncate(bad))

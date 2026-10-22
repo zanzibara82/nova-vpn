@@ -25,6 +25,16 @@ func TestMigrationsUpToDownToUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
+	// Схема сейчас будет пересоздана: закэшированные prepared-стейтменты общего
+	// пула устареют («cached plan must not change result type»). Пул
+	// инвалидируется — следующий тест создаст новый.
+	t.Cleanup(func() {
+		if sharedPool != nil {
+			sharedPool.Close()
+			sharedPool = nil
+		}
+	})
+
 	if _, err := migrate.Steps(ctx, databaseURL(t), -1<<31); err != nil {
 		t.Fatalf("migrate down all: %v", err)
 	}
