@@ -523,6 +523,19 @@ UPDATE tunnel_addresses
 
 -- name: AddressOfProfile :one
 SELECT address FROM tunnel_addresses WHERE allocated_to = $1;
+
+-- name: ReassignAddress :exec
+-- §7.3: смена ключа не меняет IP клиента, поэтому профиль потомка получает тот же
+-- address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
+-- (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
+-- следующий клиент получил бы адрес живого соединения.
+--
+-- Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+-- одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+-- вызов, где их переставили, читается как правильный.
+UPDATE tunnel_addresses SET allocated_to = sqlc.arg(new_profile_id)
+ WHERE server_id = sqlc.arg(server_id) AND address = sqlc.arg(address)
+   AND allocated_to = sqlc.arg(old_profile_id);
 ```
 
 - [ ] **Step 6: `internal/db/query/profiles.sql` — дословный исходник**
@@ -634,6 +647,12 @@ WHERE device_id = $1 AND status = 'active';
 SELECT id, device_id, server_id, address_v4, status, issued_at, expires_at,
        overlap_valid_until, revoked_at, rotate_from, peer_state
 FROM vpn_profiles WHERE id = $1;
+
+-- name: LinkRotatedProfile :exec
+-- Вставить профиль сразу с rotate_from существующим InsertProfile не может: он описывает
+-- выдачу, где предка нет, а переписывать запрос задачи 1 под ротацию значило бы менять
+-- проверенный контракт. Отдельный запрос ставит то же поле в той же транзакции.
+UPDATE vpn_profiles SET rotate_from = $2 WHERE id = $1;
 ```
 
 - [ ] **Step 7: `internal/db/query/nodeapi.sql` — дословный исходник**
@@ -1829,6 +1848,21 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     устройства, если когда-нибудь появится перенос данных или правка в обход product-логики,
     поэтому владелец каждого узла сверяется внутри той же транзакции.
 
+26. **Positional-аргументы одного и того же столбца получают нечитаемые имена.** В
+    `ReassignAddress` план писал `SET allocated_to = $4 … AND allocated_to = $3`, и
+    генератор выдал параметры `AllocatedTo` и `AllocatedTo_2` — вызов, где их переставили,
+    выглядит правильным и не читается. Аргументы названы через `sqlc.arg`: `old_profile_id`
+    и `new_profile_id`.
+27. **Профиль ротации не вставляется целиком одним запросом.** `InsertProfile` задачи 1
+    не имеет поля `rotate_from`: он описывает выдачу, где предка нет. Добавлен
+    `LinkRotatedProfile` (то же поле, та же транзакция), а существующий запрос не
+    переписан — его контракт проверен тестом задачи 1 и выдачей задачи 5.
+28. **«Отзыв среднего узла цепочки» недостижим через `DeleteDevice`.** После второй
+    ротации средний узел уже отозван (ротация отзывает предка), а отзыв отозванного
+    устройства — отказ по стражу задачи 7. Проверка цепочки поэтому делается отзывом
+    живого, последнего узла: гасятся все три, и это ровно то свойство, ради которого
+    цепочка берётся в обе стороны.
+
 Проверено мутациями: снятие проверки заголовка, перестановка ограничителя внутрь
 идемпотентности (отказ по лимиту записался слотом и выдал replay) и подмена `404` на `403`
 для чужого устройства — каждое изменение уронило ровно свой тест, остальные остались
@@ -2005,8 +2039,13 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 -- address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
 -- (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
 -- следующий клиент получил бы адрес живого соединения.
-UPDATE tunnel_addresses SET allocated_to = $4
- WHERE server_id = $1 AND address = $2 AND allocated_to = $3;
+--
+-- Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+-- одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+-- вызов, где их переставили, читается как правильный.
+UPDATE tunnel_addresses SET allocated_to = sqlc.arg(new_profile_id)
+ WHERE server_id = sqlc.arg(server_id) AND address = sqlc.arg(address)
+   AND allocated_to = sqlc.arg(old_profile_id);
 ```
 
 - [ ] **Step 2: `RotateKey` — схема, не исходник**
@@ -2027,8 +2066,11 @@ UPDATE tunnel_addresses SET allocated_to = $4
       соврать про себя;
    c. для каждого профиля из `RevokeAllActiveByDeviceServer(parentID)`:
       `SupersedeProfile(old.ID, now.Add(connections.RotationOverlap))` → `InsertProfile` потомка (тот же
-      `server_id`, тот же `address_v4`, `rotate_from = old.ID`, `expires_at` — **тот же**,
-      что у предка: ротация ключа не продлевает доступ) → `ReassignAddress`;
+      `server_id`, тот же `address_v4`, `expires_at` — **тот же**, что у предка: ротация
+      ключа не продлевает доступ) → `LinkRotatedProfile(child.ID, old.ID)` → `ReassignAddress`.
+      Поле `rotate_from` ставится отдельным запросом: `InsertProfile` задачи 1 описывает
+      выдачу, где предка нет, а переписывать его под ротацию значило бы менять проверенный
+      контракт (находка 27);
    d. `RevokeDevice(parentID)`;
    e. по каждому затронутому серверу — `BumpServerConfigVersion`;
    f. событие `profile_issued` на каждый новый профиль, `detail {"rotated_from": old.ID}`;
@@ -2054,9 +2096,9 @@ idem-обёртки; ответ `200 deviceView` (не `201`: создаётся
 | ротация устройства без профилей | `200`, профилей не появилось, `config_version` не изменился |
 | ротация отозванного устройства | `409 conflict` + `device_revoked` |
 | тот же публичный ключ, что у другого живого устройства | `409 duplicate_device`, и **не** создан потомок (проверка SELECT) |
-| неканонический ключ (spare-биты nonzero) | `400 invalid_request` — фикстура строится как в `devices_test.keyAt` |
+| неканонический ключ (spare-биты nonzero) | `400 invalid_request`. Фикстура правкой байтов **не** строится: base64, собранный из любых 32 байт, каноничен по построению, и первая версия теста получила бы 200 вместо отказа. Значит поднимается младший spare-бит последнего символа самой строки |
 | повтор с тем же `Idempotency-Key` | тот же ответ + `Idempotency-Replayed: true`; потомок **один** (второй ротацией был бы другой id) |
-| два последовательных rotate (цепочка из трёх устройств) | `RotationChainIDs` (задача 7) возвращает все три; отзыв среднего гасит крайние — проверить вызовом `DeleteDevice` |
+| два последовательных rotate (цепочка из трёх устройств) | оба обхода (задача 7) возвращают все три id; отзыв **живого** узла гасит всю цепочку — проверить вызовом `DeleteDevice`, живым после второй ротации остаётся последний узел, а «середина» уже отзована (находка 28) |
 
 Run: `make unit && make vet && make integration`
 Expected: PASS.
