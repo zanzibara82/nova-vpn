@@ -1071,10 +1071,16 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     строки `PrivateKey`**;
   - `Parse(text string) (Config, error)`;
   - `(Config) SerializeNoPrivateKey() (string, error)` — каноническая пересборка (именно она
-    идёт наружу после round-trip в тестах) и она же отказывается от невалидных значений.
+    идёт наружу после round-trip в тестах) и она же отказывается от невалидных значений;
+  - `NodeTunnelAddress(pool netip.Prefix) netip.Addr` — база пула + 1. План относил её к
+    задаче 4, но `Render` нуждается в ней уже здесь (DNS-рекурсор клиента), поэтому
+    определена в этой задаче, а задача 4 только потребляет (см.Interfaces задачи 4).
 - Ни `net/http`, ни БД: модуль чистый, чтобы инъекционные тесты (шаг 3) не зависели от стека.
 
 - [ ] **Step 1: Тест round-trip — `internal/connections/wgconfig_test.go`, дословный исходник**
+
+Это начало файла; его продолжение даёт блок шага 3. Сворачивающий чекер сравнивает
+блок с соответствующей половиной файла по маркеру `// Таблица гостевых значений`.
 
 ```go
 package connections
@@ -1198,16 +1204,16 @@ PersistentKeepalive = 25
 
 - [ ] **Step 3: Инъекционная стойкость — добавить в `wgconfig_test.go`**
 
-Дословный исходник:
+Дословный исходник. Это хвост того же файла: строка `package connections` в него не
+переносится, блок пристыковывается после шага 1 (пустая строка на стыке в сравнение
+не входит).
 
 ```go
-package connections
-
 // Таблица гостевых значений, каждое из которых должно быть отвергнуто. Это проверка
 // модели угроз (спецификация §2, строка «скомпрометированный ответ API»): серверные
 // строки не имеют права попасть ни в shell, ни в чужую секцию конфига.
 var hostile = []struct {
-	name string
+	name   string
 	mutate func(*Config)
 }{
 	{"CRLF в host", func(c *Config) { c.PeerHost = "ok.example.com\r\nPrivateKey = SKA=" }},
@@ -1218,7 +1224,7 @@ var hostile = []struct {
 	{"unicode-обфускация host", func(c *Config) { c.PeerHost = "арьтм.-com" }},
 	{"порт вне диапазона", func(c *Config) { c.PeerPort = 70000 }},
 	{"порт нулевой", func(c *Config) { c.PeerPort = 0 }},
-	{"маска не /32", func(c *Config) { c.Address = netip.MustParseAddr("10.99.7.0") }},
+	{"маска не /32", func(c *Config) { c.Address = netip.MustParsePrefix("10.99.7.0/24") }},
 	{"IPv6 allow-all без адреса", func(c *Config) {
 		c.AllowedIPs = []netip.Prefix{netip.MustParsePrefix("::/0")}
 	}},
@@ -1242,6 +1248,32 @@ func TestSerializeRefusesHostileValues(t *testing.T) {
 		})
 	}
 }
+
+func TestParseSeparatesForbiddenFromUnknownKey(t *testing.T) {
+	// Разница между «ключ неизвестен» и «ключ запрещён» — не косметика: первое
+	// означает непривычный нам конфиг, второе — что API прислал приватный ключ или
+	// параметр, меняющий поведение ядра. Без отдельной ветки запрещённые ключи
+	// отсекались бы общим «неизвестный ключ», и таблица forbidden стала бы мёртвым
+	// кодом, который никто не проверяет.
+	text, err := serverRow().SerializeNoPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	banned := strings.Replace(text, "[Interface]\n", "[Interface]\nPresharedKey = SKM= \n", 1)
+	if _, err := Parse(banned); err == nil {
+		t.Fatal("PresharedKey принят")
+	} else if !strings.Contains(err.Error(), "запрещ") {
+		t.Errorf("сообщение об отказе = %q, want указание на запрещённый ключ", err)
+	}
+
+	unknown := strings.Replace(text, "[Interface]\n", "[Interface]\nListenPort = 51820\n", 1)
+	if _, err := Parse(unknown); err == nil {
+		t.Fatal("ListenPort принят")
+	} else if strings.Contains(err.Error(), "запрещ") {
+		t.Errorf("неизвестный ключ назван запрещённым: %q", err)
+	}
+}
 ```
 
 Замечания по двум случаям, чтобы их не «починили» ослаблением:
@@ -1250,6 +1282,21 @@ func TestSerializeRefusesHostileValues(t *testing.T) {
   — это тихий blackhole, а не нейтральное значение.
 - `маска не /32` отвергается и сериализатором, и парсером: адрес клиента в туннеле — ровно
   один `/32`, любое другое значение означает, что конфигурацию собрали не мы.
+
+Что в блоке было не так и что к нему добавлено при исполнении:
+
+- случай `маска не /32` был написан как `c.Address = netip.MustParseAddr("10.99.7.0")`, и
+  файл с этим не компилируется: `MustParseAddr` даёт `netip.Addr`, а поле — `netip.Prefix`
+  (`cannot use ... as netip.Prefix value`). В блоке стоит `MustParsePrefix("10.99.7.0/24")` —
+  это ровно тот же смысл (маска не /32), но годный к сборке;
+- таблица гостевых значений проверяет `err != nil || Parse(text) != nil`, то есть есть
+  вариант пройти её, ничего не отвергнув на сборке. Отдельной проверкой установлено, что
+  сериализатор отказывает сам: с усиленным утверждением (`if err == nil { t.Fatalf }`) все
+  12 случаев упали на отказе `SerializeNoPrivateKey`, а не на отказе парсера;
+- добавлен `TestParseSeparatesForbiddenFromUnknownKey`. Без него таблица `forbidden` была бы
+  мёртвым кодом: неизвестный ключ и запрещённый отсекались бы одной общей веткой, а
+  различие важно — «ключ неизвестен» это непривычный конфиг, «ключ запрещён» это
+  приватный ключ или параметр ядра, пришедший из API.
 
 - [ ] **Step 4: Прогон и коммит**
 
@@ -1273,11 +1320,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   читается из того же запроса, что и права)
 
 **Interfaces:**
-- Consumes: `LockServerRow`, `BusyAddresses`, `ClaimAddress`, `db.VpnServer.AddressPoolV4`.
+- Consumes: `LockServerRow`, `BusyAddresses`, `ClaimAddress`, `db.VpnServer.AddressPoolV4`,
+  `connections.NodeTunnelAddress` (определён задачей 3 — `Render` не может без DNS-адреса).
 - Produces:
-  - `connections.NodeTunnelAddress(pool netip.Prefix) netip.Addr` — база пула + 1; это адрес
-    `wg0` узла и он же recursor в туннеле (спецификация §8, пример `10.99.0.1` в §4.1 —
-    это ровно база пула `10.99.0.0/24`);
   - `connections.PickAddress(pool netip.Prefix, busy map[netip.Addr]bool) (netip.Addr, error)`
     и `ErrPoolExhausted`;
   - `connections.Allocate(ctx context.Context, q *db.Queries, srv db.VpnServer, profileID uuid.UUID) (netip.Addr, error)`;
@@ -1344,7 +1389,10 @@ func TestPickAddressRejectsNonIPv4Prefix(t *testing.T) {
 ```
 
 Run: `make unit`
-Expected: FAIL — `undefined: PickAddress`.
+Expected: FAIL — `undefined: PickAddress`. `TestNodeTunnelAddressIsFirstUsable` из этого же
+файла падать не будет: функция определена задачей 3, и RED шага обеспечивается остальными
+тестами. Оставлять её нельзя: это проверка, что адрес узла и DNS-адрес из `Render` считаются
+одной формулой.
 
 - [ ] **Step 2: Реализовать `internal/connections/address.go`**
 
