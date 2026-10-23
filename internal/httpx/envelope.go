@@ -26,6 +26,15 @@ const (
 	ErrIdempotencyInProgress  ErrorCode = "idempotency_key_in_progress"
 	ErrRateLimited            ErrorCode = "rate_limited"
 	ErrInternal               ErrorCode = "internal"
+	// Auth-коды (задача 17) и регистрация (задача 16). Добавляются, а не заменяются:
+	// клиент, который видел invalid_credentials, не должен получить вместо него generic.
+	ErrInvalidCredentials  ErrorCode = "invalid_credentials"
+	ErrRefreshTokenInvalid ErrorCode = "refresh_token_invalid"
+	ErrEmailTaken          ErrorCode = "email_taken"
+	// 405 пишет сборщик из задачи 18: ServeMux отвечает 405 без тела, а §5.2 требует
+	// конверт на любой ошибке. Код объявляется здесь, вместе с перечнем в контракте,
+	// иначе тест «код контракта == константа Go» не увидит расхождение до задачи 18.
+	ErrMethodNotAllowed ErrorCode = "method_not_allowed"
 )
 
 type errorBody struct {

@@ -1,6 +1,7 @@
 GO_IMAGE ?= golang:1.25-alpine
 DB_IMAGE ?= postgres:17
 REDIS_IMAGE ?= redis:7
+API_IMAGE ?= redocly/cli:1.34.22
 
 # Хостовы порты dev-стека. Занятые по умолчанию — не гипотеза: на этой машине 5432
 # держит служба postgresql-x64-17, а 6379 — локальный redis, и connect с тестового
@@ -43,7 +44,7 @@ docker-go-app = MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) \
 	-e NOVAVPN_REDIS_ADDR=$(REDIS_ADDR_INTEG) \
 	$(GO_IMAGE) go
 
-.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev
+.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint
 unit:
 	$(docker-go) test -count=1 ./...
 
@@ -95,3 +96,6 @@ $(ENV_FILE):
 
 sqlc-generate:
 	docker run --rm -v "$(CURDIR):/src" -w /src sqlc/sqlc:1.27.0 generate
+
+api-lint:
+	docker run --rm -v "$(CURDIR)/api-spec:/spec" $(API_IMAGE) lint /spec/openapi.yaml

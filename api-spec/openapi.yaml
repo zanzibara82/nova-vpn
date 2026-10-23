@@ -1,0 +1,439 @@
+openapi: "3.1.0"
+info:
+  title: NovaVPN control plane — публичный API цикла A
+  version: "1.0.0"
+  description: >
+    Контракт первой поставки. Маршруты узла (/internal/v1) и выдачи профилей появляются
+    в A-2; здесь только идентификация, сессии и устройства. Числовые поля каталога
+    (задержка, загрузка, доступность) здесь отсутствуют сознательно: до замеров на реальном
+    узле их нечем наполнить, а спецификация §13.4 запрещает подставлять вместо них ноль.
+  license:
+    # SPDX-конвенция для закрытых лицензий; публичной лицензии у продукта нет.
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: https://api.novavpn.local
+tags:
+  - name: auth
+    description: Идентификация и сессии — регистрация, вход, refresh, logout, /me.
+  - name: devices
+    description: Устройства пользователя — регистрация и список.
+paths:
+  /api/v1/auth/register:
+    post:
+      tags: [auth]
+      operationId: register
+      summary: Регистрация аккаунта с выдачей сессии.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Credentials" }
+      responses:
+        "201":
+          description: Аккаунт создан, сессия выдана.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "409":
+          description: Email уже зарегистрирован.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code: { enum: [email_taken] }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Вход по email и паролю.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Credentials" }
+      responses:
+        "200":
+          description: Сессия выдана.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401":
+          description: Неверный email или пароль — один ответ на оба случая.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code: { enum: [invalid_credentials] }
+        "403":
+          description: Учётная запись заблокирована администратором.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code: { enum: [account_locked] }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      summary: Обмен refresh-токена на новую пару.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "200":
+          description: Новая пара токенов; предъявленный refresh перестал быть действующим.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401":
+          description: >
+            Refresh не принят: токен не разобран, семья не найдена, семья отозвана или
+            секрет переиспользован. Различия в журнале, наружу — один код, чтобы по
+            ответу нельзя было определить, какой семьи существуют.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code: { enum: [refresh_token_invalid] }
+        # 403 здесь обязателен: Rotate читает статус пользователя (задача 17, шаг 4), и
+        # заблокированный аккаунт не продлевает доступ. Без этой строки живой ответ 403
+        # не был бы описан контрактом, а контракт-first на этом маршруте теряет смысл.
+        "403":
+          description: Учётная запись заблокирована — новая пара не выдаётся.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code: { enum: [account_locked] }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Отзыв семьи refresh-токенов.
+      security: []
+      description: >
+        Отзыв семьи refresh. Аутентификации по access-токену не требует: отзыв обязан
+        сработать и когда access уже просрочен. Действующее доказательство владения
+        сессией — сам refresh-токен в теле.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RefreshRequest" }
+      responses:
+        "204": { description: Семья отозвана. Тело отсутствует. }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401":
+          description: Refresh не разобран или семья не найдена.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code: { enum: [refresh_token_invalid] }
+        # 429 есть у всех четырёх публичных маршрутов, включая logout: он тоже
+        # монтируется под dec.Anonymous (задача 18), и «отзыв на скорость» лимитируется
+        # наравне с перебором семей.
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/v1/me:
+    get:
+      tags: [auth]
+      operationId: getMe
+      summary: Аккаунт, план и использование устройств.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Пользователь, план и использование устройств.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Me" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        # 429 — окно на пользователя (dec.Auth в задаче 18): закрытые маршруты тоже
+        # лимитируются, и контракт обязан это показывать.
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/v1/devices:
+    post:
+      tags: [devices]
+      operationId: createDevice
+      summary: Регистрация устройства (идемпотентно).
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeviceCreate" }
+      responses:
+        "201":
+          description: Устройство зарегистрировано.
+          headers:
+            Idempotency-Replayed:
+              description: Присутствует при повторе того же ключа.
+              schema: { type: string, enum: ["true"] }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403":
+          description: Активной подписки нет — прав на устройства не кому дать.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code: { enum: [forbidden] }
+        "409":
+          description: >
+            Лимит устройств по тарифу, дубликат публичного ключа либо конфликт
+            Idempotency-Key.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - properties:
+                      error:
+                        properties:
+                          code:
+                            enum:
+                              - device_limit_reached
+                              - duplicate_device
+                              - idempotency_key_conflict
+                              - idempotency_key_in_progress
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+    get:
+      tags: [devices]
+      operationId: listDevices
+      summary: Список устройств пользователя.
+      security: [{ bearerAuth: [] }]
+      responses:
+        "200":
+          description: Все устройства пользователя, включая отозванные.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceList" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        # 429 — окно на пользователя (dec.Auth в задаче 18): закрытые маршруты тоже
+        # лимитируются, и контракт обязан это показывать.
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/Internal" }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Ключ повторозащищённости (спецификация §5.2). Без него запрос отклоняется.
+      schema: { type: string, minLength: 1, maxLength: 200 }
+  responses:
+    InvalidRequest:
+      description: Тело или поле не прошло валидацию.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Error"
+              - properties:
+                  error:
+                    properties:
+                      code: { enum: [invalid_request, idempotency_key_required] }
+    Unauthenticated:
+      description: Access-токен отсутствует, недействителен или в denylist.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Error"
+              - properties:
+                  error:
+                    properties:
+                      code: { enum: [unauthenticated] }
+    RateLimited:
+      description: Превышен token bucket. Повторять раньше Retry-After нельзя.
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Error"
+              - properties:
+                  error:
+                    properties:
+                      code: { enum: [rate_limited] }
+    Internal:
+      description: Внутренняя ошибка. Детали — только в журнале по request_id.
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/Error"
+              - properties:
+                  error:
+                    properties:
+                      code: { enum: [internal] }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          # details отсутствует, когда уточнять нечего; потому его нет в required.
+          required: [code, message, request_id]
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+            request_id: { type: string, pattern: "^[0-9a-f]{16}$" }
+    ErrorCode:
+      type: string
+      enum:
+        - invalid_request
+        - unauthenticated
+        - account_locked
+        - forbidden
+        - not_found
+        - method_not_allowed
+        - conflict
+        - device_limit_reached
+        - duplicate_device
+        - idempotency_key_required
+        - idempotency_key_conflict
+        - idempotency_key_in_progress
+        - rate_limited
+        - internal
+        - invalid_credentials
+        - refresh_token_invalid
+        - email_taken
+    Credentials:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 10, maxLength: 1024 }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string, minLength: 40, maxLength: 512 }
+    Session:
+      type: object
+      # token_type зафиксирован: клиент не должен угадывать схему Authorization.
+      required: [access_token, refresh_token, token_type, access_expires_at, refresh_expires_at]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string, enum: [Bearer] }
+        access_expires_at: { type: string, format: date-time }
+        refresh_expires_at: { type: string, format: date-time }
+    DeviceCreate:
+      type: object
+      required: [public_key, platform, name]
+      properties:
+        public_key: { type: string, pattern: "^[A-Za-z0-9+/]{43}=$" }
+        platform:
+          type: string
+          enum: [android, ios, windows, macos, linux, other]
+        name: { type: string, minLength: 1, maxLength: 64 }
+    Device:
+      type: object
+      required: [id, public_key, platform, name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        public_key: { type: string, pattern: "^[A-Za-z0-9+/]{43}=$" }
+        platform:
+          type: string
+          enum: [android, ios, windows, macos, linux, other]
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: ["string", "null"], format: date-time }
+        revoked_at: { type: ["string", "null"], format: date-time }
+    DeviceList:
+      type: object
+      required: [devices]
+      properties:
+        devices:
+          type: array
+          items: { $ref: "#/components/schemas/Device" }
+    Me:
+      type: object
+      required: [user, plan, devices]
+      properties:
+        user:
+          type: object
+          required: [id, email, status, locale, created_at]
+          properties:
+            id: { type: string, format: uuid }
+            email: { type: string }
+            display_name: { type: ["string", "null"] }
+            status: { type: string, enum: [active, locked, deleted] }
+            locale: { type: string }
+            created_at: { type: string, format: date-time }
+        plan:
+          # null — активной подписки нет (истекла или не была выдана). /me описывает
+          # состояние аккаунта, а не выдаёт право, поэтому здесь данные, а не отказ:
+          # 403 на «подписка кончилась» был бы неправдой про доступ.
+          type: ["object", "null"]
+          required: [slug, device_limit, traffic_quota_bytes]
+          properties:
+            slug: { type: string }
+            device_limit: { type: integer, minimum: 1 }
+            # NULL = без квоты. Именно null, а не 0: ноль читается как «трафик кончился».
+            traffic_quota_bytes: { type: ["integer", "null"] }
+        devices:
+          type: object
+          required: [live, limit]
+          properties:
+            live: { type: integer, minimum: 0 }
+            # 0 — подписки нет, и права на устройства тоже (ср. POST /devices: 403).
+            # Минимум не может быть 1, иначе истёкший аккаунт не описывается контрактом.
+            limit: { type: integer, minimum: 0 }
