@@ -603,14 +603,13 @@ UPDATE vpn_profiles
  RETURNING id, server_id, address_v4, device_id;
 
 -- name: RevokeProfilesForDevices :many
--- Отзыв устройства = отзыв всех его профилей (§5.1). Возвращает server_id, потому
--- что именно по нему вызывающий код поднимает config_version: забыть сервер —
--- значит оставить пиера в desired set живым.
-UPDATE vpn_profiles
+UPDATE vpn_profiles p
    SET status = 'revoked', revoked_at = now()
- WHERE device_id = ANY($1::uuid[]) AND status IN ('active', 'superseded')
- RETURNING id, server_id, device_id;
-
+  FROM devices d
+ WHERE p.id IN (SELECT id FROM vpn_profiles
+                 WHERE device_id = ANY($1::uuid[]) AND status IN ('active','superseded'))
+   AND p.device_id = d.id
+ RETURNING p.id, p.server_id, p.device_id, d.user_id;
 -- name: CountActiveProfilesByDevice :one
 SELECT count(*) FROM vpn_profiles WHERE device_id = $1 AND status = 'active';
 
@@ -1816,6 +1815,20 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - счётчик слотов идемпотентности скоупится по `user_id` и уникальному на прогон ключу:
   dev-база между запусками одна, и постоянный ключ оставил бы строку от прошлого прогона.
 
+24. **Рекурсивный CTE «в обе стороны» одним запросом не проходит инструментам.** План
+    задача 7 давал `RotationChainIDs` как `up` и `down`, объединённые `UNION`; PostgreSQL
+    такой текст принимает, а sqlc 1.27.0 падает на разборе (`column reference "id" is
+    ambiguous`) — и падает на любом варианте, где колонки рекурсивного CTE не квалифицированы
+    явно. Вариант «одна CTE с двумя рекурсивными ветвями» отклоняет уже сам сервер
+    (`recursive reference to query "chain" must not appear within its non-recursive term`,
+    SQLSTATE 42P19). Оставлены два запроса, каждый в свою сторону, с явными aliases, и
+    слияние множеств в Go (`mergeUnique`): результат тот же, и он проверяем тестом.
+25. **Отзыв цепочки обязан проверить владельца каждого её узла.** `rotation_of` — ссылка на
+    строку `devices`, и цепочка по построению принадлежит одному пользователю, но ни
+    констрейнта, ни проверки в этом нет. Отзыв одного человека погасил бы профили чужого
+    устройства, если когда-нибудь появится перенос данных или правка в обход product-логики,
+    поэтому владелец каждого узла сверяется внутри той же транзакции.
+
 Проверено мутациями: снятие проверки заголовка, перестановка ограничителя внутрь
 идемпотентности (отказ по лимиту записался слотом и выдал replay) и подмена `404` на `403`
 для чужого устройства — каждое изменение уронило ровно свой тест, остальные остались
@@ -1851,7 +1864,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   - `(s *Service) DeleteDevice(ctx context.Context, userID, deviceID uuid.UUID) (int, error)`
     — число отозванных профилей;
   - маршрут `DELETE /api/v1/devices/{id}`;
-  - запрос `RotationChainIDs :many` (рекурсивный CTE в обе стороны) и
+  - запросы `RotationAncestorIDs :many` и `RotationDescendantIDs :many` (рекурсивный
+  CTE в каждую сторону) и `devices.mergeUnique` — объединение обходов в одно множество
+  цепочки; рекурсивный CTE «в обе стороны одним запросом» см. находку 24; и
     `RevokeDevices :exec` (`WHERE id = ANY($1::uuid[]) AND revoked_at IS NULL`).
 
 - [ ] **Step 1: Запросы — дословный исходник, добавить в `internal/db/query/devices.sql`**
@@ -1863,25 +1878,29 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 UPDATE devices SET revoked_at = now()
  WHERE id = ANY($1::uuid[]) AND revoked_at IS NULL;
 
--- name: RotationChainIDs :many
--- Цепочка ротации в обе стороны. Вверх — потому что отзыв потомка обязан закрыть
--- overlap предка (§7.3): иначе ключ, от которого человек уже отказался, останется в
--- desired set ещё на окно. Вниз — потому что потомок без предка для пользователя
--- «то же самое устройство с новым ключом», и отзыв родителя обязан гасить его тоже.
+-- name: RotationAncestorIDs :many
+-- Цепочка ротации в обе стороны — два запроса, а не одно UNION-выражение: отзыв
+-- потомка обязан закрыть overlap предка (§7.3), а отзыв родителя обязан погасить
+-- потомка (для пользователя это то же устройство с новым ключом), и множества нужно
+-- объединить. Вариант «один CTE, объединяющий up и down» PostgreSQL принимает, а
+-- sqlc 1.27.0 — нет («column reference \"id\" is ambiguous»); вариант «два рекурсивных
+-- рекурсивных ветвей в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
+-- этого генератор теряется в тех же CTE.
 WITH RECURSIVE up AS (
-    SELECT id, rotation_of FROM devices WHERE id = $1
+    SELECT devices.id, devices.rotation_of FROM devices WHERE devices.id = $1
   UNION ALL
-    SELECT d.id, d.rotation_of FROM devices d JOIN up ON d.id = up.rotation_of
-), down AS (
-    SELECT id, rotation_of FROM devices WHERE id = $1
-  UNION ALL
-    SELECT d.id, d.rotation_of FROM devices d JOIN down ON d.rotation_of = down.id
-), chain AS (
-    SELECT id FROM up
-  UNION
-    SELECT id FROM down
+    SELECT d.id, d.rotation_of FROM devices AS d JOIN up ON d.id = up.rotation_of
 )
-SELECT id FROM chain;
+SELECT up.id FROM up;
+
+-- name: RotationDescendantIDs :many
+-- Нижний ход той же цепочки (см. комментарий у RotationAncestorIDs).
+WITH RECURSIVE down AS (
+    SELECT devices.id, devices.rotation_of FROM devices WHERE devices.id = $1
+  UNION ALL
+    SELECT d.id, d.rotation_of FROM devices AS d JOIN down ON d.rotation_of = down.id
+)
+SELECT down.id FROM down;
 ```
 
 Правка `profiles.sql`: у `RevokeProfilesForDevices` (задача 1) возврата `user_id` нет —
@@ -1922,8 +1941,11 @@ UPDATE vpn_profiles p
 - [ ] **Step 3: Handler — схема, не исходник**
 
 `DELETE /api/v1/devices/{id}` под `dec.Auth`; `204` без тела; `400 invalid_request` на
-не-uuid в пути; `404 not_found` на чужое/несуществующее (сообщение `"устройство не
-найдено"`); `500` на прочее. Идемпотентность не требуется: `DELETE` по определению
+не-uuid в пути; `404 not_found` на чужое/несуществующее **и на уже отозванное** (сообщение
+`"устройство не найдено"`); `500` на прочее. Строка про отозванное добавлена при исполнении:
+таблица шага 4 требует `404` на повторный `DELETE`, а без отдельного стража
+`ErrDeviceRevoked` второй вызов дал бы `204` — молчаливый успех там, где человек должен
+увидеть, что отзыв уже был. Идемпотентность не требуется: `DELETE` по определению
 повторозащищён (второй вызов даёт `404`), а `§5.2` требует заголовок только на трёх POST.
 
 - [ ] **Step 4: Интеграционный тест — `tests/integration/device_delete_test.go`**
