@@ -248,6 +248,35 @@ func (q *Queries) MarkProfileExpired(ctx context.Context, id uuid.UUID) (MarkPro
 	return i, err
 }
 
+const profileByID = `-- name: ProfileByID :one
+SELECT id, device_id, server_id, address_v4, status, issued_at, expires_at,
+       overlap_valid_until, revoked_at, rotate_from, peer_state
+FROM vpn_profiles WHERE id = $1
+`
+
+// Нужен после отзыва: RevokeProfile возвращает четыре колонки, а выдаче обязано
+// верить прочитанному состоянию, а не предположению о том, каким стал профиль.
+// Правка существующего запроса вместо этого изменила бы контракт задачи 1, а он
+// проверен её тестом.
+func (q *Queries) ProfileByID(ctx context.Context, id uuid.UUID) (VpnProfile, error) {
+	row := q.db.QueryRow(ctx, profileByID, id)
+	var i VpnProfile
+	err := row.Scan(
+		&i.ID,
+		&i.DeviceID,
+		&i.ServerID,
+		&i.AddressV4,
+		&i.Status,
+		&i.IssuedAt,
+		&i.ExpiresAt,
+		&i.OverlapValidUntil,
+		&i.RevokedAt,
+		&i.RotateFrom,
+		&i.PeerState,
+	)
+	return i, err
+}
+
 const profilesByDevice = `-- name: ProfilesByDevice :many
 SELECT id, device_id, server_id, address_v4, status, issued_at, expires_at,
        overlap_valid_until, revoked_at, rotate_from, peer_state

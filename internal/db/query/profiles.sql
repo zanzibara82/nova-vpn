@@ -96,3 +96,12 @@ UPDATE vpn_profiles SET status = 'expired'
 -- перенос обязан быть атомарным по всем серверам, где устройство сидит.
 SELECT id, server_id, address_v4, expires_at FROM vpn_profiles
 WHERE device_id = $1 AND status = 'active';
+
+-- name: ProfileByID :one
+-- Нужен после отзыва: RevokeProfile возвращает четыре колонки, а выдаче обязано
+-- верить прочитанному состоянию, а не предположению о том, каким стал профиль.
+-- Правка существующего запроса вместо этого изменила бы контракт задачи 1, а он
+-- проверен её тестом.
+SELECT id, device_id, server_id, address_v4, status, issued_at, expires_at,
+       overlap_valid_until, revoked_at, rotate_from, peer_state
+FROM vpn_profiles WHERE id = $1;

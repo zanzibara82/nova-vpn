@@ -129,6 +129,11 @@ type Querier interface {
 	NullOldRefreshIPs(ctx context.Context) (int64, error)
 	PlanBySlug(ctx context.Context, slug string) (PlanBySlugRow, error)
 	PlanIDBySlug(ctx context.Context, slug string) (uuid.UUID, error)
+	// Нужен после отзыва: RevokeProfile возвращает четыре колонки, а выдаче обязано
+	// верить прочитанному состоянию, а не предположению о том, каким стал профиль.
+	// Правка существующего запроса вместо этого изменила бы контракт задачи 1, а он
+	// проверен её тестом.
+	ProfileByID(ctx context.Context, id uuid.UUID) (VpnProfile, error)
 	ProfilesByDevice(ctx context.Context, deviceID uuid.UUID) ([]VpnProfile, error)
 	// GET /me и админ-просмотр: список профилей всех устройств пользователя.
 	ProfilesByUser(ctx context.Context, userID uuid.UUID) ([]ProfilesByUserRow, error)
