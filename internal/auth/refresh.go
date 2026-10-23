@@ -132,6 +132,16 @@ func (s *SessionService) Rotate(ctx context.Context, raw string, ip *netip.Addr)
 		s.log.Warn("refresh token reuse detected, family revoked", "user_id", family.UserID)
 		return Session{}, ErrInvalidRefreshToken
 	}
+	user, err := s.q.UserByID(ctx, family.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Session{}, ErrInvalidRefreshToken
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("load user for rotation: %w", err)
+	}
+	if user.Status != db.UserStatusActive {
+		return Session{}, ErrAccountLocked
+	}
 	next := newSecret()
 	rotated, err := s.q.RotateRefresh(ctx, db.RotateRefreshParams{
 		ID: family.ID, NewHash: hashSecret(next), OldHash: hashSecret(secret), Ip: ip,

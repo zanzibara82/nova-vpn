@@ -159,7 +159,10 @@ paths:
         "204": { description: Семья отозвана. Тело отсутствует. }
         "400": { $ref: "#/components/responses/InvalidRequest" }
         "401":
-          description: Refresh не разобран или семья не найдена.
+          description: >
+            Refresh не разобран (не формат семьи). Уже отозванная или несуществующая
+            семья отвечает 204: отзыв идемпотентен, а различение этих случаев —
+            оракул «какие семьи существовали».
           content:
             application/json:
               schema:
@@ -404,6 +407,14 @@ components:
         devices:
           type: array
           items: { $ref: "#/components/schemas/Device" }
+    PlanView:
+      type: object
+      required: [slug, device_limit, traffic_quota_bytes]
+      properties:
+        slug: { type: string }
+        device_limit: { type: integer, minimum: 1 }
+        # NULL = без квоты. Именно null, а не 0: ноль читается как «трафик кончился».
+        traffic_quota_bytes: { type: ["integer", "null"] }
     Me:
       type: object
       required: [user, plan, devices]
@@ -422,13 +433,9 @@ components:
           # null — активной подписки нет (истекла или не была выдана). /me описывает
           # состояние аккаунта, а не выдаёт право, поэтому здесь данные, а не отказ:
           # 403 на «подписка кончилась» был бы неправдой про доступ.
-          type: ["object", "null"]
-          required: [slug, device_limit, traffic_quota_bytes]
-          properties:
-            slug: { type: string }
-            device_limit: { type: integer, minimum: 1 }
-            # NULL = без квоты. Именно null, а не 0: ноль читается как «трафик кончился».
-            traffic_quota_bytes: { type: ["integer", "null"] }
+          anyOf:
+            - $ref: "#/components/schemas/PlanView"
+            - type: "null"
         devices:
           type: object
           required: [live, limit]
