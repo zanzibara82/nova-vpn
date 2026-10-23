@@ -4415,7 +4415,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   только, закрыт его маршрут или нет,
   `(*Handler).RegisterRoutes(mux *http.ServeMux, dec httpx.Decorators)` —
   монтирует `POST /api/v1/devices` и `GET /api/v1/devices` под `dec.Auth`;
-  запрос `db.LockUserForDeviceCount(ctx, userID uuid.UUID) error`
+  запрос `db.LockUserForDeviceCount(ctx context.Context, userID string) error`
   (`pg_advisory_xact_lock(hashtextextended($1, 0))`).
 
 `internal/httpx/decorators.go` — пять строк, но именно они закрывают вопрос «кто решает,
@@ -4456,6 +4456,7 @@ package integration
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -4493,7 +4494,7 @@ func TestDeviceLimitIsHard(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	svc, q := newDeviceSvc(t)
-	user := seedUser(t, ctx, q) // подписка internal-default, device_limit = 3
+	user := seedUser(t, ctx, q, true) // подписка internal-default, device_limit = 3
 
 	for i := 0; i < 3; i++ {
 		if _, err := svc.Register(ctx, user, devices.RegisterInput{
@@ -4503,23 +4504,23 @@ func TestDeviceLimitIsHard(t *testing.T) {
 	}
 	_, err := svc.Register(ctx, user, devices.RegisterInput{
 		PublicKey: keyAt(3), Platform: "linux", Name: "fourth"})
-	if err == nil || !errorsIs(err, devices.ErrDeviceLimit) {
+	if err == nil || !errors.Is(err, devices.ErrDeviceLimit) {
 		t.Fatalf("4th device: err = %v, want ErrDeviceLimit", err)
 	}
 
 	// Тот же публичный ключ второй раз → duplicate, а не «тихо вернули первое устройство».
 	if _, err := svc.Register(ctx, user, devices.RegisterInput{
-		PublicKey: keyAt(0), Platform: "linux", Name: "dup"}); !errorsIs(err, devices.ErrDuplicateKey) {
+		PublicKey: keyAt(0), Platform: "linux", Name: "dup"}); !errors.Is(err, devices.ErrDuplicateKey) {
 		t.Errorf("duplicate key: err = %v, want ErrDuplicateKey", err)
 	}
 
 	// Чужое устройство недоступно по ID.
-	other := seedUser(t, ctx, q)
+	other := seedUser(t, ctx, q, true)
 	list, err := svc.List(ctx, other)
 	if err != nil || len(list) != 0 {
 		t.Errorf("other user sees %d devices (err=%v)", len(list), err)
 	}
-	if _, err := svc.OwnedBy(ctx, list0ID(t, ctx, user), other); !errorsIs(err, devices.ErrForbiddenDevice) {
+	if _, err := svc.OwnedBy(ctx, list0ID(t, ctx, user), other); !errors.Is(err, devices.ErrForbiddenDevice) {
 		t.Errorf("OwnedBy cross-user = %v, want ErrForbiddenDevice", err)
 	}
 }
@@ -4540,7 +4541,7 @@ func TestConcurrentRegistrationRespectsLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	svc, q := newDeviceSvc(t)
-	user := seedUser(t, ctx, q)
+	user := seedUser(t, ctx, q, true)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -4551,7 +4552,7 @@ func TestConcurrentRegistrationRespectsLimit(t *testing.T) {
 			defer wg.Done()
 			_, err := svc.Register(ctx, user, devices.RegisterInput{
 				PublicKey: keyAt(100 + i), Platform: "linux", Name: "race"})
-			if errorsIs(err, devices.ErrDeviceLimit) {
+			if errors.Is(err, devices.ErrDeviceLimit) {
 				mu.Lock()
 				limiterHits++
 				mu.Unlock()
@@ -4580,7 +4581,7 @@ func TestHandlerMapsErrorsToCodes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	svc, q := newDeviceSvc(t)
-	user := seedUser(t, ctx, q)
+	user := seedUser(t, ctx, q, true)
 	// dec здесь — сквозные обёртки: тест проверяет маппинг ошибок хендлера,
 	// а не аутентификацию и не лимиты (они — в задачах 17 и 18).
 	passthrough := func(next http.Handler) http.Handler { return next }
@@ -4643,9 +4644,9 @@ Expected: FAIL — `undefined: devices.NewService`, `undefined: devices.ErrDevic
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));
 ```
 
-Run: `make sqlc-generate` → метод `db.Queries.LockUserForDeviceCount(ctx, uuid.UUID)`;
-если sqlc не выводит `$1::text` в `uuid`, передать `user.String()` и убрать каст —
-главное, чтобы аргументом был один `uuid`/`text`, а не пара.
+Run: `make sqlc-generate` → метод `db.Queries.LockUserForDeviceCount(ctx context.Context,
+dollar_1 string)`: каст `$1::text` и задаёт тип параметра — без каста sqlc его не
+выведет, поэтому каст остаётся, а сервис передаёт `userID.String()`.
 
 `internal/devices/service.go`:
 
@@ -4659,6 +4660,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/entitlements"
@@ -4710,8 +4712,17 @@ func (s *Service) Register(ctx context.Context, userID uuid.UUID, in RegisterInp
 
 	var created db.Device
 	err = db.RunInTx(ctx, s.pool, func(tx *db.Queries) error {
-		if err := tx.LockUserForDeviceCount(ctx, userID); err != nil {
+		if err := tx.LockUserForDeviceCount(ctx, userID.String()); err != nil {
 			return fmt.Errorf("advisory lock: %w", err)
+		}
+		// Дубликат проверяется до лимита: повторный запрос с тем же ключом обязан
+		// ответить ErrDuplicateKey, даже когда лимит уже исчерпан.
+		if existing, err := tx.DeviceByUserAndKey(ctx, db.DeviceByUserAndKeyParams{
+			UserID: userID, PublicKey: in.PublicKey,
+		}); err == nil && existing.RevokedAt == nil {
+			return ErrDuplicateKey
+		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("lookup by key: %w", err)
 		}
 		live, err := tx.CountLiveDevices(ctx, userID)
 		if err != nil {
@@ -4719,13 +4730,6 @@ func (s *Service) Register(ctx context.Context, userID uuid.UUID, in RegisterInp
 		}
 		if !ent.AllowsDevice(int(live)) {
 			return ErrDeviceLimit
-		}
-		if existing, err := tx.DeviceByUserAndKey(ctx, db.DeviceByUserAndKeyParams{
-			UserID: userID, PublicKey: in.PublicKey,
-		}); err == nil && existing.RevokedAt == nil {
-			return ErrDuplicateKey
-		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("lookup by key: %w", err)
 		}
 		created, err = tx.InsertDevice(ctx, db.InsertDeviceParams{
 			ID: uuid.New(), UserID: userID, PublicKey: in.PublicKey,
@@ -4764,6 +4768,15 @@ func (s *Service) OwnedBy(ctx context.Context, deviceID, userID uuid.UUID) (db.D
 	return d, nil
 }
 ```
+
+Примечание (правка против исходного брифа): блок проверял лимит до дубликата —
+при исчерпанном лимите случай «тот же публичный ключ» возвращал бы `ErrDeviceLimit`,
+и проверка дубликата в `TestDeviceLimitIsHard` была недостижима. Порядок внутри
+транзакции изменён: дубликат проверяется до счёта и лимита, повторный запрос обязан
+ответить `ErrDuplicateKey` независимо от заполненности лимита. Также в блок добавлен
+импорт `pgxpool` (структура `Service` держит пул — в брифе импорта не было), а
+advisory lock вызывается с `userID.String()` — sqlc выводит из `$1::text` параметр
+`string`.
 
 `isUniqueViolation` — в `internal/devices/errors.go` (`db.DevicePlatform` генерирует
 sqlc в `internal/db/models.go`, здесь он только используется как тип поля
@@ -4812,11 +4825,11 @@ func NewHandler(svc *Service, idem *httpx.Idempotency) *Handler {
 }
 
 type deviceView struct {
-	ID        string    `json:"id"`
-	PublicKey string    `json:"public_key"`
-	Platform  string    `json:"platform"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        string     `json:"id"`
+	PublicKey string     `json:"public_key"`
+	Platform  string     `json:"platform"`
+	Name      string     `json:"name"`
+	CreatedAt time.Time  `json:"created_at"`
 	LastSeen  *time.Time `json:"last_seen_at"`
 	RevokedAt *time.Time `json:"revoked_at"`
 }
@@ -4825,6 +4838,7 @@ func toView(d db.Device) deviceView {
 	return deviceView{ID: d.ID.String(), PublicKey: d.PublicKey, Platform: string(d.Platform),
 		Name: d.Name, CreatedAt: d.CreatedAt, LastSeen: d.LastSeenAt, RevokedAt: d.RevokedAt}
 }
+
 // RegisterRoutes — единый для всех модулей способ монтирования (контракт и файл
 // internal/httpx/decorators.go — в начале этой задачи): сборщик передаёт ServeMux и
 // две обёртки, модуль решает только то, какой из его маршрутов закрыт. Оба маршрута
@@ -4919,14 +4933,18 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 
 - [ ] **Step 4: Прогнать**
 
-Run: `make up-dev && make sqlc-generate && make unit && make integration`
-Expected: PASS. В `TestConcurrentRegistrationRespectsLimit` `live == 3` обязан выполняться
-при `-race`; `make integration` ниже запускается с `-race`.
+Run: `make up-dev && make sqlc-generate && make unit && make integration`, сверх того —
+гонка с детектором: интеграция с `-race` (alpine без gcc, а `-race` требует cgo, поэтому
+полный образ `golang:1.25` с `CGO_ENABLED=1`, команда `docker-go-int` с флагом `-race`).
+Expected: PASS. В `TestConcurrentRegistrationRespectsLimit` `live == 3` и
+`limiterHits == 7` обязаны выполняться при `-race`. Target `integration` Makefile не
+несёт `-race`: `DOCKER_FLAGS` фиксирует `CGO_ENABLED=0`, на alpine такой прогон не собрался бы.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/devices internal/db/query/devices_lock.sql internal/db
+git add internal/devices internal/httpx/decorators.go tests/integration/devices_test.go \
+  internal/db/query/devices_lock.sql internal/db
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(devices): регистрация с жёстким лимитом под advisory lock и списком"
 ```
