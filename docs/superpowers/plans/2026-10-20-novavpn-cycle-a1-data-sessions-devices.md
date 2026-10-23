@@ -7384,8 +7384,7 @@ func TestWithUserIDWithoutJournalDoesNotPanic(t *testing.T) {
 	if !ok || got != id {
 		t.Errorf("UserIDFromContext = (%v, %v), want (%v, true)", got, ok, id)
 	}
-}
-```
+}```
 
 Run: `make unit`
 Expected: FAIL — `undefined: Envelope`, `undefined: Logging`. Пакет не компилируется
@@ -7463,8 +7462,7 @@ func allowedMethods(routes PatternResolver, r *http.Request) []string {
 		}
 	}
 	return allow
-}
-```
+}```
 
 `internal/httpx/logging.go`:
 
@@ -7608,8 +7606,7 @@ func Logging(next http.Handler, routes PatternResolver, log *slog.Logger) http.H
 
 		next.ServeHTTP(sw, req)
 	})
-}
-```
+}```
 
 `internal/httpx/requestid.go` — после переезда `statusWriter` и удаления журнальной
 строки файл выглядит целиком так (`time` больше не нужен):
@@ -7667,8 +7664,7 @@ func isHex16(s string) bool {
 		}
 	}
 	return true
-}
-```
+}```
 
 Два следствия, которые легко промотреть:
 
@@ -7687,8 +7683,7 @@ func WithUserID(ctx context.Context, id uuid.UUID) context.Context {
 	// предыдущем ctx и доступен по указателю.
 	noteUserID(ctx, id)
 	return context.WithValue(ctx, userIDKey{}, id)
-}
-```
+}```
 
 Run: `make unit && make vet`
 Expected: PASS.
@@ -7702,6 +7697,9 @@ Expected: PASS.
 запущенный после `auth_flow_test.go`, иначе ловил бы чужой 429 (или не ловил бы свой).
 Девятая база — отдельное пространство именно для этого теста; dev-Redis в compose
 настроен на 16 баз, и их больше никто не трогает.
+
+Хелпер `do` из задачи 17 разбирает каждое тело ответа как JSON, поэтому health
+проверяется без него: прямой `http.Get` — тело «ok» в plain text уронило бы `do`.
 
 ```go
 //go:build integration
@@ -7788,10 +7786,15 @@ func TestRouterServesDocumentedRoutes(t *testing.T) {
 		t.Fatalf("devices without token = %d %v", resp.StatusCode, body)
 	}
 
-	// Health живёт вне /api/v1 и не требует аутентификации.
-	resp, _ = do(t, http.MethodGet, base+"/debug/health", nil, "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("health = %d, want 200", resp.StatusCode)
+	// Health живёт вне /api/v1 и не требует аутентификации. Тело — plain text,
+	// поэтому без do: та разбирает ответ как JSON.
+	hresp, err := http.Get(base + "/debug/health")
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	defer hresp.Body.Close()
+	if hresp.StatusCode != http.StatusOK {
+		t.Fatalf("health = %d, want 200", hresp.StatusCode)
 	}
 	// Сквозной путь (register → me → devices) здесь не повторяется: он
 	// в auth_flow_test.go. Здесь проверяется именно сборка, а не правила.
@@ -7892,8 +7895,7 @@ func TestRouterRateLimitsAnonymousRoutes(t *testing.T) {
 	if !limited {
 		t.Fatalf("anonymous register must hit the per-IP bucket, got %v", codes)
 	}
-}
-```
+}```
 
 Run: `make integration`
 Expected: FAIL — `undefined: api.NewRouter`, `undefined: api.Deps`. Если падают
@@ -8029,8 +8031,7 @@ func userKey(r *http.Request) string {
 		return "anonymous"
 	}
 	return id.String()
-}
-```
+}```
 
 Три замечания к коду выше:
 
@@ -8103,12 +8104,11 @@ func serve(cfg config.Config) error {
 	}
 	log.Info("stopped")
 	return nil
-}
-```
+}```
 
 Импорты файла целиком: `context`, `errors`, `flag`, `fmt`, `log/slog`, `net/http`, `os`,
 `os/signal`, `syscall`, `time`, `github.com/redis/go-redis/v9`,
-`github.com/novavpn/novavpn/internal/api`, `internal/config`, `internal/db`,
+`github.com/novavpn/novavpn/services/api`, `internal/config`, `internal/db`,
 `internal/db/migrate`, `internal/entitlements`. Из задачи 1 в списке остаётся `net/http`
 (он нужен `http.Server`), а `errors` и `flag` нужны `run` и ветке `migrate` из задачи 5.
 
@@ -8132,10 +8132,15 @@ Run: `make up-dev && make migrate-up`, затем `make run-dev`; в друго�
 Expected: процесс стартует с `"msg":"listening"`; health отвечает `ok`; `/api/v1/devices`
 без токена — конверт 401 с заголовком `X-Request-Id`; несуществующий путь — конверт 404,
 а не `404 page not found`; `PUT /api/v1/auth/login` — 405 с `Allow: POST` и конвертом.
-По `Ctrl-C` появляется `"msg":"stopped"` и процесс выходит с кодом 0 (проверяется
-`echo $?` сразу после выхода). Если выход по сигналу не происходит за 10 секунд —
-`Shutdown` не получил контекст или обработчик завис; это дефект сборки, а не тестовой
-среды.
+По `Ctrl-C` появляется `"msg":"stopped"`, бинарник останавливается штатно. Про код
+выхода — уточнение, проверенное на этом шаге: `go run` (Go 1.25) сигналы дочернему
+процессу не пробрасывает (сигнального кода в `cmd/go/internal/run` нет), а после
+собственного SIGINT ставит exit status 1 (`work/exec.go`, `SetExitStatus`). Поэтому
+под `make run-dev` `echo $?` печатает код обёртки, а не бинарника. Критерий
+«выход 0» проверяется собранным бинарником как PID 1: SIGTERM и SIGINT дают
+`"msg":"stopped"` и код 0 (проверено обоими). Если выход по сигналу не происходит за
+10 секунд — `Shutdown` не получил контекст или обработчик завис; это дефект сборки,
+а не тестовой среды.
 
 Run: `make integration`
 Expected: PASS — все тесты сборки, включая `TestRouterJournalHasNoSecrets` и
