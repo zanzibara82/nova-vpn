@@ -431,21 +431,22 @@ func (q *Queries) RevokeProfile(ctx context.Context, id uuid.UUID) (RevokeProfil
 }
 
 const revokeProfilesForDevices = `-- name: RevokeProfilesForDevices :many
-UPDATE vpn_profiles
+UPDATE vpn_profiles p
    SET status = 'revoked', revoked_at = now()
- WHERE device_id = ANY($1::uuid[]) AND status IN ('active', 'superseded')
- RETURNING id, server_id, device_id
+  FROM devices d
+ WHERE p.id IN (SELECT id FROM vpn_profiles
+                 WHERE device_id = ANY($1::uuid[]) AND status IN ('active','superseded'))
+   AND p.device_id = d.id
+ RETURNING p.id, p.server_id, p.device_id, d.user_id
 `
 
 type RevokeProfilesForDevicesRow struct {
 	ID       uuid.UUID
 	ServerID uuid.UUID
 	DeviceID uuid.UUID
+	UserID   uuid.UUID
 }
 
-// Отзыв устройства = отзыв всех его профилей (§5.1). Возвращает server_id, потому
-// что именно по нему вызывающий код поднимает config_version: забыть сервер —
-// значит оставить пиера в desired set живым.
 func (q *Queries) RevokeProfilesForDevices(ctx context.Context, dollar_1 []uuid.UUID) ([]RevokeProfilesForDevicesRow, error) {
 	rows, err := q.db.Query(ctx, revokeProfilesForDevices, dollar_1)
 	if err != nil {
@@ -455,7 +456,12 @@ func (q *Queries) RevokeProfilesForDevices(ctx context.Context, dollar_1 []uuid.
 	var items []RevokeProfilesForDevicesRow
 	for rows.Next() {
 		var i RevokeProfilesForDevicesRow
-		if err := rows.Scan(&i.ID, &i.ServerID, &i.DeviceID); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.ServerID,
+			&i.DeviceID,
+			&i.UserID,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

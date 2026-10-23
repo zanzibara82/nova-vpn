@@ -156,14 +156,14 @@ type Querier interface {
 	RevokeAllFamiliesForUser(ctx context.Context, userID uuid.UUID) error
 	RevokeBootstrapToken(ctx context.Context, id uuid.UUID) (RevokeBootstrapTokenRow, error)
 	RevokeDevice(ctx context.Context, id uuid.UUID) error
+	// revoked_at IS NULL: повторный отзыв не должен двигать отметку времени — по ней судят,
+	// когда доступ действительно перестал существовать.
+	RevokeDevices(ctx context.Context, dollar_1 []uuid.UUID) error
 	RevokeNodeCredentialsForServer(ctx context.Context, serverID uuid.UUID) (int64, error)
 	// overlap_valid_until не обнуляется: констрейнт profiles_peer_state требует
 	// ненулевого окна при peer_state='rotating_old_key', а тихое «починить» констрейнт
 	// правкой данных — это способ потерять настоящее состояние.
 	RevokeProfile(ctx context.Context, id uuid.UUID) (RevokeProfileRow, error)
-	// Отзыв устройства = отзыв всех его профилей (§5.1). Возвращает server_id, потому
-	// что именно по нему вызывающий код поднимает config_version: забыть сервер —
-	// значит оставить пиера в desired set живым.
 	RevokeProfilesForDevices(ctx context.Context, dollar_1 []uuid.UUID) ([]RevokeProfilesForDevicesRow, error)
 	RevokeRefreshFamily(ctx context.Context, arg RevokeRefreshFamilyParams) error
 	// Условие по старому хэшу — это и детект переиспользования, и атомарность ротации:
@@ -172,6 +172,16 @@ type Querier interface {
 	// (current_token_hash), и sqlc выдал бы два одинаковых имени поля. Через @name
 	// имена задаёт автор запроса.
 	RotateRefresh(ctx context.Context, arg RotateRefreshParams) (RotateRefreshRow, error)
+	// Цепочка ротации в обе стороны — два запроса, а не одно UNION-выражение: отзыв
+	// потомка обязан закрыть overlap предка (§7.3), а отзыв родителя обязан погасить
+	// потомка (для пользователя это то же устройство с новым ключом), и множества нужно
+	// объединить. Вариант «один CTE, объединяющий up и down» PostgreSQL принимает, а
+	// sqlc 1.27.0 — нет («column reference \"id\" is ambiguous»); вариант «два рекурсивных
+	//Term в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
+	// этого генератор теряется в тех же CTE.
+	RotationAncestorIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
+	// Нижний ход той же цепочки (см. комментарий у RotationAncestorIDs).
+	RotationDescendantIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
 	ServerByID(ctx context.Context, id uuid.UUID) (VpnServer, error)
 	ServerConfigVersion(ctx context.Context, id uuid.UUID) (int64, error)
 	ServerHealthOf(ctx context.Context, serverID uuid.UUID) (ServerHealth, error)

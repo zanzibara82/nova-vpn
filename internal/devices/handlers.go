@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/entitlements"
 	"github.com/novavpn/novavpn/internal/httpx"
@@ -41,6 +43,42 @@ func toView(d db.Device) deviceView {
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, dec httpx.Decorators) {
 	mux.Handle("POST /api/v1/devices", dec.Auth(http.HandlerFunc(h.register)))
 	mux.Handle("GET /api/v1/devices", dec.Auth(http.HandlerFunc(h.list)))
+	// Отзыв устройства закрыт так же, как остальные: право на объект проверяется в
+	// сервисе, а не в middleware (спецификация §5.2). Идемпотентный ключ здесь не
+	// нужен: повтор DELETE отвечает 404, и защищать от повторной выдачи нечего.
+	mux.Handle("DELETE /api/v1/devices/{id}", dec.Auth(http.HandlerFunc(h.delete)))
+}
+
+// delete отзывает устройство. Ответ — 204 без тела: после отзыва показывать
+// нечего, а возвращать строку устройства значило бы обещать клиенту состояние,
+// которое он больше не может проверить.
+func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated,
+			"требуется аутентификация", nil)
+		return
+	}
+	deviceID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
+			"идентификатор устройства должен быть uuid", map[string]any{"field": "id"})
+		return
+	}
+	if _, err := h.svc.DeleteDevice(r.Context(), userID, deviceID); err != nil {
+		switch {
+		// Отозванное и чужое отвечают одинаково: по различию ответов перебирали бы,
+		// у каких устройств доступ уже закрыт.
+		case errors.Is(err, ErrForbiddenDevice), errors.Is(err, ErrDeviceRevoked):
+			httpx.WriteError(w, r, http.StatusNotFound, httpx.ErrNotFound,
+				"устройство не найдено", nil)
+		default:
+			httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal,
+				"внутренняя ошибка", nil)
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) register(w http.ResponseWriter, r *http.Request) {

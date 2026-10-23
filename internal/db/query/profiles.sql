@@ -73,14 +73,13 @@ UPDATE vpn_profiles
  RETURNING id, server_id, address_v4, device_id;
 
 -- name: RevokeProfilesForDevices :many
--- Отзыв устройства = отзыв всех его профилей (§5.1). Возвращает server_id, потому
--- что именно по нему вызывающий код поднимает config_version: забыть сервер —
--- значит оставить пиера в desired set живым.
-UPDATE vpn_profiles
+UPDATE vpn_profiles p
    SET status = 'revoked', revoked_at = now()
- WHERE device_id = ANY($1::uuid[]) AND status IN ('active', 'superseded')
- RETURNING id, server_id, device_id;
-
+  FROM devices d
+ WHERE p.id IN (SELECT id FROM vpn_profiles
+                 WHERE device_id = ANY($1::uuid[]) AND status IN ('active','superseded'))
+   AND p.device_id = d.id
+ RETURNING p.id, p.server_id, p.device_id, d.user_id;
 -- name: CountActiveProfilesByDevice :one
 SELECT count(*) FROM vpn_profiles WHERE device_id = $1 AND status = 'active';
 
