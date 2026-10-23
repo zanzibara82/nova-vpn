@@ -4955,7 +4955,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Files:**
 - Create: `api-spec/openapi.yaml`, `api-spec/contract_test.go`
-- Modify: `internal/httpx/envelope.go` (три кода, которых требует контракт),
+- Modify: `internal/httpx/envelope.go` (четыре новых кода: три добавляет контракт, `method_not_allowed` — заранее для задачи 18),
   `Makefile` (цель `api-lint`), `go.mod`/`go.sum` (`gopkg.in/yaml.v3`)
 
 **Interfaces:**
@@ -4995,16 +4995,24 @@ info:
     в A-2; здесь только идентификация, сессии и устройства. Числовые поля каталога
     (задержка, загрузка, доступность) здесь отсутствуют сознательно: до замеров на реальном
     узле их нечем наполнить, а спецификация §13.4 запрещает подставлять вместо них ноль.
+  license:
+    # SPDX-конвенция для закрытых лицензий; публичной лицензии у продукта нет.
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
 servers:
   - url: https://api.novavpn.local
 tags:
   - name: auth
+    description: Идентификация и сессии — регистрация, вход, refresh, logout, /me.
   - name: devices
+    description: Устройства пользователя — регистрация и список.
 paths:
   /api/v1/auth/register:
     post:
       tags: [auth]
       operationId: register
+      summary: Регистрация аккаунта с выдачей сессии.
+      security: []
       requestBody:
         required: true
         content:
@@ -5034,6 +5042,8 @@ paths:
     post:
       tags: [auth]
       operationId: login
+      summary: Вход по email и паролю.
+      security: []
       requestBody:
         required: true
         content:
@@ -5074,6 +5084,8 @@ paths:
     post:
       tags: [auth]
       operationId: refresh
+      summary: Обмен refresh-токена на новую пару.
+      security: []
       requestBody:
         required: true
         content:
@@ -5120,6 +5132,8 @@ paths:
     post:
       tags: [auth]
       operationId: logout
+      summary: Отзыв семьи refresh-токенов.
+      security: []
       description: >
         Отзыв семьи refresh. Аутентификации по access-токену не требует: отзыв обязан
         сработать и когда access уже просрочен. Действующее доказательство владения
@@ -5152,6 +5166,7 @@ paths:
     get:
       tags: [auth]
       operationId: getMe
+      summary: Аккаунт, план и использование устройств.
       security: [{ bearerAuth: [] }]
       responses:
         "200":
@@ -5168,6 +5183,7 @@ paths:
     post:
       tags: [devices]
       operationId: createDevice
+      summary: Регистрация устройства (идемпотентно).
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
@@ -5222,6 +5238,7 @@ paths:
     get:
       tags: [devices]
       operationId: listDevices
+      summary: Список устройств пользователя.
       security: [{ bearerAuth: [] }]
       responses:
         "200":
@@ -5410,6 +5427,11 @@ components:
             limit: { type: integer, minimum: 0 }
 ```
 
+Контракт в блоке выше — в состоянии, прошедшем линт `redocly/cli` (recommended
+ruleset): у каждой операции есть `summary`, публичные маршруты явно помечены
+`security: []`, в `info` есть `license`, у тегов — описания. Поля добавлены по
+требованию правил; правила не отключались.
+
 Оговорка по `password.minLength: 10`: JSON Schema считает символы, `auth.HashPassword` —
 байты (UTF-8). Для кириллицы и иероглифов байтов больше, поэтому проверка в Go строже, а
 не мягче: контракт обещает нижнюю границу, код её держит с запасом. Менять `MinPasswordLen`
@@ -5443,13 +5465,13 @@ import (
 )
 
 type spec struct {
-	Paths    map[string]map[string]any `yaml:"paths"`
-	Comp struct {
+	Paths map[string]map[string]any `yaml:"paths"`
+	Comp  struct {
 		Schemas map[string]struct {
-			Type       string `yaml:"type"`
-			Required   []string `yaml:"required"`
+			Type       string         `yaml:"type"`
+			Required   []string       `yaml:"required"`
 			Properties map[string]any `yaml:"properties"`
-			Enum       []string `yaml:"enum"`
+			Enum       []string       `yaml:"enum"`
 		} `yaml:"schemas"`
 	} `yaml:"components"`
 }
@@ -5473,23 +5495,23 @@ func load(t *testing.T) spec {
 func TestContractCodesAreDeclared(t *testing.T) {
 	s := load(t)
 	declared := map[string]httpx.ErrorCode{
-		"invalid_request":            httpx.ErrInvalidRequest,
-		"unauthenticated":            httpx.ErrUnauthenticated,
-		"account_locked":             httpx.ErrAccountLocked,
-		"forbidden":                  httpx.ErrForbidden,
-		"not_found":                  httpx.ErrNotFound,
-		"method_not_allowed":         httpx.ErrMethodNotAllowed,
-		"conflict":                   httpx.ErrConflict,
-		"device_limit_reached":       httpx.ErrDeviceLimitReached,
-		"duplicate_device":           httpx.ErrDuplicateDevice,
-		"idempotency_key_required":   httpx.ErrIdempotencyKeyRequired,
-		"idempotency_key_conflict":   httpx.ErrIdempotencyConflict,
+		"invalid_request":             httpx.ErrInvalidRequest,
+		"unauthenticated":             httpx.ErrUnauthenticated,
+		"account_locked":              httpx.ErrAccountLocked,
+		"forbidden":                   httpx.ErrForbidden,
+		"not_found":                   httpx.ErrNotFound,
+		"method_not_allowed":          httpx.ErrMethodNotAllowed,
+		"conflict":                    httpx.ErrConflict,
+		"device_limit_reached":        httpx.ErrDeviceLimitReached,
+		"duplicate_device":            httpx.ErrDuplicateDevice,
+		"idempotency_key_required":    httpx.ErrIdempotencyKeyRequired,
+		"idempotency_key_conflict":    httpx.ErrIdempotencyConflict,
 		"idempotency_key_in_progress": httpx.ErrIdempotencyInProgress,
-		"rate_limited":               httpx.ErrRateLimited,
-		"internal":                   httpx.ErrInternal,
-		"invalid_credentials":        httpx.ErrInvalidCredentials,
-		"refresh_token_invalid":      httpx.ErrRefreshTokenInvalid,
-		"email_taken":                httpx.ErrEmailTaken,
+		"rate_limited":                httpx.ErrRateLimited,
+		"internal":                    httpx.ErrInternal,
+		"invalid_credentials":         httpx.ErrInvalidCredentials,
+		"refresh_token_invalid":       httpx.ErrRefreshTokenInvalid,
+		"email_taken":                 httpx.ErrEmailTaken,
 	}
 	for _, name := range s.Comp.Schemas["ErrorCode"].Enum {
 		v, ok := declared[name]
@@ -5566,8 +5588,7 @@ func TestAllPathsArePublicV1(t *testing.T) {
 	if len(s.Paths) != 6 {
 		t.Errorf("paths = %d, want 6 for cycle A-1", len(s.Paths))
 	}
-}
-```
+}```
 
 `withRequestID` — в том же файле; `requestIDKey` неэкспортируем, поэтому тест берёт
 готовый middleware, а не конструирует контекст в обход него.
@@ -5584,24 +5605,22 @@ func withRequestID(t *testing.T, ctx context.Context) context.Context {
 		t.Fatal("request id middleware produced no request id")
 	}
 	return got
-}
-```
+}```
 
 - [ ] **Step 3: Добавить четыре кода в httpx**
 
 `internal/httpx/envelope.go`, в тот же `const`-блок:
 
 ```go
-	// Auth-коды (задача 17) и регистрация (задача 16). Добавляются, а не заменяются:
+// Auth-коды (задача 17) и регистрация (задача 16). Добавляются, а не заменяются:
 	// клиент, который видел invalid_credentials, не должен получить вместо него generic.
-	ErrInvalidCredentials   ErrorCode = "invalid_credentials"
-	ErrRefreshTokenInvalid  ErrorCode = "refresh_token_invalid"
-	ErrEmailTaken           ErrorCode = "email_taken"
+	ErrInvalidCredentials  ErrorCode = "invalid_credentials"
+	ErrRefreshTokenInvalid ErrorCode = "refresh_token_invalid"
+	ErrEmailTaken          ErrorCode = "email_taken"
 	// 405 пишет сборщик из задачи 18: ServeMux отвечает 405 без тела, а §5.2 требует
 	// конверт на любой ошибке. Код объявляется здесь, вместе с перечнем в контракте,
 	// иначе тест «код контракта == константа Go» не увидит расхождение до задачи 18.
-	ErrMethodNotAllowed     ErrorCode = "method_not_allowed"
-```
+	ErrMethodNotAllowed ErrorCode = "method_not_allowed"```
 
 - [ ] **Step 4: Линт контракта и `make api-lint`**
 
@@ -5609,11 +5628,13 @@ func withRequestID(t *testing.T, ctx context.Context) context.Context {
 запуске, записывается в файл, а не остаётся `latest`):
 
 ```make
-API_IMAGE ?= redocly/cli:1.34
+API_IMAGE ?= redocly/cli:1.34.22
 
-api-lint:
-	docker run --rm -v "$(CURDIR)/api-spec:/spec" $(API_IMAGE) lint /spec/openapi.yaml
-```
+api-lint:```
+
+Тег `1.34` на Docker Hub не существует — пин заменён на `1.34.22`, последний
+патч линейки 1.34 (проверено по API хаба); блок Makefile выше уже с фактическим
+тегом.
 
 Run: `make api-lint`
 Expected: `openapi.yaml: parsed` без ошибок; если линт требует `operationId` на каждом
