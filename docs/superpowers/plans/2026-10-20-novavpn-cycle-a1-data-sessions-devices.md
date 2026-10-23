@@ -5675,7 +5675,8 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `internal/auth/handlers.go`, `internal/auth/middleware_test.go`,
   `tests/integration/auth_flow_test.go`
 - Modify: `internal/auth/refresh.go` (ротация обязана проверять статус пользователя —
-  иначе блокировка из ТЗ §9 не останавливает продление сессий)
+  иначе блокировка из ТЗ §9 не останавливает продление сессий), `api-spec/openapi.yaml`
+  и `docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md` (шаг 6)
 
 **Interfaces:**
 - Consumes: `auth.SessionService`, `auth.Session` (задача 12), `auth.Denylist`, `auth.Issuer`,
@@ -5772,8 +5773,7 @@ func newAuthServer(t *testing.T) (*httptest.Server, *db.Queries) {
 	srv := httptest.NewServer(httpx.NewRequestID(mux))
 	t.Cleanup(srv.Close)
 	return srv, q
-}
-```
+}```
 
 Дальше — хелперы ответа и тело теста:
 
@@ -5864,8 +5864,7 @@ func errorCode(t *testing.T, body map[string]any) string {
 func envelopePair(body map[string]any) string {
 	e, _ := body["error"].(map[string]any)
 	return fmt.Sprint(e["code"], "|", e["message"])
-}
-```
+}```
 
 Тело первого теста — весь путь сессии, включая переиспользование refresh и отзыв:
 
@@ -5965,8 +5964,7 @@ func TestRegisterThenRotateThenLogoutDeniesAccess(t *testing.T) {
 	if _, err := q.UserByEmail(ctx, email); err != nil {
 		t.Fatalf("user vanished after logout: %v", err)
 	}
-}
-```
+}```
 
 Второй тест закрывает отказные ветки: слабый пароль, дубликат email, одинаковость
 ответов на неизвестный email и неверный пароль (нет оракула перечисления), блокировку,
@@ -6042,8 +6040,7 @@ func userIDByEmail(t *testing.T, ctx context.Context, q *db.Queries, email strin
 		t.Fatalf("UserByEmail(%s): %v", email, err)
 	}
 	return u.ID
-}
-```
+}```
 
 Сравнение ведётся по паре «code|message», а не по карте целиком: `request_id` различается
 по определению, и с ним эта проверка была бы всегда красной — ровно тот класс молчаливого
@@ -6144,8 +6141,7 @@ func TestMiddlewareRejects(t *testing.T) {
 			assertUnauthenticated(t, w)
 		})
 	}
-}
-```
+}```
 
 Хелпер проверки envelope — тот же файл:
 
@@ -6170,8 +6166,7 @@ func assertUnauthenticated(t *testing.T, w *httptest.ResponseRecorder) {
 	if len(body.Error.RequestID) != 16 {
 		t.Errorf("request_id = %q, want 16 chars", body.Error.RequestID)
 	}
-}
-```
+}```
 
 `bytes32` уже объявлен в `token_test.go` (задача 11) — в этом файле его объявлять
 нельзя. `SessionService` собирается напрямую, потому что `ParseAccess` не трогает `q`;
@@ -6209,8 +6204,7 @@ func TestMiddlewareFailsOpenWhenDenylistIsDown(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (fail-open)", w.Code)
 	}
-}
-```
+}```
 
 Run: `make unit`
 Expected: FAIL — `undefined: Middleware`.
@@ -6296,7 +6290,7 @@ func ClientIP(r *http.Request) *netip.Addr {
 		return nil
 	}
 	if addr.Is4In6() {
-		addr = addr.Addr4()
+		addr = addr.Unmap()
 	}
 	return &addr
 }
@@ -6306,8 +6300,11 @@ func ipString(a *netip.Addr) string {
 		return "unknown"
 	}
 	return a.String()
-}
-```
+}```
+
+В блоке выше `ClientIP` приводит 4-in-6 через `addr.Unmap()`: у `netip.Addr` метода
+`Addr4()` нет (в черновике плана стояла именно она), а `Unmap` возвращает чистую
+четвёрку. Правка сделана по фактической компиляции, семантика не менялась.
 
 `Middleware` намеренно не принимает `*slog.Logger`: отказ `Denylist.Contains` пишется в
 журнал внутри denylist (задача 11), а журнал каждого запроса делает сквозной middleware из
@@ -6388,8 +6385,7 @@ func (g *LoginGuard) Reset(ctx context.Context, email, ip string) {
 	if err := g.rdb.Del(ctx, failKey(email, ip)).Err(); err != nil {
 		g.log.Warn("login guard reset", "err", err)
 	}
-}
-```
+}```
 
 `failBaseDelay << shift` законен: `time.Duration` — целой тип, а сдвиг на `int64`
 даёт удвоение. Окно `failWindow` обновляется только на первой неудаче, счётчик не
@@ -6445,8 +6441,7 @@ func TestLockedAccountCannotRefresh(t *testing.T) {
 	if _, err := q.UserByEmail(ctx, email); err != nil {
 		t.Fatalf("user vanished after lock: %v", err)
 	}
-}
-```
+}```
 
 Run: `make integration`
 Expected: FAIL — `refresh on locked account: 200`.
@@ -6459,8 +6454,6 @@ Expected: FAIL — `refresh on locked account: 200`.
 ```go
 	user, err := s.q.UserByID(ctx, family.UserID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Семья указывает на пользователя, которого нет (в A удаление — это
-		// status='deleted', поэтому случай теоретический, но дешёвый).
 		return Session{}, ErrInvalidRefreshToken
 	}
 	if err != nil {
@@ -6468,8 +6461,10 @@ Expected: FAIL — `refresh on locked account: 200`.
 	}
 	if user.Status != db.UserStatusActive {
 		return Session{}, ErrAccountLocked
-	}
-```
+	}```
+
+В фактическом файле ветка `ErrNoRows` без комментария: случай теоретический
+(в A удаление — это `status='deleted'`), и комментарий там был бы громче ветки.
 
 Проверка стоит до сравнения секрета? Нет — порядок обратный: неверный токен обязан
 остаться `refresh_token_invalid`, иначе ответ «аккаунт заблокирован» станет
@@ -6749,12 +6744,12 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 type userView struct {
-	ID          string     `json:"id"`
-	Email       string     `json:"email"`
-	DisplayName *string    `json:"display_name"`
-	Status      string     `json:"status"`
-	Locale      string     `json:"locale"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID          string    `json:"id"`
+	Email       string    `json:"email"`
+	DisplayName *string   `json:"display_name"`
+	Status      string    `json:"status"`
+	Locale      string    `json:"locale"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type planView struct {
@@ -6769,9 +6764,9 @@ type usageView struct {
 }
 
 type meView struct {
-	User    userView   `json:"user"`
-	Plan    *planView  `json:"plan"`
-	Devices usageView  `json:"devices"`
+	User    userView  `json:"user"`
+	Plan    *planView `json:"plan"`
+	Devices usageView `json:"devices"`
 }
 
 func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
@@ -6895,9 +6890,12 @@ func isEmailTaken(err error) bool {
 	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
 		return false
 	}
-	return pgErr.Constraint == "users_email_key"
-}
-```
+	return pgErr.ConstraintName == "users_email_key"
+}```
+
+В блоке выше `isEmailTaken` читает `pgErr.ConstraintName`: поле `*pgconn.PgError` в
+pgx v5 называется именно так (`Constraint` из черновика плана не компилируется).
+Семантика та же: код 23505 плюс имя `users_email_key`.
 
 Несколько решений, которые надо держать именно такими:
 
@@ -6921,13 +6919,21 @@ func isEmailTaken(err error) bool {
 - [ ] **Step 6: Привести контракт и спецификацию в соответствие**
 
 Контракт задачи 16 писался до того, как появились `account_locked` на refresh и
-идемпотентность logout. Правки в `api-spec/openapi.yaml` — в том же коммите:
+идемпотентность logout. Правки в `api-spec/openapi.yaml` — в том же коммите.
+Два пункта из черновика этого шага оказались уже сделанными: 403 `account_locked`
+на refresh и `minimum: 0` у `devices.limit` вошли в контракт ещё задачей 16
+(план писался одним документом до реализации). Поэтому пункт 1 и лимит из
+пункта 3 здесь только проверяются, а реальные правки — пункт 2 и перенос полей
+плана в отдельную схему `PlanView`.
 
-1. `POST /auth/refresh` — добавить ответ:
+1. `POST /auth/refresh` — 403 уже в контракте (блок ниже — фактический фрагмент); проверено, правок нет:
 
 ```yaml
+        # 403 здесь обязателен: Rotate читает статус пользователя (задача 17, шаг 4), и
+        # заблокированный аккаунт не продлевает доступ. Без этой строки живой ответ 403
+        # не был бы описан контрактом, а контракт-first на этом маршруте теряет смысл.
         "403":
-          description: Аккаунт заблокирован; продление сессии остановлено (ТЗ §9).
+          description: Учётная запись заблокирована — новая пара не выдаётся.
           content:
             application/json:
               schema:
@@ -6936,8 +6942,7 @@ func isEmailTaken(err error) bool {
                   - properties:
                       error:
                         properties:
-                          code: { enum: [account_locked] }
-```
+                          code: { enum: [account_locked] }```
 
 2. `POST /auth/logout` — заменить текст ответа `401`, чтобы он описывал только
    нераспаршиваемый токен:
@@ -6956,13 +6961,15 @@ func isEmailTaken(err error) bool {
                   - properties:
                       error:
                         properties:
-                          code: { enum: [refresh_token_invalid] }
-```
+                          code: { enum: [refresh_token_invalid] }```
 
 3. `GET /me` — план становится nullable, лимит устройств — с нулём:
 
 ```yaml
         plan:
+          # null — активной подписки нет (истекла или не была выдана). /me описывает
+          # состояние аккаунта, а не выдаёт право, поэтому здесь данные, а не отказ:
+          # 403 на «подписка кончилась» был бы неправдой про доступ.
           anyOf:
             - $ref: "#/components/schemas/PlanView"
             - type: "null"
@@ -6971,10 +6978,9 @@ func isEmailTaken(err error) bool {
           required: [live, limit]
           properties:
             live: { type: integer, minimum: 0 }
-            # 0 — план кончился или его никогда не было; именно поэтому здесь
-            # больше нет minimum: 1.
-            limit: { type: integer, minimum: 0 }
-```
+            # 0 — подписки нет, и права на устройства тоже (ср. POST /devices: 403).
+            # Минимум не может быть 1, иначе истёкший аккаунт не описывается контрактом.
+            limit: { type: integer, minimum: 0 }```
 
 и в `components/schemas` добавить `PlanView` с теми же полями, что `planView` в Go
 (`slug`, `device_limit` с `minimum: 1`, `traffic_quota_bytes` — `["integer","null"]`).
