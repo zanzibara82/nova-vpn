@@ -12,6 +12,7 @@ import (
 
 	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/config"
+	"github.com/novavpn/novavpn/internal/connections"
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/devices"
 	"github.com/novavpn/novavpn/internal/entitlements"
@@ -37,6 +38,13 @@ const (
 	// Закрытые маршруты: bucket на пользователя.
 	userPerMin = 600.0
 	userBurst  = 50
+	// Выдача профиля — отдельный бакет, а не часть общего бюджета закрытых
+	// маршрутов: при общем лимите один пользователь мог бы удерживать 30 выдач в
+	// минуту и одновременно делать 600 списаний, то есть платить за право
+	// заблокировать сервер чужим трафиком из своего же бюджета. Число и окно — §5.2,
+	// окно на пользователя (ключ тот же userKey, что у dec.Auth).
+	profileIssuePerMin = 30.0
+	profileIssueBurst  = 5
 )
 
 // planSlug — единственный план A-1; он же seed из миграции 0003 (задача 4).
@@ -81,6 +89,15 @@ func NewRouter(d Deps) http.Handler {
 	devices.NewHandler(devices.NewService(d.Pool, d.Ent),
 		httpx.NewIdempotency(httpx.NewPGIdempotency(d.Pool))).RegisterRoutes(mux, dec)
 	servers.NewHandler(servers.NewService(q)).RegisterRoutes(mux, dec)
+
+	// Профили: свой ограничитель поверх того же пользователя. Порядок обёрток
+	// (auth → лимит выдачи → идемпотентность → хендлер) задаёт модуль, здесь
+	// решается только из чего он собран: 429 обязан случиться до записи слота
+	// идемпотентности, иначе отклонённый запрос оставил бы занятой ключ.
+	profileIssue := lim.Middleware("profile_issue", httpx.RatePerMinute(profileIssuePerMin),
+		profileIssueBurst, userKey)
+	connections.NewHandler(connections.NewService(d.Pool, d.Ent),
+		httpx.NewIdempotency(httpx.NewPGIdempotency(d.Pool)), profileIssue).RegisterRoutes(mux, dec)
 
 	// Порядок цепочки: request id (чтобы конверт 404 имел что поставить в
 	// request_id), журнал (видит и 429, и панику, и называет маршрут до диспетчера),
