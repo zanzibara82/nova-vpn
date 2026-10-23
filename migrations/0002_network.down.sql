@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS tunnel_addresses;
+DROP TABLE IF EXISTS vpn_profiles;
+DROP TABLE IF EXISTS node_credentials;
+DROP TABLE IF EXISTS vpn_servers;
+DROP TABLE IF EXISTS server_locations;
+DROP TYPE IF EXISTS peer_state;
+DROP TYPE IF EXISTS profile_status;
+DROP TYPE IF EXISTS dns_mode;
+DROP TYPE IF EXISTS maintenance_status;

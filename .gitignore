@@ -9,6 +9,8 @@
 .env
 .env.*
 !.env.example
+# Примеры окружения отслеживаются, рабочие файлы — нет
+!.env.dev.example
 *.key
 *.pem
 *.p12
@@ -23,6 +25,7 @@ etc_priv/
 node_private_key
 
 # Артефакты сборки
+/out/
 /services/api/bin/
 /services/node-agent/bin/
 /dist/

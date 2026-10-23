@@ -1,0 +1,44 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "migrations"
+    queries: "internal/db/query"
+    gen:
+      go:
+        package: "db"
+        out: "internal/db"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        emit_json_tags: false
+        emit_prepared_queries: false
+        # NULL-колонки обязаны стать указателями (*time.Time, *int64, *netip.Addr),
+        # иначе «значение по умолчанию» и «значения нет» будут неотличимы — а это ровно
+        # та подмена, которую запрещает ТЗ §19.3 (метрики без замера = null).
+        emit_pointers_for_null_types: true
+        overrides:
+          # Встроенный Go-тип — плоской строкой; тип из stdlib — вложенной формой.
+          - db_type: "citext"
+            go_type: "string"
+          # Без override uuid генерируется как pgtype.UUID, но все слои выше (задачи 7+)
+          # работают с google/uuid.UUID, а pgx/v5 умеет кодировать его нативно.
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+          # Без override timestamptz генерируется как pgtype.Timestamptz, а план задач
+          # 12/13/15 сравнивает и присваивает time.Time (ExpiresAt, CreatedAt, RevokedAt).
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+          # Nullable-колонки sqlc ищет отдельным ключом и берёт тип дословно, поэтому
+          # указатель задаётся явно: иначе «значения нет» слилось бы с нулевым временем.
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              type: "time.Time"
+              pointer: true
+          - db_type: "cidr"
+            go_type:
+              import: "net/netip"
+              type: "Prefix"
+          - db_type: "inet"
+            go_type:
+              import: "net/netip"
+              type: "Addr"

@@ -305,7 +305,7 @@ func Load(getenv func(string) string) (Config, error) {
 		return c, fmt.Errorf("NOVAVPN_ALLOW_INSECURE_API: %w", err)
 	}
 	if insecure && c.Env != EnvDev {
-		return c, errors.New("NOVAVPN_ALLOW_INSECURE_API is refused outside dev: TLS verification is not optional in prod")
+		return c, errors.New("insecure API transport is refused outside dev: TLS verification is not optional in prod (NOVAVPN_ALLOW_INSECURE_API)")
 	}
 	c.AllowInsecureAPI = insecure
 	return c, nil
@@ -319,6 +319,12 @@ func orDefault(v, def string) string {
 }
 ```
 
+Слово `insecure` в тексте отказа написано строчными намеренно: шаг 1 проверяет
+`strings.Contains(err.Error(), "insecure")`, а это сравнение регистрозависимо, и одно только
+имя переменной `NOVAVPN_ALLOW_INSECURE_API` его не удовлетворяет (заглавные к строчным не
+равны). Имя переменной оставлено в конце сообщения, чтобы по тексту ошибки было понятно,
+какую именно настройку отклонили.
+
 - [ ] **Step 4: Makefile — единственный способ собрать и протестировать**
 
 `Makefile` (хост Windows + Git Bash; пути внутри контейнера абсолютные, поэтому
@@ -328,6 +334,15 @@ func orDefault(v, def string) string {
 GO_IMAGE ?= golang:1.25-alpine
 DB_IMAGE ?= postgres:17
 REDIS_IMAGE ?= redis:7
+
+# Хостовы порты dev-стека. Занятые по умолчанию — не гипотеза: на этой машине 5432
+# держит служба postgresql-x64-17, а 6379 — локальный redis, и connect с тестового
+# контейнера уходит в чужой сервер (SASL-ошибка на несуществующую роль). Порты
+# переопределяют одной строкой: make integration POSTGRES_HOST_PORT=5433.
+POSTGRES_HOST_PORT ?= 5432
+REDIS_HOST_PORT ?= 6379
+# Compose читает порты из окружения процесса, поэтому их передают именно ему.
+DEV_ENV = POSTGRES_HOST_PORT=$(POSTGRES_HOST_PORT) REDIS_HOST_PORT=$(REDIS_HOST_PORT)
 COMPOSE   := docker compose -f infrastructure/docker/docker-compose.dev.yml
 ENV_FILE  := infrastructure/docker/.env.dev
 
@@ -336,8 +351,8 @@ ENV_FILE  := infrastructure/docker/.env.dev
 # отдельно: .env.dev описывает запуск бинарника с хоста. Флаг -e важнее
 # --env-file, так что значения из файла не перебивают эти.
 # host-gateway нужен Linux-движку; Docker Desktop резолвит имя и без него.
-DB_URL_INTEG     := postgres://nova:nova@host.docker.internal:5432/novavpn?sslmode=disable
-REDIS_ADDR_INTEG := host.docker.internal:6379
+DB_URL_INTEG     := postgres://nova:nova@host.docker.internal:$(POSTGRES_HOST_PORT)/novavpn?sslmode=disable
+REDIS_ADDR_INTEG := host.docker.internal:$(REDIS_HOST_PORT)
 
 DOCKER_FLAGS := -v "$(CURDIR):/src" -w /src \
 	-v novavpn-gomod:/go/pkg/mod -v novavpn-gocache:/root/.cache/go-build \
@@ -361,7 +376,7 @@ docker-go-app = MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) \
 	-e NOVAVPN_REDIS_ADDR=$(REDIS_ADDR_INTEG) \
 	$(GO_IMAGE) go
 
-.PHONY: unit vet integration mod tidy sqlc-generate migrate-up migrate-down run-dev up-dev down-dev
+.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev
 unit:
 	$(docker-go) test -count=1 ./...
 
@@ -374,8 +389,10 @@ mod:
 	$(docker-go) mod tidy
 
 up-dev:
-	$(COMPOSE) up -d postgres redis
-	$(COMPOSE) exec -T postgres pg_isready -U nova -d novavpn -q
+	# --wait обязателен: без него `up -d` возвращается сразу, а `pg_isready` в следующей
+	# строке застает инициализацию кластера и уходит с кодом 2 (проверено на этом стеке).
+	$(DEV_ENV) $(COMPOSE) up -d --wait postgres redis
+	$(DEV_ENV) $(COMPOSE) exec -T postgres pg_isready -U nova -d novavpn -q
 
 down-dev:
 	$(COMPOSE) down -v
@@ -411,6 +428,7 @@ $(ENV_FILE):
 
 sqlc-generate:
 	docker run --rm -v "$(CURDIR):/src" -w /src sqlc/sqlc:1.27.0 generate
+
 ```
 
 `go.mod` создаётся одной строкой внутри контейнера (на хосте Go нет):
@@ -426,7 +444,7 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=0 golan
 
 Только то, что существует в A-1: разбор подкоманды `serve` (HTTP-сервер со
 `GET /debug/health`) и подкоманда `migrate`. Здесь `migrate` — заглушка
-`errors.New("migrations land in task 3")`: она падает громко, а не молча делает вид.
+`errors.New("migrations land in task 5")`: она падает громко, а не молча делает вид.
 Реализацию (`up|all|version` поверх пакета `internal/db/migrate`, который появляется в
 задаче 5) пишет задача 5, там же в этот `switch` вставляется ветка; задача 18 к
 `migrate` не притрагивается.
@@ -465,7 +483,7 @@ func run(args []string, getenv func(string) string) error {
 	case "serve":
 		return serve(cfg)
 	case "migrate":
-		return errors.New("migrations land in task 3")
+		return errors.New("migrations land in task 5")
 	case "":
 		return errors.New("usage: novavpn-api serve|migrate <up|all>")
 	default:
@@ -501,7 +519,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 ### Task 2: Миграция 0001 — пользователи, refresh-семьи, устройства
 
 **Files:**
-- Create: `migrations/0001_identity.up.sql`, `migrations/0001_identity.down.sql`
+- Create: `migrations/0001_identity.up.sql`, `migrations/0001_identity.down.sql`,
+  `migrations/0005_users_locale_default_ru.up.sql`,
+  `migrations/0005_users_locale_default_ru.down.sql` (поправка 2026-10-22 — язык продукта, см. примечание после шага 5)
 
 **Interfaces:**
 - Consumes: PostgreSQL 17 (образ `postgres:17`, пользователь `nova`, БД `novavpn`).
@@ -590,24 +610,28 @@ DROP TYPE IF EXISTS user_status;
 
 Run:
 ```bash
-make up-dev
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  exec -T postgres psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
+# `infrastructure/docker/docker-compose.dev.yml` создаёт задача 5, поэтому до неё база
+# поднимается одноразовым контейнером с тем же пользователем и той же БД. С задачи 5
+# вместо этих двух строк — `make up-dev`.
+docker rm -f novavpn-pg-a1 2>/dev/null; docker run -d --name novavpn-pg-a1 \
+  -e POSTGRES_USER=nova -e POSTGRES_PASSWORD=nova -e POSTGRES_DB=novavpn postgres:17
+docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
   -f - < migrations/0001_identity.up.sql
 ```
-Expected: без ошибок, `CREATE TABLE` ×3.
+Expected: без ошибок, `CREATE TABLE` ×3. Состояние контейнера — одноразовое, в дерево
+репозитория не попадает; после проверки его можно удалить `docker rm -f novavpn-pg-a1`.
 
 Run (обратный порядок, чтобы down не упал на зависимостях):
 ```bash
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  exec -T postgres psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
+docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -v ON_ERROR_STOP=1 \
   -f - < migrations/0001_identity.down.sql
 ```
 Expected: без ошибок.
 
 - [ ] **Step 4: Проверить, что констрейнты действительно отсекают мусор**
 
-Run: `make up-dev`, затем тот же `psql` с up-миграцией и тремя запросами:
+Run: применить up-миграцию к одноразовому контейнеру из шага 3 (с задачи 5 — после
+`make up-dev`), затем тот же `psql` с тремя запросами:
 
 ```sql
 -- (a) блокировка без причины
@@ -634,6 +658,29 @@ git add migrations/0001_identity.up.sql migrations/0001_identity.down.sql
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(db): схема идентификации — пользователи, refresh-семьи, устройства"
 ```
+
+**Поправка 2026-10-22 — язык продукта русский** (решение «продукт русскоязычный»):
+миграция `0001` выгружена с `DEFAULT 'en'` и историю не переписывает, поэтому дефолт
+локали меняет отдельная пара `0005`. Текст блока `0001` выше остаётся без изменений —
+это байт-в-байт содержание закоммиченного файла.
+
+`migrations/0005_users_locale_default_ru.up.sql`:
+
+```sql
+-- Решение 2026-10-22: язык интерфейса продукта — русский, locale по умолчанию — 'ru'.
+-- 0001 выгружена с DEFAULT 'en'; историю не переписываем — дефолт меняет эта пара.
+ALTER TABLE users
+    ALTER COLUMN locale SET DEFAULT 'ru';
+```
+
+`migrations/0005_users_locale_default_ru.down.sql`:
+
+```sql
+ALTER TABLE users
+    ALTER COLUMN locale SET DEFAULT 'en';
+```
+
+Применяется обычным раннером (`make migrate-up`), проверка up→down→up — в задаче 5.
 
 ---
 
@@ -731,13 +778,16 @@ CREATE UNIQUE INDEX profiles_one_active_per_device_server
 
 CREATE TABLE tunnel_addresses (
     server_id    uuid NOT NULL REFERENCES vpn_servers(id) ON DELETE CASCADE,
-    address      inet PRIMARY KEY,
+    address      inet NOT NULL,
+    -- Первичный ключ — пара (сервер, адрес), а не адрес: пулы разных серверов могут
+    -- совпадать, и один и тот же адрес в двух пулах — норма (спецификация §6).
     -- Назначение хранится здесь, чтобы аллокация шла под блокировкой строки сервера:
     -- коллизия адреса невозможна конструктивно (спецификация §6).
     allocated_to uuid REFERENCES vpn_profiles(id) ON DELETE SET NULL,
     -- Освобождается не сразу, а по истечении окна переиспользования (§7.2).
     released_at  timestamptz,
     reusable_at  timestamptz,
+    PRIMARY KEY (server_id, address),
     CONSTRAINT addresses_window CHECK (released_at IS NULL OR reusable_at IS NULL
                                        OR reusable_at >= released_at)
 );
@@ -762,7 +812,8 @@ DROP TYPE IF EXISTS maintenance_status;
 
 - [ ] **Step 3: Проверить синтаксис и констрейнты**
 
-Run: `make up-dev`, затем прогнать up → down → up через `psql -v ON_ERROR_STOP=1 -f - < …sql`
+Run: поднять базу (до задачи 5 — одноразовый контейнер `novavpn-pg-a1`, команда в задаче 2,
+шаг 3; с задачи 5 — `make up-dev`), затем прогнать up → down → up через `psql -v ON_ERROR_STOP=1 -f - < …sql`
 (команда из задачи 2, шаг 3) и нижеуказанный скрипт проверок. Он сам создаёт себе
 родительские строки, поэтому запускается одним куском:
 
@@ -776,6 +827,12 @@ INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, pu
 VALUES ('00000000-0000-4000-8000-000000000f02', '00000000-0000-4000-8000-000000000f01',
         'nl-ams-1', 'nl-ams-1.novavpn.example', 51820,
         'wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iA=', '10.99.7.0/24', 'example-hosting');
+-- второй узел в той же локации и с тем же пулом: нужен для блока (d)
+INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, public_key,
+                         address_pool_v4, provider)
+VALUES ('00000000-0000-4000-8000-000000000f0a', '00000000-0000-4000-8000-000000000f01',
+        'nl-ams-2', 'nl-ams-2.novavpn.example', 51820,
+        'qTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iB=', '10.99.7.0/24', 'example-hosting');
 INSERT INTO users (id, email, password_hash)
 VALUES ('00000000-0000-4000-8000-000000000f03', 'seed@novavpn.example',
         '$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0aW9uZQ$aGFzaGFzaGFzaGFzaGFzaGFzaA');
@@ -809,12 +866,16 @@ VALUES ('00000000-0000-4000-8000-000000000f08', '00000000-0000-4000-8000-0000000
         'superseded', 'rotating_old_key');
 ROLLBACK TO c;   -- ← profiles_peer_state
 
--- (d) адрес в tunnel_addresses уникален в пределах сервера (PK), но одинаковый адрес
---     на двух серверах — норма: второй вставкой это и проверяем.
+-- (d) адрес уникален в пределах сервера (PK), но одинаковый адрес на двух серверах — норма:
+--     вторая вставка (другой сервер) обязана пройти, третья (тот же сервер и адрес) — упасть.
 SAVEPOINT d;
 INSERT INTO tunnel_addresses (server_id, address)
 VALUES ('00000000-0000-4000-8000-000000000f02', '10.99.7.42/32');
-ROLLBACK TO d;   -- ← вторая вставка того же (server, address) падает на PRIMARY KEY
+INSERT INTO tunnel_addresses (server_id, address)
+VALUES ('00000000-0000-4000-8000-000000000f0a', '10.99.7.42/32');
+INSERT INTO tunnel_addresses (server_id, address)
+VALUES ('00000000-0000-4000-8000-000000000f02', '10.99.7.42/32');
+ROLLBACK TO d;   -- ← третья вставка того же (server, address) падает на PRIMARY KEY
 
 -- (e) координаты вне диапазона:
 SAVEPOINT e;
@@ -827,10 +888,12 @@ ROLLBACK;
 
 Run: сохранить скрипт в `out/constraints.sql` (каталог игнорируется) и выполнить:
 ```bash
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  cp out/constraints.sql postgres:/tmp/constraints.sql
-MSYS_NO_PATHCONV=1 docker compose -f infrastructure/docker/docker-compose.dev.yml \
-  exec -T postgres psql -U nova -d novavpn -f /tmp/constraints.sql
+# До задачи 5 база — одноразовый контейнер `novavpn-pg-a1` (задача 2, шаг 3);
+# с задачи 5 те же два шага делаются через compose-service `postgres`.
+# Флаг MSYS_NO_PATHCONV=1 обязателен обоим командам: без него Git Bash превращает
+# /tmp/constraints.sql в путь Windows, и psql сообщает «No such file or directory».
+MSYS_NO_PATHCONV=1 docker cp out/constraints.sql novavpn-pg-a1:/tmp/constraints.sql
+MSYS_NO_PATHCONV=1 docker exec -i novavpn-pg-a1 psql -U nova -d novavpn -f /tmp/constraints.sql
 ```
 (Без `-v ON_ERROR_STOP=1`: нам нужно увидеть все пять ошибок, а не остановиться на первой.)
 
@@ -838,8 +901,8 @@ Expected: **пять ошибок**, по одной на блоки (a)–(e), 
 `duplicate key value violates unique constraint "profiles_one_active_per_device_server"`,
 `profiles_revoked_at`, `profiles_peer_state`,
 `duplicate key value violates unique constraint "tunnel_addresses_pkey"`,
-`server_locations_lat_check`. Блок (d) обязан упасть на **втором** INSERT (первый —
-валидная вставка), блок (e) — на `lat = 95`.
+`server_locations_lat_check`. Блок (d) обязан упасть на **третьем** INSERT (первые два —
+валидные вставки: один и тот же адрес на двух разных серверах), блок (e) — на `lat = 95`.
 
 - [ ] **Step 4: Коммит**
 
@@ -1021,10 +1084,35 @@ Run (после применения 0001 и 0002): `psql -v ON_ERROR_STOP=1 -f 
 затем down, затем up; затем скрипт проверок (тот же порядок `docker compose cp` +
 `psql -f /tmp/plans_checks.sql`, что в задаче 3):
 
+Проверки ссылаются на родителей из задач 2–3 (пользователь `…f03`, устройство `…f04`, узел
+`…f02`), поэтому сначала прогоняется и коммитится сид `out/seed.sql`, затем идёт скрипт ниже.
+Сид нужен отдельным файлом, а не «seed-блоком задачи 3»: `out/constraints.sql` заканчивается
+`ROLLBACK` и родителей после себя не оставляет.
+
+```sql
+-- out/seed.sql — родители для проверок задач 3 и 4. ON CONFLICT, чтобы запускать дважды
+-- на уже наполненной базе.
+INSERT INTO server_locations (id, country_code, city, lat, lon, timezone)
+VALUES ('00000000-0000-4000-8000-000000000f01', 'NL', 'Amsterdam', 52.3738, 4.8910, 'Europe/Amsterdam')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, public_key,
+                         address_pool_v4, provider)
+VALUES ('00000000-0000-4000-8000-000000000f02', '00000000-0000-4000-8000-000000000f01',
+        'nl-ams-1', 'nl-ams-1.novavpn.example', 51820,
+        'wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iA=', '10.99.7.0/24', 'example-hosting')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO users (id, email, password_hash)
+VALUES ('00000000-0000-4000-8000-000000000f03', 'seed@novavpn.example',
+        '$argon2id$v=19$m=65536,t=3,p=4$c2FsdHNhbHRzYWx0aW9uZQ$aGFzaGFzaGFzaGFzaGFzaGFzaA')
+ON CONFLICT (id) DO NOTHING;
+INSERT INTO devices (id, user_id, public_key, platform, name)
+VALUES ('00000000-0000-4000-8000-000000000f04', '00000000-0000-4000-8000-000000000f03',
+        'wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iI=', 'linux', 'seed')
+ON CONFLICT (id) DO NOTHING;
+```
+
 ```sql
 BEGIN;
--- Скрипт рассчитывает на строку узла из seed-блока задачи 3; если база чистая —
--- выполнить сначала seed из того файла, затем этот.
 SAVEPOINT a;
 INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, reason, request_id)
 VALUES (NULL, 'server_created', 'vpn_server', '00000000-0000-4000-8000-000000000f02', '', 'req-1');
@@ -1045,14 +1133,14 @@ SAVEPOINT d;
 INSERT INTO device_day_traffic (user_id, device_id, day, rx_bytes, tx_bytes)
 VALUES ('00000000-0000-4000-8000-000000000f03', '00000000-0000-4000-8000-000000000f04',
         current_date, -1, 0);
-ROLLBACK TO d;   -- ← device_day_trafficRx_bytes_check (имя по умолчанию, сверить с выводом)
+ROLLBACK TO d;   -- ← device_day_traffic_rx_bytes_check
 ROLLBACK;
 ```
 
 Expected: **четыре ошибки** — `admin_audit_reason`, `bootstrap_window`,
-`plans_device_limit`, `…_rx_bytes_check` (последняя — имя констрейнта PostgreSQL
-генерирует сам; в журнале проверки записать фактическое). `repeat`/`decode` существуют в
- PostgreSQL 17 и возвращают 32 нулевых байта — ровно столько, сколько требует
+`plans_device_limit`, `device_day_traffic_rx_bytes_check` (имя последней генерирует
+PostgreSQL, проверено на живом сервере 17.11). `repeat`/`decode` существуют в
+PostgreSQL 17 и возвращают 32 нулевых байта — ровно столько, сколько требует
 `octet_length(token_hash) = 32`.
 
 - [ ] **Step 4: Проверить, что `internal-default` пережил down/up ровно один раз**
@@ -1092,13 +1180,23 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - Consumes: `migrations/*.sql`, `config.Config.DatabaseURL`.
 - Produces: `migrate.Up(ctx, url string) (uint, error)` и
   `migrate.Steps(ctx, url string, n int) (uint, error)` — оба возвращают применённую версию;
+  `Steps` считает концы цепочки достижимыми: `n = -1<<31` откатывает до нуля и на чистой базе,
+  и с недосчитанными шагами (`ErrShortLimit`), а не возвращает ошибку;
   `migrations.FS embed.FS`; CLI-команда `novavpn-api migrate up|all|version`.
 
 - [ ] **Step 1: compose-стэк для разработки и тестов**
 
-`infrastructure/docker/docker-compose.dev.yml`:
+`infrastructure/docker/docker-compose.dev.yml` (имя и порты — не косметика: без `name:`
+Compose берёт имя каталога первого файла, то есть `docker`, а `make down-dev` снимает тома
+`-v` — в общем пространстве имён это чужие данные; порты параметризуются, потому что на
+машине разработчика 5432 и 6379 уже заняты локальными службами):
 
 ```yaml
+# Имя обязательно: без него Compose берёт имя каталога первого файла, то есть «docker».
+# `make down-dev` снимает `-v`, а в общем пространстве имён уже есть чужие
+# docker-compose.dev.yml (на этом хосте — проект cms) — без имени удалились бы чужие тома.
+name: novavpn-dev
+
 services:
   postgres:
     image: postgres:17
@@ -1106,7 +1204,7 @@ services:
       POSTGRES_USER: nova
       POSTGRES_PASSWORD: nova
       POSTGRES_DB: novavpn
-    ports: ["5432:5432"]
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nova -d novavpn"]
       interval: 2s
@@ -1115,7 +1213,7 @@ services:
   redis:
     image: redis:7
     command: ["redis-server", "--save", "", "--appendonly", "no"]
-    ports: ["6379:6379"]
+    ports: ["${REDIS_HOST_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -1172,6 +1270,16 @@ func databaseURL(t *testing.T) string {
 func TestMigrationsUpToDownToUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+
+	// Схема сейчас будет пересоздана: закэшированные prepared-стейтменты общего
+	// пула устареют («cached plan must not change result type»). Пул
+	// инвалидируется — следующий тест создаст новый.
+	t.Cleanup(func() {
+		if sharedPool != nil {
+			sharedPool.Close()
+			sharedPool = nil
+		}
+	})
 
 	if _, err := migrate.Steps(ctx, databaseURL(t), -1<<31); err != nil {
 		t.Fatalf("migrate down all: %v", err)
@@ -1303,14 +1411,35 @@ func Steps(ctx context.Context, url string, n int) (uint, error) {
 		return 0, err
 	}
 	defer m.Close()
-	if err := m.Steps(n); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+	if n < 0 {
+		// На чистой базе откатывать нечего, а golang-migrate при шаге вниз читает
+		// down-файл версии 0 и возвращает fs.ErrNotExist («file does not exist»),
+		// а не ErrNoChange. Проверено на postgres:17 с пустой schema_migrations.
+		if _, _, verr := m.Version(); errors.Is(verr, migrate.ErrNilVersion) {
+			return 0, nil
+		}
+	}
+	if err := m.Steps(n); err != nil && !errors.Is(err, migrate.ErrNoChange) && !isLimit(err) {
 		return 0, err
 	}
 	return version(m)
 }
 
+// isLimit — «шагов запрошено больше, чем есть файлов». О значении судят по обоим
+// концам цепочки: n = -1<<31 означает «до нуля» и упирается в этот случай штатно
+// (проверено: `migrate all` на версии 3 давал «limit 2147483645 short» с кодом 1).
+// Поэтому он не ошибка, а достигнутый конец схемы.
+func isLimit(err error) bool {
+	var short migrate.ErrShortLimit
+	return errors.As(err, &short)
+}
+
 func version(m *migrate.Migrate) (uint, error) {
 	v, dirty, err := m.Version()
+	if errors.Is(err, migrate.ErrNilVersion) {
+		// Схема без единой миграции — это версия 0, а не ошибка.
+		return 0, nil
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -1320,6 +1449,9 @@ func version(m *migrate.Migrate) (uint, error) {
 	return v, nil
 }
 ```
+
+Тип ошибки — `migrate.ErrShortLimit{Short uint}` (в v4.20.1; `ErrLimitSteps` его именем не
+называется, `errors.Is` не срабатывает, нужен `errors.As`).
 
 Блокировку параллельных применений `golang-migrate` берёт на себя сама (`Lock()` внутри
 `m.Up()`/`m.Steps()` через advisory lock PostgreSQL); отдельный `m.Lock()` в коде не нужен
@@ -1358,7 +1490,10 @@ case "migrate":
 
 Run: `make up-dev && make integration`
 Expected: PASS. Если первый `migrate down all` падает на зависимостях между 0002 и 0003 —
-порядок `DROP` в down-файлах неверен, чинить там, а не в тесте.
+порядок `DROP` в down-файлах неверен, чинить там, а не в тесте. Если SASL-ошибка на роли
+`nova` — порт 5432 на хосте занят локальной службой postgres, и ответ уходит не в dev-стек;
+тогда `make up-dev integration POSTGRES_HOST_PORT=5433 REDIS_HOST_PORT=16379`. Проверено на
+такой машине: с дефолтным портом тест падал на «role "nova" …», с 5433 — зелёный.
 
 ```bash
 git add migrations/embed.go internal/db/migrate infrastructure/docker tests/integration services/api go.mod go.sum Makefile
@@ -2163,9 +2298,9 @@ func RatePerMinute(perMin float64) float64 { return perMin / 60_000.0 }
 // Middleware пишет 429 в документированном конверте и ставит Retry-After.
 // name участвует в имени ключа, чтобы разные маршруты не отъедали бюджет друг у друга.
 // ВНИМАНИЕ К ЕДИНИЦАМ: rate — это токенов за МИЛЛИСЕКУНДУ, потому что bucketLua
-// считает elapsed в мс. 0.01 = 10 в секунду = 600 в минуту. Вызов снаружи делает
-// httpx.RatePerMinute (задача 18), а не голое число: «20 в минуту», записанное как 20,
-// дало бы 20 000 запросов в секунду и молча отключило бы лимит.
+// считает elapsed в мс. 0.01 = 10 в секунду = 600 в минуту. Наружу передают результат
+// httpx.RatePerMinute (она объявлением выше), а не голое число: «20 в минуту», записанное
+// как 20, дало бы 20 000 запросов в секунду и молча отключило бы лимит.
 func (l *Limiter) Middleware(name string, rate float64, burst int, key func(*http.Request) string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2208,8 +2343,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Files:**
 - Create: `internal/httpx/idempotency.go`, `internal/db/query/idempotency.sql`,
-  `internal/httpx/context.go`, `tests/integration/helpers_test.go`,
-  `tests/integration/idempotency_test.go`
+  `internal/httpx/context.go`, `internal/httpx/idempotency_pg.go`,
+  `migrations/0004_idempotency_response_body_bytea.up.sql`,
+  `migrations/0004_idempotency_response_body_bytea.down.sql`,
+  `tests/integration/helpers_test.go`, `tests/integration/idempotency_test.go`
 - Modify: `internal/httpx/envelope.go` (коды уже объявлены — проверить, что
   `ErrIdempotencyKeyRequired`, `ErrIdempotencyConflict`, `ErrIdempotencyInProgress` на месте)
 
@@ -2282,8 +2419,25 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/httpx"
 )
+
+// seedIdemUser создаёт строку в users: idempotency_keys.user_id ссылается на
+// users(id) (FK ON DELETE CASCADE), а случайный UUID без строки не прошёл бы.
+// Имя отлично от seedUser задач 12+, чтобы не конфликтовать с будущим хелпером.
+func seedIdemUser(t *testing.T, ctx context.Context, id uuid.UUID) {
+	t.Helper()
+	q := db.New(pool(t))
+	if _, err := q.InsertUser(ctx, db.InsertUserParams{
+		ID:           id,
+		Email:        id.String() + "@example.com",
+		PasswordHash: "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG",
+		Locale:       "ru",
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+}
 
 // mkIdempotency строит middleware поверх счётного обработчика: счётчик показывает,
 // что повтор не дошёл до бизнес-логики.
@@ -2305,22 +2459,23 @@ func TestIdempotentReplay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	user, idemKey := uuid.New(), uuid.NewString()
+	seedIdemUser(t, ctx, user)
 	calls := 0
 	h := mkIdempotency(t, &calls)
 	body := []byte(`{"public_key":"wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iJ=","platform":"linux","name":"laptop"}`)
 
-	run := func(payload []byte, withKey bool) *httptest.ResponseRecorder {
+	run := func(payload []byte, withKey bool, u uuid.UUID) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/devices", bytes.NewReader(payload)).WithContext(ctx)
 		req.Header.Set("Content-Type", "application/json")
 		if withKey {
 			req.Header.Set("Idempotency-Key", idemKey)
 		}
 		w := httptest.NewRecorder()
-		h.ServeHTTP(w, withUser(req, user))
+		h.ServeHTTP(w, withUser(req, u))
 		return w
 	}
 
-	first, second := run(body, true), run(body, true)
+	first, second := run(body, true, user), run(body, true, user)
 	if first.Code != http.StatusCreated || second.Code != http.StatusCreated {
 		t.Fatalf("statuses: %d / %d", first.Code, second.Code)
 	}
@@ -2336,19 +2491,21 @@ func TestIdempotentReplay(t *testing.T) {
 
 	// Тот же ключ, другое тело → 409 idempotency_key_conflict.
 	other := []byte(`{"public_key":"wTpNl3mZ3GJdF0nQ2hK2sV7pR9uX1yB4cD6eF8gH0iK=","platform":"linux","name":"phone"}`)
-	w := run(other, true)
+	w := run(other, true, user)
 	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"code":"idempotency_key_conflict"`) {
 		t.Fatalf("conflict body = %d %s", w.Code, w.Body)
 	}
 
 	// Отсутствие обязательного ключа → 400 idempotency_key_required.
-	w = run(other, false)
+	w = run(other, false, user)
 	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"code":"idempotency_key_required"`) {
 		t.Fatalf("missing key: %d %s", w.Code, w.Body)
 	}
 
 	// Другой пользователь с тем же ключом — не чужой результат (изолированный скоуп).
-	w = run(body, true)
+	user2 := uuid.New()
+	seedIdemUser(t, ctx, user2)
+	w = run(body, true, user2)
 	if w.Code != http.StatusCreated || !strings.Contains(w.Body.String(), `"call":2`) {
 		t.Fatalf("same key, second user must run fresh: %d %s", w.Code, w.Body)
 	}
@@ -2432,7 +2589,6 @@ import (
 	"crypto/sha256"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -2497,9 +2653,10 @@ func (i *Idempotency) Middleware(route string) func(http.Handler) http.Handler {
 					return
 				}
 				// Повтор: отдать сохранённый результат, бизнес-логику не трогать.
+				// ResponseStatus не nil: Complete пишет его вместе с completed_at.
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("Idempotency-Replayed", "true")
-				w.WriteHeader(existing.ResponseStatus)
+				w.WriteHeader(int(*existing.ResponseStatus))
 				_, _ = w.Write(existing.ResponseBody)
 				return
 			}
@@ -2520,8 +2677,8 @@ func (i *Idempotency) Middleware(route string) func(http.Handler) http.Handler {
 
 type captureWriter struct {
 	http.ResponseWriter
-	status   int
-	body     bytes.Buffer
+	status    int
+	body      bytes.Buffer
 	completed bool
 }
 
@@ -2546,10 +2703,8 @@ package httpx
 
 import (
 	"context"
-	"errors"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/novavpn/novavpn/internal/db"
 )
@@ -2559,18 +2714,19 @@ type PGIdempotency struct{ q *db.Queries }
 func NewPGIdempotency(pool db.DBTX) *PGIdempotency { return &PGIdempotency{q: db.New(pool)} }
 
 func (p *PGIdempotency) Claim(ctx context.Context, userID uuid.UUID, route, key string, hash []byte) (db.IdempotencyKey, bool, error) {
-	if err := p.q.ClaimIdempotencyKey(ctx, db.ClaimIdempotencyKeyParams{
+	inserted, err := p.q.ClaimIdempotencyKey(ctx, db.ClaimIdempotencyKeyParams{
 		ID: uuid.New(), UserID: userID, Route: route, IdemKey: key, RequestHash: hash,
-	}); err != nil {
+	})
+	if err != nil {
 		return db.IdempotencyKey{}, false, err
+	}
+	if inserted == 1 {
+		// ON CONFLICT DO NOTHING: строка вставлена → повтор не найден → слот наш.
+		return db.IdempotencyKey{}, false, nil
 	}
 	existing, err := p.q.LoadIdempotencyKey(ctx, db.LoadIdempotencyKeyParams{
 		UserID: userID, Route: route, IdemKey: key,
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Вставка прошла → повтор не найден → слот наш.
-		return db.IdempotencyKey{}, false, nil
-	}
 	if err != nil {
 		return db.IdempotencyKey{}, false, err
 	}
@@ -2591,12 +2747,49 @@ func (p *PGIdempotency) Abandon(ctx context.Context, userID uuid.UUID, route, ke
 }
 ```
 
-Одновременные Claim/Load не атомарны (между `:execrows` и `SELECT` теоретически влезает
-другой повторыш) — поэтому `CompleteIdempotencyKey` имеет `AND completed_at IS NULL`, а
-`response_status`/`response_body` в схеме nullable: при гонке победителя определяет БД по
-первой записанной версии, а не угадайка в Go. Если тест на гонку из шага 5 нестабилен,
-переносить Claim+Load в одну SQL-функцию (`RETURNING` через CTE) — но только после того,
-как нестабильность наблюдалась, а не заранее.
+Победителя при гонке определяет БД, а не угадайка в Go: `ClaimIdempotencyKey` — это
+`ON CONFLICT DO NOTHING` с `:execrows`, поэтому ровно одна из конкурирующих вставок
+вернёт 1 строку — слот берёт тот, кто вставил; остальные получают 0 и читают
+существующую строку через Load. `CompleteIdempotencyKey` имеет `AND completed_at IS
+NULL`, а `response_status`/`response_body` в схеме nullable: результат фиксирует
+первая запись. Если тест на гонку из шага 5 нестабилен, переносить Claim+Load в одну
+SQL-функцию (`RETURNING` через CTE) — но только после того, как нестабильность
+наблюдалась, а не заранее.
+
+Два расхождения со схемой задачи 4, закрытые миграцией `0004` (в **Files** выше):
+
+- `response_body` стал `bytea`, а не `jsonb`: jsonb нормализует порядок ключей и
+  пробелы, поэтому повтор ключа вернул бы клиенту другие байты, чем первый ответ, и
+  проверка `first.Body == second.Body` в тесте не прошла бы. Повтор обязан отдавать
+  первый результат байт-в-байт (§5.2). `convert_to` вместо `::text::bytea`, чтобы
+  escape-формат bytea не съедал бэкслеши в JSON-строках.
+- `idempotency_keys.user_id` ссылается на `users(id)` (FK ON DELETE CASCADE),
+  поэтому тест сидит пользователя хелпером `seedIdemUser` перед первым запросом —
+  случайный UUID без строки в `users` дал бы 500 на Claim.
+
+`migrations/0004_idempotency_response_body_bytea.up.sql`:
+
+```sql
+-- jsonb нормализует порядок ключей и пробелы: повтор Idempotency-Key отдал бы
+-- клиенту другие байты, чем первый ответ (§5.2 требует вернуть первый результат).
+-- bytea хранит тело как есть; convert_to вместо ::text::bytea, чтобы escape-формат
+-- bytea не съедал бэкслеши в JSON-строках.
+ALTER TABLE idempotency_keys
+    ALTER COLUMN response_body TYPE bytea USING convert_to(response_body::text, 'UTF8');
+```
+
+`migrations/0004_idempotency_response_body_bytea.down.sql`:
+
+```sql
+ALTER TABLE idempotency_keys
+    ALTER COLUMN response_body TYPE jsonb USING convert_from(response_body, 'UTF8')::jsonb;
+```
+
+Поправка 2026-10-22: язык продукта — русский, поэтому сид пользователя использует
+`Locale: "ru"` (как и сиды задач 12 и 17); дефолт колонки меняет миграция `0005`
+(примечание в задаче 2). Сообщения middleware этой задачи остаются английскими — это
+инфраструктурные строки, клиенты ориентируются на коды (спецификация цикла A, единый
+формат ошибки); прикладные сообщения HTTP-слоя (задачи 15, 17, 18) — по-русски.
 
 - [ ] **Step 5: Прогнать и коммитить**
 
@@ -2604,7 +2797,9 @@ Run: `make up-dev && make integration`
 Expected: PASS — `TestIdempotentReplay` зелёный, `calls == 1` на втором запросе.
 
 ```bash
-git add internal/httpx internal/db tests/integration/idempotency_test.go
+git add internal/httpx internal/db migrations/0004_idempotency_response_body_bytea.up.sql \
+  migrations/0004_idempotency_response_body_bytea.down.sql \
+  tests/integration/idempotency_test.go tests/integration/helpers_test.go
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(httpx): идемпотентность критических операций с конфликтом тела"
 ```
@@ -2676,9 +2871,9 @@ func TestRejectsEmptyAndShort(t *testing.T) {
 func TestVerifyRejectsMalformedHash(t *testing.T) {
 	for _, bad := range []string{
 		"", "not-a-hash",
-		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA",     // не argon2id
-		"$argon2id$v=19$m=1024,t=3,p=4$c2FsdA$aGFzaA",     // слабый параметр
-		"$argon2id$v=19$m=65536,t=3,p=4$!!$aGFzaA",        // мусор в соли
+		"$argon2i$v=19$m=65536,t=3,p=4$c2FsdA$aGFzaA", // не argon2id
+		"$argon2id$v=19$m=1024,t=3,p=4$c2FsdA$aGFzaA", // слабый параметр
+		"$argon2id$v=19$m=65536,t=3,p=4$!!$aGFzaA",    // мусор в соли
 	} {
 		if VerifyPassword(bad, "anything-long-enough") {
 			t.Errorf("VerifyPassword accepted %q", truncate(bad))
@@ -2781,13 +2976,14 @@ func VerifyPassword(phc, password string) bool {
 	if err != nil || len(want) < 16 {
 		return false
 	}
-	got := argon2.IDKey([]byte(password), salt, t, m, p, uint32(len(want)))
+	got := argon2.IDKey([]byte(password), salt, t, m, uint8(p), uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 ```
 
-`len(password) < MinPasswordLen*1` — опечатка-страховка в коде плана; заменить на
-`len(password) < MinPasswordLen` при наборе (пояснение про UTF-8 остаётся).
+`argon2.IDKey(... m, p, ...)` — в коде плана число потоков приводится как `uint8(p)`;
+x/crypto v0.53.0 принимает его только как uint8 (блок плана приведён к файлу
+байт-в-байт).
 
 - [ ] **Step 4: Прогнать**
 
@@ -2798,7 +2994,7 @@ Expected: PASS. Время `TestHashProducesVerifiablePHC` ≈ 100–300 мс н
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/auth
+git add internal/auth go.mod go.sum
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(auth): argon2id с фиксированными параметрами и отказом на malformed-хэше"
 ```
@@ -2935,8 +3131,9 @@ type AccessToken struct {
 }
 
 type Claims struct {
-	UserID uuid.UUID
-	JTI    string
+	UserID    uuid.UUID
+	JTI       string
+	ExpiresAt time.Time
 }
 
 type Issuer struct {
@@ -3118,7 +3315,7 @@ Expected: `make unit` зелёный; `TestDenylistAddAndContains` и
 Обе проверки denylist используют ключ `deny:<jti>` — совпадение с планом восстановления S5.
 
 ```bash
-git add internal/auth
+git add internal/auth go.mod go.sum
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(auth): короткоживущий access JWT с jti и denylist в Redis"
 ```
@@ -3139,7 +3336,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   refreshTTL time.Duration, log *slog.Logger) *auth.SessionService`;
   `(*SessionService).NewSession(ctx, userID uuid.UUID, ip *netip.Addr) (auth.Session, error)`,
   `(*SessionService).Rotate(ctx, raw string, ip *netip.Addr) (auth.Session, error)`,
-  `(*SessionService).Revoke(ctx, raw string) error`,
+  `(*SessionService).Revoke(ctx, raw, access string) error`,
   `auth.Session{AccessToken string; RefreshToken string; AccessExpiresAt, RefreshExpiresAt time.Time}`,
   `auth.ErrInvalidRefreshToken`, `auth.ErrExpiredRefreshToken`, `auth.ErrAccountLocked`.
   Повторное использование отозванного токена → `RevokeRefreshFamily(..., 'reuse_detected')`.
@@ -3181,8 +3378,8 @@ func TestParseRefreshRejectsJunk(t *testing.T) {
 	for _, bad := range []string{
 		"", "a", "a.b", ".", "###.###",
 		base64.URLEncoding.EncodeToString([]byte("not-a-uuid")) + ".AAAAAAAA",
-		uuid.NewString() + ".",     // пустой секрет
-		uuid.NewString() + ".a.b",  // лишняя часть
+		uuid.NewString() + ".",         // пустой секрет
+		uuid.NewString() + ".a.b",      // лишняя часть
 		uuid.NewString() + ".AAAAAAA=", // base64url с паддингом — другая каноническая форма
 	} {
 		if _, _, err := parseRefresh(bad); err == nil {
@@ -3275,18 +3472,18 @@ func hashSecret(secret []byte) []byte {
 }
 
 type Session struct {
-	AccessToken     string
-	RefreshToken    string
-	AccessExpiresAt time.Time
+	AccessToken      string
+	RefreshToken     string
+	AccessExpiresAt  time.Time
 	RefreshExpiresAt time.Time
 }
 
 type SessionService struct {
-	q         *db.Queries
-	iss       *Issuer
-	deny      Denylist
+	q          *db.Queries
+	iss        *Issuer
+	deny       Denylist
 	refreshTTL time.Duration
-	log       *slog.Logger
+	log        *slog.Logger
 }
 
 func NewSessionService(q *db.Queries, iss *Issuer, deny Denylist, refreshTTL time.Duration, log *slog.Logger) *SessionService {
@@ -3350,7 +3547,7 @@ func (s *SessionService) Rotate(ctx context.Context, raw string, ip *netip.Addr)
 	}
 	if err != nil {
 		return Session{}, fmt.Errorf("rotate refresh: %w", err)
-	}	// rotated.UserID — тот же пользователь, что и у семьи: mint подписывает access
+	} // rotated.UserID — тот же пользователь, что и у семьи: mint подписывает access
 	// на субъекта, а не на идентификатор семьи.
 	return s.mint(ctx, rotated.UserID, fam, next, family.ExpiresAt)
 }
@@ -3413,8 +3610,6 @@ import (
 	"log/slog"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 
 	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/db"
@@ -3526,6 +3721,22 @@ import (
 	"github.com/novavpn/novavpn/internal/db"
 )
 
+// Один пул на весь прогон: интеграционные тесты их создают десятки, а
+// pg_max_connections на dev-стеке конечен.
+var sharedPool *pgxpool.Pool
+
+func pool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	if sharedPool == nil {
+		p, err := db.Pool(context.Background(), databaseURL(t))
+		if err != nil {
+			t.Fatalf("pool: %v", err)
+		}
+		sharedPool = p
+	}
+	return sharedPool
+}
+
 func bytes32ForTests() []byte { return []byte("integration-secret-0000000000000000") }
 
 func redisClient(t *testing.T) *redis.Client {
@@ -3551,14 +3762,15 @@ func seedUser(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
 	}
 	if _, err := q.InsertUser(ctx, db.InsertUserParams{
 		ID: id, Email: "seed-" + id.String()[:8] + "@novavpn.test",
-		PasswordHash: hash, Locale: "en",
+		PasswordHash: hash, Locale: "ru",
 	}); err != nil {
 		t.Fatalf("InsertUser: %v", err)
 	}
 	if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
-		ID: uuid.New(), UserID: id,
-		PlanID:  uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
-		StartsAt: time.Now(), 
+		ID:       uuid.New(),
+		UserID:   id,
+		PlanID:   uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
+		StartsAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("InsertSubscription: %v", err)
 	}
@@ -3566,15 +3778,18 @@ func seedUser(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
 }
 ```
 
-`pool(t)` в этом файле уже лежит (задача 9, шаг 4) — вторая копия недопустима:
-в одном пакете две функции с одним именем не компилируются.
+Блок — файл целиком после шага: `pool` перенесён из задачи 9 без изменений,
+вторая копия недопустима (в одном пакете две функции с одним именем не
+компилируются).
 
 - [ ] **Step 5: Прогнать и коммитить**
 
 Run: `make unit && make integration`
 Expected: PASS. Если `TestRefreshRotationAndReuse` падает на «family was not revoked»,
 проверить, что `RotateRefresh` в `identity.sql` имеет `AND revoked_at IS NULL` — без него
-ветка переиспользования не закрывает доступ.
+ветка переиспользования не закрывает доступ. Если падает на «cached plan must not
+change result type» — тест миграций не инвалидировал общий пул после пересоздания
+схемы (блок задачи 5).
 
 ```bash
 git add internal/auth tests/integration internal/db/query/identity.sql
@@ -3747,7 +3962,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -3780,6 +3994,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -3797,11 +4012,11 @@ func TestEntitlementsForUser(t *testing.T) {
 
 	// Пользователь без подписки → явная ошибка, а не дефолтный лимит.
 	userless := seedUserWithoutPlan(t, ctx, q)
-	if _, err := svc.ForUser(ctx, userless); err == nil || !errorsIs(err, entitlements.ErrNoActiveSubscription) {
+	if _, err := svc.ForUser(ctx, userless); err == nil || !errors.Is(err, entitlements.ErrNoActiveSubscription) {
 		t.Fatalf("ForUser(no subscription) = %v, want ErrNoActiveSubscription", err)
 	}
 
-	user := seedUser(t, ctx, q) // создаёт подписку internal-default (см. задачу 12, helpers)
+	user := seedUser(t, ctx, q, true) // создаёт подписку internal-default (см. задачу 12, helpers)
 	e, err := svc.ForUser(ctx, user)
 	if err != nil {
 		t.Fatalf("ForUser: %v", err)
@@ -3820,23 +4035,45 @@ func TestEntitlementsForUser(t *testing.T) {
 func TestUnknownSelectorIsAnErrorNotATicket(t *testing.T) {
 	ctx := context.Background()
 	q := db.New(pool(t))
-	if err := q.InsertPlan(ctx, db.InsertPlanParams{
-		ID: uuid.New(), Slug: "selector-test-" + uuid.NewString()[:8],
+	slug := "selector-test-" + uuid.NewString()[:8]
+	if _, err := q.InsertPlan(ctx, db.InsertPlanParams{
+		ID: uuid.New(), Slug: slug,
 		DeviceLimit: 5, ServerSelector: "country=DE",
 	}); err != nil {
 		t.Fatalf("InsertPlan: %v", err)
 	}
-	user := seedUserWithPlan(t, ctx, q, "selector-test-…")
+	user := seedUserWithPlan(t, ctx, q, slug)
 	if _, err := entitlements.New(q).ForUser(ctx, user); err == nil {
 		t.Fatal("selector 'country=DE' accepted in cycle A")
 	}
 }
 ```
 
-`errorsIs` — `errors.Is`; `seedUserWithoutPlan`, `seedUserWithPlan` и запрос `InsertPlan`
-дописываются в `tests/integration/helpers_test.go` и `internal/db/query/plans.sql`:
+Хелперы `seedUserWithoutPlan`, `seedUserWithPlan` дописываются в
+`tests/integration/helpers_test.go`, запросы `InsertPlan`/`PlanIDBySlug` — в
+`internal/db/query/plans.sql`:
 
 ```sql
+-- name: LiveSubscriptionByUser :one
+SELECT s.id AS subscription_id, s.user_id, s.status, s.starts_at, s.ends_at, s.source,
+       p.id AS plan_id, p.slug, p.device_limit, p.server_selector,
+       p.traffic_quota_bytes, p.trial_days
+FROM subscriptions s
+JOIN subscription_plans p ON p.id = s.plan_id
+WHERE s.user_id = $1 AND s.status = 'active'
+  AND (s.ends_at IS NULL OR s.ends_at > now())
+ORDER BY s.starts_at DESC
+LIMIT 1;
+
+-- name: PlanBySlug :one
+SELECT id, slug, device_limit, server_selector, traffic_quota_bytes, trial_days
+FROM subscription_plans WHERE slug = $1;
+
+-- name: InsertSubscription :one
+INSERT INTO subscriptions (id, user_id, plan_id, status, starts_at, ends_at, source)
+VALUES ($1, $2, $3, 'active', $4, $5, 'manual')
+RETURNING id;
+
 -- name: InsertPlan :one
 INSERT INTO subscription_plans (id, slug, device_limit, server_selector, traffic_quota_bytes)
 VALUES ($1, $2, $3, $4, $5)
@@ -3846,8 +4083,115 @@ RETURNING id;
 SELECT id FROM subscription_plans WHERE slug = $1;
 ```
 
-`seedUserWithPlan` берёт `PlanIDBySlug` и вставляет подписку; `seedUserWithoutPlan` —
-`seedUser` без блока `InsertSubscription` (вынести в хелпере флаг `withPlan bool`).
+`seedUser` получает флаг `withPlan bool` (вынос блока `InsertSubscription` в
+условие): `seedUserWithoutPlan` — это `seedUser(..., false)`, `seedUserWithPlan`
+берёт `PlanIDBySlug` и вставляет подписку на заданный план. Файл
+`helpers_test.go` целиком после шага:
+
+```go
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/novavpn/novavpn/internal/auth"
+	"github.com/novavpn/novavpn/internal/db"
+)
+
+// Один пул на весь прогон: интеграционные тесты их создают десятки, а
+// pg_max_connections на dev-стеке конечен.
+var sharedPool *pgxpool.Pool
+
+func pool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	if sharedPool == nil {
+		p, err := db.Pool(context.Background(), databaseURL(t))
+		if err != nil {
+			t.Fatalf("pool: %v", err)
+		}
+		sharedPool = p
+	}
+	return sharedPool
+}
+
+func bytes32ForTests() []byte { return []byte("integration-secret-0000000000000000") }
+
+func redisClient(t *testing.T) *redis.Client {
+	t.Helper()
+	addr := os.Getenv("NOVAVPN_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("NOVAVPN_REDIS_ADDR is not set; run `make up-dev` first")
+	}
+	c := redis.NewClient(&redis.Options{Addr: addr})
+	if err := c.Ping(context.Background()).Err(); err != nil {
+		t.Fatalf("redis at %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+func seedUser(t *testing.T, ctx context.Context, q *db.Queries, withPlan bool) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	hash, err := auth.HashPassword("integration-password-123")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	if _, err := q.InsertUser(ctx, db.InsertUserParams{
+		ID: id, Email: "seed-" + id.String()[:8] + "@novavpn.test",
+		PasswordHash: hash, Locale: "ru",
+	}); err != nil {
+		t.Fatalf("InsertUser: %v", err)
+	}
+	if withPlan {
+		if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
+			ID:       uuid.New(),
+			UserID:   id,
+			PlanID:   uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
+			StartsAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("InsertSubscription: %v", err)
+		}
+	}
+	return id
+}
+
+func seedUserWithoutPlan(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID {
+	return seedUser(t, ctx, q, false)
+}
+
+func seedUserWithPlan(t *testing.T, ctx context.Context, q *db.Queries, slug string) uuid.UUID {
+	t.Helper()
+	id := seedUser(t, ctx, q, false)
+	planID, err := q.PlanIDBySlug(ctx, slug)
+	if err != nil {
+		t.Fatalf("PlanIDBySlug: %v", err)
+	}
+	if _, err := q.InsertSubscription(ctx, db.InsertSubscriptionParams{
+		ID:       uuid.New(),
+		UserID:   id,
+		PlanID:   planID,
+		StartsAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("InsertSubscription: %v", err)
+	}
+	return id
+}
+```
+
+Этот блок заменяет блок хелперов задачи 12: сигнатура `seedUser` изменилась, и
+оба вызова в `tests/integration/refresh_test.go` (задача 12) обновлены на
+`seedUser(t, ctx, q, true)`. Блок задачи 12 остаётся историческим состоянием
+файла.
 
 - [ ] **Step 5: Прогнать и коммитить**
 
@@ -3856,7 +4200,8 @@ Expected: PASS. `TestUnknownSelectorIsAnErrorNotATicket` обязан упаст
 не на вставке: в этом смысл проверки.
 
 ```bash
-git add internal/entitlements internal/db/tx.go internal/db tests/integration/entitlements_test.go
+git add internal/entitlements internal/db/tx.go internal/db \
+  tests/integration/{entitlements_test.go,helpers_test.go,refresh_test.go}
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(entitlements): права из плана с явной отказкой на неизвестный selector"
 ```
@@ -3919,8 +4264,8 @@ func TestRejectsNonCanonicalLastChar(t *testing.T) {
 func TestRejectsMalformed(t *testing.T) {
 	for _, bad := range []string{
 		"", "   ", "not-base64-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!=",
-		canonicalZeros[:42],            // без '=' → длина 43
-		canonicalZeros + "=",           // длина 45
+		canonicalZeros[:42],  // без '=' → длина 43
+		canonicalZeros + "=", // длина 45
 		strings.ToLower(canonicalZeros),
 		base64.URLEncoding.EncodeToString(make([]byte, 32)) + "==", // url-safe форма
 	} {
@@ -3932,7 +4277,8 @@ func TestRejectsMalformed(t *testing.T) {
 
 func TestRejectsNewlineAndWhitespaceInside(t *testing.T) {
 	// Ключ с переносом строки — классика «пропустили из буфера обмена»:
-	// StdEncoding.DecodeString его не примет, но проверка длины обязана отработать раньше.
+	// проверка длины обязана отработать раньше декодирования — вход с переносом
+	// длиннее 44 символов.
 	if _, err := ParsePublicKey(canonicalZeros[:20] + "\n" + canonicalZeros[20:]); err == nil {
 		t.Fatal("key with newline accepted")
 	}
@@ -3975,8 +4321,8 @@ import (
 const keyLen = 32
 
 var (
-	ErrKeyLength     = errors.New("wireguard public key must be 32 bytes")
-	ErrKeyNotBase64  = errors.New("wireguard public key is not valid base64")
+	ErrKeyLength       = errors.New("wireguard public key must be 32 bytes")
+	ErrKeyNotBase64    = errors.New("wireguard public key is not valid base64")
 	ErrKeyNotCanonical = errors.New("wireguard public key is not canonical base64")
 )
 
@@ -4001,7 +4347,7 @@ func ParsePublicKey(b64 string) ([32]byte, error) {
 	if len(b64) != 44 || b64[43] != '=' {
 		return out, ErrKeyLength
 	}
-	raw, err := base64.StdEncoding.Strict().DecodeString(b64)
+	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return out, ErrKeyNotBase64
 	}
@@ -4015,6 +4361,14 @@ func ParsePublicKey(b64 string) ([32]byte, error) {
 	return out, nil
 }
 ```
+
+Примечание (правка против исходного брифа): блок использовал `base64.StdEncoding.Strict()` —
+в Go 1.25 строгий декодер **отклоняет** ненулевые spare-биты как ошибку декодирования, и
+`TestRejectsNonCanonicalLastChar` падал с `ErrKeyNotBase64` вместо `ErrKeyNotCanonical`.
+Предпосылка «декодер молча проглатывает» верна только для нестрогого `DecodeString` — он и
+используется; каноничность (spare-биты, регистр) ловит перекодировка по §5.2. Комментарий
+теста про перенос строки тоже исправлен: нестрогий `DecodeString` сам пропускает `\r\n`,
+поэтому страхует проверка длины до декодирования.
 
 Проверка «ключ — валидная точка curve25519» в A-1 **не** делается: WireGuard принимает
 любые 32 байта, а `ScalarMult` с малым порядком — это вопрос анализа ключа, который в
@@ -4061,7 +4415,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   только, закрыт его маршрут или нет,
   `(*Handler).RegisterRoutes(mux *http.ServeMux, dec httpx.Decorators)` —
   монтирует `POST /api/v1/devices` и `GET /api/v1/devices` под `dec.Auth`;
-  запрос `db.LockUserForDeviceCount(ctx, userID uuid.UUID) error`
+  запрос `db.LockUserForDeviceCount(ctx context.Context, userID string) error`
   (`pg_advisory_xact_lock(hashtextextended($1, 0))`).
 
 `internal/httpx/decorators.go` — пять строк, но именно они закрывают вопрос «кто решает,
@@ -4102,6 +4456,7 @@ package integration
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -4139,7 +4494,7 @@ func TestDeviceLimitIsHard(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	svc, q := newDeviceSvc(t)
-	user := seedUser(t, ctx, q) // подписка internal-default, device_limit = 3
+	user := seedUser(t, ctx, q, true) // подписка internal-default, device_limit = 3
 
 	for i := 0; i < 3; i++ {
 		if _, err := svc.Register(ctx, user, devices.RegisterInput{
@@ -4149,23 +4504,23 @@ func TestDeviceLimitIsHard(t *testing.T) {
 	}
 	_, err := svc.Register(ctx, user, devices.RegisterInput{
 		PublicKey: keyAt(3), Platform: "linux", Name: "fourth"})
-	if err == nil || !errorsIs(err, devices.ErrDeviceLimit) {
+	if err == nil || !errors.Is(err, devices.ErrDeviceLimit) {
 		t.Fatalf("4th device: err = %v, want ErrDeviceLimit", err)
 	}
 
 	// Тот же публичный ключ второй раз → duplicate, а не «тихо вернули первое устройство».
 	if _, err := svc.Register(ctx, user, devices.RegisterInput{
-		PublicKey: keyAt(0), Platform: "linux", Name: "dup"}); !errorsIs(err, devices.ErrDuplicateKey) {
+		PublicKey: keyAt(0), Platform: "linux", Name: "dup"}); !errors.Is(err, devices.ErrDuplicateKey) {
 		t.Errorf("duplicate key: err = %v, want ErrDuplicateKey", err)
 	}
 
 	// Чужое устройство недоступно по ID.
-	other := seedUser(t, ctx, q)
+	other := seedUser(t, ctx, q, true)
 	list, err := svc.List(ctx, other)
 	if err != nil || len(list) != 0 {
 		t.Errorf("other user sees %d devices (err=%v)", len(list), err)
 	}
-	if _, err := svc.OwnedBy(ctx, list0ID(t, ctx, user), other); !errorsIs(err, devices.ErrForbiddenDevice) {
+	if _, err := svc.OwnedBy(ctx, list0ID(t, ctx, user), other); !errors.Is(err, devices.ErrForbiddenDevice) {
 		t.Errorf("OwnedBy cross-user = %v, want ErrForbiddenDevice", err)
 	}
 }
@@ -4186,7 +4541,7 @@ func TestConcurrentRegistrationRespectsLimit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	svc, q := newDeviceSvc(t)
-	user := seedUser(t, ctx, q)
+	user := seedUser(t, ctx, q, true)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -4197,7 +4552,7 @@ func TestConcurrentRegistrationRespectsLimit(t *testing.T) {
 			defer wg.Done()
 			_, err := svc.Register(ctx, user, devices.RegisterInput{
 				PublicKey: keyAt(100 + i), Platform: "linux", Name: "race"})
-			if errorsIs(err, devices.ErrDeviceLimit) {
+			if errors.Is(err, devices.ErrDeviceLimit) {
 				mu.Lock()
 				limiterHits++
 				mu.Unlock()
@@ -4226,7 +4581,7 @@ func TestHandlerMapsErrorsToCodes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	svc, q := newDeviceSvc(t)
-	user := seedUser(t, ctx, q)
+	user := seedUser(t, ctx, q, true)
 	// dec здесь — сквозные обёртки: тест проверяет маппинг ошибок хендлера,
 	// а не аутентификацию и не лимиты (они — в задачах 17 и 18).
 	passthrough := func(next http.Handler) http.Handler { return next }
@@ -4289,9 +4644,9 @@ Expected: FAIL — `undefined: devices.NewService`, `undefined: devices.ErrDevic
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));
 ```
 
-Run: `make sqlc-generate` → метод `db.Queries.LockUserForDeviceCount(ctx, uuid.UUID)`;
-если sqlc не выводит `$1::text` в `uuid`, передать `user.String()` и убрать каст —
-главное, чтобы аргументом был один `uuid`/`text`, а не пара.
+Run: `make sqlc-generate` → метод `db.Queries.LockUserForDeviceCount(ctx context.Context,
+dollar_1 string)`: каст `$1::text` и задаёт тип параметра — без каста sqlc его не
+выведет, поэтому каст остаётся, а сервис передаёт `userID.String()`.
 
 `internal/devices/service.go`:
 
@@ -4305,6 +4660,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/entitlements"
@@ -4356,8 +4712,17 @@ func (s *Service) Register(ctx context.Context, userID uuid.UUID, in RegisterInp
 
 	var created db.Device
 	err = db.RunInTx(ctx, s.pool, func(tx *db.Queries) error {
-		if err := tx.LockUserForDeviceCount(ctx, userID); err != nil {
+		if err := tx.LockUserForDeviceCount(ctx, userID.String()); err != nil {
 			return fmt.Errorf("advisory lock: %w", err)
+		}
+		// Дубликат проверяется до лимита: повторный запрос с тем же ключом обязан
+		// ответить ErrDuplicateKey, даже когда лимит уже исчерпан.
+		if existing, err := tx.DeviceByUserAndKey(ctx, db.DeviceByUserAndKeyParams{
+			UserID: userID, PublicKey: in.PublicKey,
+		}); err == nil && existing.RevokedAt == nil {
+			return ErrDuplicateKey
+		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("lookup by key: %w", err)
 		}
 		live, err := tx.CountLiveDevices(ctx, userID)
 		if err != nil {
@@ -4365,13 +4730,6 @@ func (s *Service) Register(ctx context.Context, userID uuid.UUID, in RegisterInp
 		}
 		if !ent.AllowsDevice(int(live)) {
 			return ErrDeviceLimit
-		}
-		if existing, err := tx.DeviceByUserAndKey(ctx, db.DeviceByUserAndKeyParams{
-			UserID: userID, PublicKey: in.PublicKey,
-		}); err == nil && existing.RevokedAt == nil {
-			return ErrDuplicateKey
-		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("lookup by key: %w", err)
 		}
 		created, err = tx.InsertDevice(ctx, db.InsertDeviceParams{
 			ID: uuid.New(), UserID: userID, PublicKey: in.PublicKey,
@@ -4410,6 +4768,15 @@ func (s *Service) OwnedBy(ctx context.Context, deviceID, userID uuid.UUID) (db.D
 	return d, nil
 }
 ```
+
+Примечание (правка против исходного брифа): блок проверял лимит до дубликата —
+при исчерпанном лимите случай «тот же публичный ключ» возвращал бы `ErrDeviceLimit`,
+и проверка дубликата в `TestDeviceLimitIsHard` была недостижима. Порядок внутри
+транзакции изменён: дубликат проверяется до счёта и лимита, повторный запрос обязан
+ответить `ErrDuplicateKey` независимо от заполненности лимита. Также в блок добавлен
+импорт `pgxpool` (структура `Service` держит пул — в брифе импорта не было), а
+advisory lock вызывается с `userID.String()` — sqlc выводит из `$1::text` параметр
+`string`.
 
 `isUniqueViolation` — в `internal/devices/errors.go` (`db.DevicePlatform` генерирует
 sqlc в `internal/db/models.go`, здесь он только используется как тип поля
@@ -4458,11 +4825,11 @@ func NewHandler(svc *Service, idem *httpx.Idempotency) *Handler {
 }
 
 type deviceView struct {
-	ID        string    `json:"id"`
-	PublicKey string    `json:"public_key"`
-	Platform  string    `json:"platform"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        string     `json:"id"`
+	PublicKey string     `json:"public_key"`
+	Platform  string     `json:"platform"`
+	Name      string     `json:"name"`
+	CreatedAt time.Time  `json:"created_at"`
 	LastSeen  *time.Time `json:"last_seen_at"`
 	RevokedAt *time.Time `json:"revoked_at"`
 }
@@ -4471,6 +4838,7 @@ func toView(d db.Device) deviceView {
 	return deviceView{ID: d.ID.String(), PublicKey: d.PublicKey, Platform: string(d.Platform),
 		Name: d.Name, CreatedAt: d.CreatedAt, LastSeen: d.LastSeenAt, RevokedAt: d.RevokedAt}
 }
+
 // RegisterRoutes — единый для всех модулей способ монтирования (контракт и файл
 // internal/httpx/decorators.go — в начале этой задачи): сборщик передаёт ServeMux и
 // две обёртки, модуль решает только то, какой из его маршрутов закрыт. Оба маршрута
@@ -4485,7 +4853,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	// при этом проверяется всегда — иначе тест с nil-хранилищем проходил бы молча.
 	if r.Header.Get("Idempotency-Key") == "" {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrIdempotencyKeyRequired,
-			"Idempotency-Key is required for device registration", nil)
+			"заголовок Idempotency-Key обязателен при регистрации устройства", nil)
 		return
 	}
 	var wrapped http.Handler = http.HandlerFunc(h.registerInner)
@@ -4498,7 +4866,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) registerInner(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
-		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 		return
 	}
 	var in struct {
@@ -4507,7 +4875,7 @@ func (h *Handler) registerInner(w http.ResponseWriter, r *http.Request) {
 		Name      string `json:"name"`
 	}
 	if err := httpx.DecodeJSON(r, &in, 1<<14); err != nil {
-		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest, "invalid request body", nil)
+		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest, "некорректное тело запроса", nil)
 		return
 	}
 	d, err := h.svc.Register(r.Context(), userID, RegisterInput{
@@ -4518,41 +4886,41 @@ func (h *Handler) registerInner(w http.ResponseWriter, r *http.Request) {
 		_ = httpx.WriteJSON(w, http.StatusCreated, toView(d))
 	case errors.Is(err, ErrInvalidKey):
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"public_key must be canonical base64 of 32 bytes",
+			"public_key должен быть каноническим base64 от 32 байт",
 			map[string]any{"field": "public_key"})
 	case errors.Is(err, ErrInvalidPlatform):
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"unsupported platform", map[string]any{"field": "platform"})
+			"неподдерживаемая платформа", map[string]any{"field": "platform"})
 	case errors.Is(err, ErrInvalidName):
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"name must be 1..64 characters", map[string]any{"field": "name"})
+			"имя должно быть от 1 до 64 символов", map[string]any{"field": "name"})
 	case errors.Is(err, ErrDeviceLimit):
 		lim := 0
 		if e, err := h.svc.ent.ForUser(r.Context(), userID); err == nil {
 			lim = e.DeviceLimit
 		}
 		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrDeviceLimitReached,
-			"device limit reached for this plan", map[string]any{"limit": lim})
+			"лимит устройств этого плана исчерпан", map[string]any{"limit": lim})
 	case errors.Is(err, ErrDuplicateKey):
 		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrDuplicateDevice,
-			"a device with this public key already exists", nil)
+			"устройство с таким публичным ключом уже существует", nil)
 	case errors.Is(err, entitlements.ErrNoActiveSubscription):
 		httpx.WriteError(w, r, http.StatusForbidden, httpx.ErrForbidden,
-			"no active subscription", nil)
+			"нет активной подписки", nil)
 	default:
-		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "internal error", nil)
+		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "внутренняя ошибка", nil)
 	}
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
-		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 		return
 	}
 	items, err := h.svc.List(r.Context(), userID)
 	if err != nil {
-		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "internal error", nil)
+		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "внутренняя ошибка", nil)
 		return
 	}
 	out := make([]deviceView, 0, len(items))
@@ -4565,14 +4933,18 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 
 - [ ] **Step 4: Прогнать**
 
-Run: `make up-dev && make sqlc-generate && make unit && make integration`
-Expected: PASS. В `TestConcurrentRegistrationRespectsLimit` `live == 3` обязан выполняться
-при `-race`; `make integration` ниже запускается с `-race`.
+Run: `make up-dev && make sqlc-generate && make unit && make integration`, сверх того —
+гонка с детектором: интеграция с `-race` (alpine без gcc, а `-race` требует cgo, поэтому
+полный образ `golang:1.25` с `CGO_ENABLED=1`, команда `docker-go-int` с флагом `-race`).
+Expected: PASS. В `TestConcurrentRegistrationRespectsLimit` `live == 3` и
+`limiterHits == 7` обязаны выполняться при `-race`. Target `integration` Makefile не
+несёт `-race`: `DOCKER_FLAGS` фиксирует `CGO_ENABLED=0`, на alpine такой прогон не собрался бы.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/devices internal/db/query/devices_lock.sql internal/db
+git add internal/devices internal/httpx/decorators.go tests/integration/devices_test.go \
+  internal/db/query/devices_lock.sql internal/db
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(devices): регистрация с жёстким лимитом под advisory lock и списком"
 ```
@@ -4583,7 +4955,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Files:**
 - Create: `api-spec/openapi.yaml`, `api-spec/contract_test.go`
-- Modify: `internal/httpx/envelope.go` (три кода, которых требует контракт),
+- Modify: `internal/httpx/envelope.go` (четыре новых кода: три добавляет контракт, `method_not_allowed` — заранее для задачи 18),
   `Makefile` (цель `api-lint`), `go.mod`/`go.sum` (`gopkg.in/yaml.v3`)
 
 **Interfaces:**
@@ -4623,16 +4995,24 @@ info:
     в A-2; здесь только идентификация, сессии и устройства. Числовые поля каталога
     (задержка, загрузка, доступность) здесь отсутствуют сознательно: до замеров на реальном
     узле их нечем наполнить, а спецификация §13.4 запрещает подставлять вместо них ноль.
+  license:
+    # SPDX-конвенция для закрытых лицензий; публичной лицензии у продукта нет.
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
 servers:
   - url: https://api.novavpn.local
 tags:
   - name: auth
+    description: Идентификация и сессии — регистрация, вход, refresh, logout, /me.
   - name: devices
+    description: Устройства пользователя — регистрация и список.
 paths:
   /api/v1/auth/register:
     post:
       tags: [auth]
       operationId: register
+      summary: Регистрация аккаунта с выдачей сессии.
+      security: []
       requestBody:
         required: true
         content:
@@ -4662,6 +5042,8 @@ paths:
     post:
       tags: [auth]
       operationId: login
+      summary: Вход по email и паролю.
+      security: []
       requestBody:
         required: true
         content:
@@ -4702,6 +5084,8 @@ paths:
     post:
       tags: [auth]
       operationId: refresh
+      summary: Обмен refresh-токена на новую пару.
+      security: []
       requestBody:
         required: true
         content:
@@ -4748,6 +5132,8 @@ paths:
     post:
       tags: [auth]
       operationId: logout
+      summary: Отзыв семьи refresh-токенов.
+      security: []
       description: >
         Отзыв семьи refresh. Аутентификации по access-токену не требует: отзыв обязан
         сработать и когда access уже просрочен. Действующее доказательство владения
@@ -4780,6 +5166,7 @@ paths:
     get:
       tags: [auth]
       operationId: getMe
+      summary: Аккаунт, план и использование устройств.
       security: [{ bearerAuth: [] }]
       responses:
         "200":
@@ -4796,6 +5183,7 @@ paths:
     post:
       tags: [devices]
       operationId: createDevice
+      summary: Регистрация устройства (идемпотентно).
       security: [{ bearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
@@ -4850,6 +5238,7 @@ paths:
     get:
       tags: [devices]
       operationId: listDevices
+      summary: Список устройств пользователя.
       security: [{ bearerAuth: [] }]
       responses:
         "200":
@@ -5038,6 +5427,11 @@ components:
             limit: { type: integer, minimum: 0 }
 ```
 
+Контракт в блоке выше — в состоянии, прошедшем линт `redocly/cli` (recommended
+ruleset): у каждой операции есть `summary`, публичные маршруты явно помечены
+`security: []`, в `info` есть `license`, у тегов — описания. Поля добавлены по
+требованию правил; правила не отключались.
+
 Оговорка по `password.minLength: 10`: JSON Schema считает символы, `auth.HashPassword` —
 байты (UTF-8). Для кириллицы и иероглифов байтов больше, поэтому проверка в Go строже, а
 не мягче: контракт обещает нижнюю границу, код её держит с запасом. Менять `MinPasswordLen`
@@ -5071,13 +5465,13 @@ import (
 )
 
 type spec struct {
-	Paths    map[string]map[string]any `yaml:"paths"`
-	Comp struct {
+	Paths map[string]map[string]any `yaml:"paths"`
+	Comp  struct {
 		Schemas map[string]struct {
-			Type       string `yaml:"type"`
-			Required   []string `yaml:"required"`
+			Type       string         `yaml:"type"`
+			Required   []string       `yaml:"required"`
 			Properties map[string]any `yaml:"properties"`
-			Enum       []string `yaml:"enum"`
+			Enum       []string       `yaml:"enum"`
 		} `yaml:"schemas"`
 	} `yaml:"components"`
 }
@@ -5101,23 +5495,23 @@ func load(t *testing.T) spec {
 func TestContractCodesAreDeclared(t *testing.T) {
 	s := load(t)
 	declared := map[string]httpx.ErrorCode{
-		"invalid_request":            httpx.ErrInvalidRequest,
-		"unauthenticated":            httpx.ErrUnauthenticated,
-		"account_locked":             httpx.ErrAccountLocked,
-		"forbidden":                  httpx.ErrForbidden,
-		"not_found":                  httpx.ErrNotFound,
-		"method_not_allowed":         httpx.ErrMethodNotAllowed,
-		"conflict":                   httpx.ErrConflict,
-		"device_limit_reached":       httpx.ErrDeviceLimitReached,
-		"duplicate_device":           httpx.ErrDuplicateDevice,
-		"idempotency_key_required":   httpx.ErrIdempotencyKeyRequired,
-		"idempotency_key_conflict":   httpx.ErrIdempotencyConflict,
+		"invalid_request":             httpx.ErrInvalidRequest,
+		"unauthenticated":             httpx.ErrUnauthenticated,
+		"account_locked":              httpx.ErrAccountLocked,
+		"forbidden":                   httpx.ErrForbidden,
+		"not_found":                   httpx.ErrNotFound,
+		"method_not_allowed":          httpx.ErrMethodNotAllowed,
+		"conflict":                    httpx.ErrConflict,
+		"device_limit_reached":        httpx.ErrDeviceLimitReached,
+		"duplicate_device":            httpx.ErrDuplicateDevice,
+		"idempotency_key_required":    httpx.ErrIdempotencyKeyRequired,
+		"idempotency_key_conflict":    httpx.ErrIdempotencyConflict,
 		"idempotency_key_in_progress": httpx.ErrIdempotencyInProgress,
-		"rate_limited":               httpx.ErrRateLimited,
-		"internal":                   httpx.ErrInternal,
-		"invalid_credentials":        httpx.ErrInvalidCredentials,
-		"refresh_token_invalid":      httpx.ErrRefreshTokenInvalid,
-		"email_taken":                httpx.ErrEmailTaken,
+		"rate_limited":                httpx.ErrRateLimited,
+		"internal":                    httpx.ErrInternal,
+		"invalid_credentials":         httpx.ErrInvalidCredentials,
+		"refresh_token_invalid":       httpx.ErrRefreshTokenInvalid,
+		"email_taken":                 httpx.ErrEmailTaken,
 	}
 	for _, name := range s.Comp.Schemas["ErrorCode"].Enum {
 		v, ok := declared[name]
@@ -5194,8 +5588,7 @@ func TestAllPathsArePublicV1(t *testing.T) {
 	if len(s.Paths) != 6 {
 		t.Errorf("paths = %d, want 6 for cycle A-1", len(s.Paths))
 	}
-}
-```
+}```
 
 `withRequestID` — в том же файле; `requestIDKey` неэкспортируем, поэтому тест берёт
 готовый middleware, а не конструирует контекст в обход него.
@@ -5212,24 +5605,22 @@ func withRequestID(t *testing.T, ctx context.Context) context.Context {
 		t.Fatal("request id middleware produced no request id")
 	}
 	return got
-}
-```
+}```
 
 - [ ] **Step 3: Добавить четыре кода в httpx**
 
 `internal/httpx/envelope.go`, в тот же `const`-блок:
 
 ```go
-	// Auth-коды (задача 17) и регистрация (задача 16). Добавляются, а не заменяются:
+// Auth-коды (задача 17) и регистрация (задача 16). Добавляются, а не заменяются:
 	// клиент, который видел invalid_credentials, не должен получить вместо него generic.
-	ErrInvalidCredentials   ErrorCode = "invalid_credentials"
-	ErrRefreshTokenInvalid  ErrorCode = "refresh_token_invalid"
-	ErrEmailTaken           ErrorCode = "email_taken"
+	ErrInvalidCredentials  ErrorCode = "invalid_credentials"
+	ErrRefreshTokenInvalid ErrorCode = "refresh_token_invalid"
+	ErrEmailTaken          ErrorCode = "email_taken"
 	// 405 пишет сборщик из задачи 18: ServeMux отвечает 405 без тела, а §5.2 требует
 	// конверт на любой ошибке. Код объявляется здесь, вместе с перечнем в контракте,
 	// иначе тест «код контракта == константа Go» не увидит расхождение до задачи 18.
-	ErrMethodNotAllowed     ErrorCode = "method_not_allowed"
-```
+	ErrMethodNotAllowed ErrorCode = "method_not_allowed"```
 
 - [ ] **Step 4: Линт контракта и `make api-lint`**
 
@@ -5237,11 +5628,13 @@ func withRequestID(t *testing.T, ctx context.Context) context.Context {
 запуске, записывается в файл, а не остаётся `latest`):
 
 ```make
-API_IMAGE ?= redocly/cli:1.34
+API_IMAGE ?= redocly/cli:1.34.22
 
-api-lint:
-	docker run --rm -v "$(CURDIR)/api-spec:/spec" $(API_IMAGE) lint /spec/openapi.yaml
-```
+api-lint:```
+
+Тег `1.34` на Docker Hub не существует — пин заменён на `1.34.22`, последний
+патч линейки 1.34 (проверено по API хаба); блок Makefile выше уже с фактическим
+тегом.
 
 Run: `make api-lint`
 Expected: `openapi.yaml: parsed` без ошибок; если линт требует `operationId` на каждом
@@ -5282,7 +5675,8 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `internal/auth/handlers.go`, `internal/auth/middleware_test.go`,
   `tests/integration/auth_flow_test.go`
 - Modify: `internal/auth/refresh.go` (ротация обязана проверять статус пользователя —
-  иначе блокировка из ТЗ §9 не останавливает продление сессий)
+  иначе блокировка из ТЗ §9 не останавливает продление сессий), `api-spec/openapi.yaml`
+  и `docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md` (шаг 6)
 
 **Interfaces:**
 - Consumes: `auth.SessionService`, `auth.Session` (задача 12), `auth.Denylist`, `auth.Issuer`,
@@ -5379,8 +5773,7 @@ func newAuthServer(t *testing.T) (*httptest.Server, *db.Queries) {
 	srv := httptest.NewServer(httpx.NewRequestID(mux))
 	t.Cleanup(srv.Close)
 	return srv, q
-}
-```
+}```
 
 Дальше — хелперы ответа и тело теста:
 
@@ -5471,8 +5864,7 @@ func errorCode(t *testing.T, body map[string]any) string {
 func envelopePair(body map[string]any) string {
 	e, _ := body["error"].(map[string]any)
 	return fmt.Sprint(e["code"], "|", e["message"])
-}
-```
+}```
 
 Тело первого теста — весь путь сессии, включая переиспользование refresh и отзыв:
 
@@ -5572,8 +5964,7 @@ func TestRegisterThenRotateThenLogoutDeniesAccess(t *testing.T) {
 	if _, err := q.UserByEmail(ctx, email); err != nil {
 		t.Fatalf("user vanished after logout: %v", err)
 	}
-}
-```
+}```
 
 Второй тест закрывает отказные ветки: слабый пароль, дубликат email, одинаковость
 ответов на неизвестный email и неверный пароль (нет оракула перечисления), блокировку,
@@ -5649,8 +6040,7 @@ func userIDByEmail(t *testing.T, ctx context.Context, q *db.Queries, email strin
 		t.Fatalf("UserByEmail(%s): %v", email, err)
 	}
 	return u.ID
-}
-```
+}```
 
 Сравнение ведётся по паре «code|message», а не по карте целиком: `request_id` различается
 по определению, и с ним эта проверка была бы всегда красной — ровно тот класс молчаливого
@@ -5751,8 +6141,7 @@ func TestMiddlewareRejects(t *testing.T) {
 			assertUnauthenticated(t, w)
 		})
 	}
-}
-```
+}```
 
 Хелпер проверки envelope — тот же файл:
 
@@ -5777,8 +6166,7 @@ func assertUnauthenticated(t *testing.T, w *httptest.ResponseRecorder) {
 	if len(body.Error.RequestID) != 16 {
 		t.Errorf("request_id = %q, want 16 chars", body.Error.RequestID)
 	}
-}
-```
+}```
 
 `bytes32` уже объявлен в `token_test.go` (задача 11) — в этом файле его объявлять
 нельзя. `SessionService` собирается напрямую, потому что `ParseAccess` не трогает `q`;
@@ -5816,8 +6204,7 @@ func TestMiddlewareFailsOpenWhenDenylistIsDown(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (fail-open)", w.Code)
 	}
-}
-```
+}```
 
 Run: `make unit`
 Expected: FAIL — `undefined: Middleware`.
@@ -5850,12 +6237,12 @@ func Middleware(sess *SessionService, deny Denylist) func(http.Handler) http.Han
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			value := Bearer(r)
 			if value == "" {
-				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 				return
 			}
 			claims, err := sess.ParseAccess(value)
 			if err != nil || claims.UserID == uuid.Nil {
-				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 				return
 			}
 			blocked, err := deny.Contains(r.Context(), claims.JTI)
@@ -5868,7 +6255,7 @@ func Middleware(sess *SessionService, deny Denylist) func(http.Handler) http.Han
 				blocked = false
 			}
 			if blocked {
-				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "authentication required", nil)
+				httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated, "требуется аутентификация", nil)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(httpx.WithUserID(r.Context(), claims.UserID)))
@@ -5903,7 +6290,7 @@ func ClientIP(r *http.Request) *netip.Addr {
 		return nil
 	}
 	if addr.Is4In6() {
-		addr = addr.Addr4()
+		addr = addr.Unmap()
 	}
 	return &addr
 }
@@ -5913,8 +6300,11 @@ func ipString(a *netip.Addr) string {
 		return "unknown"
 	}
 	return a.String()
-}
-```
+}```
+
+В блоке выше `ClientIP` приводит 4-in-6 через `addr.Unmap()`: у `netip.Addr` метода
+`Addr4()` нет (в черновике плана стояла именно она), а `Unmap` возвращает чистую
+четвёрку. Правка сделана по фактической компиляции, семантика не менялась.
 
 `Middleware` намеренно не принимает `*slog.Logger`: отказ `Denylist.Contains` пишется в
 журнал внутри denylist (задача 11), а журнал каждого запроса делает сквозной middleware из
@@ -5995,8 +6385,7 @@ func (g *LoginGuard) Reset(ctx context.Context, email, ip string) {
 	if err := g.rdb.Del(ctx, failKey(email, ip)).Err(); err != nil {
 		g.log.Warn("login guard reset", "err", err)
 	}
-}
-```
+}```
 
 `failBaseDelay << shift` законен: `time.Duration` — целой тип, а сдвиг на `int64`
 даёт удвоение. Окно `failWindow` обновляется только на первой неудаче, счётчик не
@@ -6052,8 +6441,7 @@ func TestLockedAccountCannotRefresh(t *testing.T) {
 	if _, err := q.UserByEmail(ctx, email); err != nil {
 		t.Fatalf("user vanished after lock: %v", err)
 	}
-}
-```
+}```
 
 Run: `make integration`
 Expected: FAIL — `refresh on locked account: 200`.
@@ -6066,8 +6454,6 @@ Expected: FAIL — `refresh on locked account: 200`.
 ```go
 	user, err := s.q.UserByID(ctx, family.UserID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Семья указывает на пользователя, которого нет (в A удаление — это
-		// status='deleted', поэтому случай теоретический, но дешёвый).
 		return Session{}, ErrInvalidRefreshToken
 	}
 	if err != nil {
@@ -6075,8 +6461,10 @@ Expected: FAIL — `refresh on locked account: 200`.
 	}
 	if user.Status != db.UserStatusActive {
 		return Session{}, ErrAccountLocked
-	}
-```
+	}```
+
+В фактическом файле ветка `ErrNoRows` без комментария: случай теоретический
+(в A удаление — это `status='deleted'`), и комментарий там был бы громче ветки.
 
 Проверка стоит до сравнения секрета? Нет — порядок обратный: неверный токен обязан
 остаться `refresh_token_invalid`, иначе ответ «аккаунт заблокирован» станет
@@ -6158,7 +6546,7 @@ type refreshRequest struct {
 func (h *Handler) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := httpx.DecodeJSON(r, dst, maxAuthBody); err != nil {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"body must be a single JSON object with the documented fields", nil)
+			"тело должно быть одним JSON-объектом с полями из документации", nil)
 		return false
 	}
 	return true
@@ -6169,7 +6557,7 @@ func (h *Handler) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 func (h *Handler) internal(w http.ResponseWriter, r *http.Request, err error) {
 	h.log.Error("auth: internal error",
 		"err", err, "request_id", httpx.RequestIDFromContext(r.Context()))
-	httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "internal error", nil)
+	httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal, "внутренняя ошибка", nil)
 }
 
 func (h *Handler) writeSession(w http.ResponseWriter, status int, s Session) {
@@ -6200,7 +6588,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	email, ok := normalizeEmail(in.Email)
 	if !ok {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"email must be a single address of at most 254 characters",
+			"email должен быть одним адресом не длиннее 254 символов",
 			map[string]any{"field": "email"})
 		return
 	}
@@ -6209,13 +6597,13 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 		// Пока не создан ни пользователь, ни подписка: до HashPassword доходить
 		// не должно — иначе слабый пароль уже оставил бы строку в users.
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"password must be 10..1024 bytes", map[string]any{"field": "password"})
+			"пароль должен быть от 10 до 1024 байт", map[string]any{"field": "password"})
 		return
 	}
 	userID := uuid.New()
 	err = db.RunInTx(r.Context(), h.pool, func(q *db.Queries) error {
 		if _, err := q.InsertUser(r.Context(), db.InsertUserParams{
-			ID: userID, Email: email, PasswordHash: hash, DisplayName: nil, Locale: "en",
+			ID: userID, Email: email, PasswordHash: hash, DisplayName: nil, Locale: "ru",
 		}); err != nil {
 			return err
 		}
@@ -6224,7 +6612,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if isEmailTaken(err) {
 			httpx.WriteError(w, r, http.StatusConflict, httpx.ErrEmailTaken,
-				"email is already registered", map[string]any{"field": "email"})
+				"email уже зарегистрирован", map[string]any{"field": "email"})
 			return
 		}
 		h.internal(w, r, err)
@@ -6268,7 +6656,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	if user.Status != db.UserStatusActive {
 		h.log.Warn("login on non-active account", "user_id", user.ID, "status", string(user.Status))
 		httpx.WriteError(w, r, http.StatusForbidden, httpx.ErrAccountLocked,
-			"account is locked", nil)
+			"учётная запись заблокирована", nil)
 		return
 	}
 	h.guard.Reset(r.Context(), email, ipStr)
@@ -6297,7 +6685,7 @@ func (h *Handler) penalize(w http.ResponseWriter, r *http.Request, email, ip str
 		}
 	}
 	httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrInvalidCredentials,
-		"email or password is incorrect", nil)
+		"неверный email или пароль", nil)
 }
 
 func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
@@ -6309,7 +6697,7 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 	// «слишком короткий» — это нарушение схемы, а не «токена нет».
 	if n := len(in.RefreshToken); n < 40 || n > 512 {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
-			"refresh_token must be 40..512 characters", map[string]any{"field": "refresh_token"})
+			"refresh_token должен быть от 40 до 512 символов", map[string]any{"field": "refresh_token"})
 		return
 	}
 	sess, err := h.sess.Rotate(r.Context(), in.RefreshToken, ClientIP(r))
@@ -6322,10 +6710,10 @@ func (h *Handler) refresh(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("refresh rejected", "err", err,
 			"request_id", httpx.RequestIDFromContext(r.Context()))
 		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrRefreshTokenInvalid,
-			"refresh token is invalid", nil)
+			"неверный refresh-токен", nil)
 	case errors.Is(err, ErrAccountLocked):
 		httpx.WriteError(w, r, http.StatusForbidden, httpx.ErrAccountLocked,
-			"account is locked", nil)
+			"учётная запись заблокирована", nil)
 	default:
 		h.internal(w, r, err)
 	}
@@ -6343,7 +6731,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 			h.log.Warn("logout with undecodable refresh token",
 				"request_id", httpx.RequestIDFromContext(r.Context()))
 			httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrRefreshTokenInvalid,
-				"refresh token is invalid", nil)
+				"неверный refresh-токен", nil)
 			return
 		}
 		h.internal(w, r, err)
@@ -6356,12 +6744,12 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 type userView struct {
-	ID          string     `json:"id"`
-	Email       string     `json:"email"`
-	DisplayName *string    `json:"display_name"`
-	Status      string     `json:"status"`
-	Locale      string     `json:"locale"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID          string    `json:"id"`
+	Email       string    `json:"email"`
+	DisplayName *string   `json:"display_name"`
+	Status      string    `json:"status"`
+	Locale      string    `json:"locale"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type planView struct {
@@ -6376,16 +6764,16 @@ type usageView struct {
 }
 
 type meView struct {
-	User    userView   `json:"user"`
-	Plan    *planView  `json:"plan"`
-	Devices usageView  `json:"devices"`
+	User    userView  `json:"user"`
+	Plan    *planView `json:"plan"`
+	Devices usageView `json:"devices"`
 }
 
 func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
 		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated,
-			"authentication required", nil)
+			"требуется аутентификация", nil)
 		return
 	}
 	q := db.New(h.pool)
@@ -6394,7 +6782,7 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 		// Подписанный jti живой, пользователя нет: это не «нет права», а «нет
 		// субъекта» — 401, и denylist тут не при чём.
 		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated,
-			"authentication required", nil)
+			"требуется аутентификация", nil)
 		return
 	}
 	if err != nil {
@@ -6502,9 +6890,12 @@ func isEmailTaken(err error) bool {
 	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
 		return false
 	}
-	return pgErr.Constraint == "users_email_key"
-}
-```
+	return pgErr.ConstraintName == "users_email_key"
+}```
+
+В блоке выше `isEmailTaken` читает `pgErr.ConstraintName`: поле `*pgconn.PgError` в
+pgx v5 называется именно так (`Constraint` из черновика плана не компилируется).
+Семантика та же: код 23505 плюс имя `users_email_key`.
 
 Несколько решений, которые надо держать именно такими:
 
@@ -6528,13 +6919,21 @@ func isEmailTaken(err error) bool {
 - [ ] **Step 6: Привести контракт и спецификацию в соответствие**
 
 Контракт задачи 16 писался до того, как появились `account_locked` на refresh и
-идемпотентность logout. Правки в `api-spec/openapi.yaml` — в том же коммите:
+идемпотентность logout. Правки в `api-spec/openapi.yaml` — в том же коммите.
+Два пункта из черновика этого шага оказались уже сделанными: 403 `account_locked`
+на refresh и `minimum: 0` у `devices.limit` вошли в контракт ещё задачей 16
+(план писался одним документом до реализации). Поэтому пункт 1 и лимит из
+пункта 3 здесь только проверяются, а реальные правки — пункт 2 и перенос полей
+плана в отдельную схему `PlanView`.
 
-1. `POST /auth/refresh` — добавить ответ:
+1. `POST /auth/refresh` — 403 уже в контракте (блок ниже — фактический фрагмент); проверено, правок нет:
 
 ```yaml
+        # 403 здесь обязателен: Rotate читает статус пользователя (задача 17, шаг 4), и
+        # заблокированный аккаунт не продлевает доступ. Без этой строки живой ответ 403
+        # не был бы описан контрактом, а контракт-first на этом маршруте теряет смысл.
         "403":
-          description: Аккаунт заблокирован; продление сессии остановлено (ТЗ §9).
+          description: Учётная запись заблокирована — новая пара не выдаётся.
           content:
             application/json:
               schema:
@@ -6543,8 +6942,7 @@ func isEmailTaken(err error) bool {
                   - properties:
                       error:
                         properties:
-                          code: { enum: [account_locked] }
-```
+                          code: { enum: [account_locked] }```
 
 2. `POST /auth/logout` — заменить текст ответа `401`, чтобы он описывал только
    нераспаршиваемый токен:
@@ -6563,13 +6961,15 @@ func isEmailTaken(err error) bool {
                   - properties:
                       error:
                         properties:
-                          code: { enum: [refresh_token_invalid] }
-```
+                          code: { enum: [refresh_token_invalid] }```
 
 3. `GET /me` — план становится nullable, лимит устройств — с нулём:
 
 ```yaml
         plan:
+          # null — активной подписки нет (истекла или не была выдана). /me описывает
+          # состояние аккаунта, а не выдаёт право, поэтому здесь данные, а не отказ:
+          # 403 на «подписка кончилась» был бы неправдой про доступ.
           anyOf:
             - $ref: "#/components/schemas/PlanView"
             - type: "null"
@@ -6578,10 +6978,9 @@ func isEmailTaken(err error) bool {
           required: [live, limit]
           properties:
             live: { type: integer, minimum: 0 }
-            # 0 — план кончился или его никогда не было; именно поэтому здесь
-            # больше нет minimum: 1.
-            limit: { type: integer, minimum: 0 }
-```
+            # 0 — подписки нет, и права на устройства тоже (ср. POST /devices: 403).
+            # Минимум не может быть 1, иначе истёкший аккаунт не описывается контрактом.
+            limit: { type: integer, minimum: 0 }```
 
 и в `components/schemas` добавить `PlanView` с теми же полями, что `planView` в Go
 (`slug`, `device_limit` с `minimum: 1`, `traffic_quota_bytes` — `["integer","null"]`).
@@ -6985,8 +7384,7 @@ func TestWithUserIDWithoutJournalDoesNotPanic(t *testing.T) {
 	if !ok || got != id {
 		t.Errorf("UserIDFromContext = (%v, %v), want (%v, true)", got, ok, id)
 	}
-}
-```
+}```
 
 Run: `make unit`
 Expected: FAIL — `undefined: Envelope`, `undefined: Logging`. Пакет не компилируется
@@ -7041,10 +7439,10 @@ func Envelope(routes PatternResolver) http.Handler {
 		if allow := allowedMethods(routes, r); len(allow) > 0 {
 			w.Header().Set("Allow", strings.Join(allow, ", "))
 			WriteError(w, r, http.StatusMethodNotAllowed, ErrMethodNotAllowed,
-				"method not allowed for this route", map[string]any{"allowed": allow})
+				"метод не разрешён для этого маршрута", map[string]any{"allowed": allow})
 			return
 		}
-		WriteError(w, r, http.StatusNotFound, ErrNotFound, "route not found", nil)
+		WriteError(w, r, http.StatusNotFound, ErrNotFound, "маршрут не найден", nil)
 	})
 }
 
@@ -7064,8 +7462,7 @@ func allowedMethods(routes PatternResolver, r *http.Request) []string {
 		}
 	}
 	return allow
-}
-```
+}```
 
 `internal/httpx/logging.go`:
 
@@ -7203,14 +7600,13 @@ func Logging(next http.Handler, routes PatternResolver, log *slog.Logger) http.H
 				// Если обработчик уже начал писать тело, дописывать конверт
 				// нельзя: клиент получил бы JSON в середине ответа.
 				WriteError(sw, req, http.StatusInternalServerError, ErrInternal,
-					"internal error", nil)
+					"внутренняя ошибка", nil)
 			}
 		}()
 
 		next.ServeHTTP(sw, req)
 	})
-}
-```
+}```
 
 `internal/httpx/requestid.go` — после переезда `statusWriter` и удаления журнальной
 строки файл выглядит целиком так (`time` больше не нужен):
@@ -7268,8 +7664,7 @@ func isHex16(s string) bool {
 		}
 	}
 	return true
-}
-```
+}```
 
 Два следствия, которые легко промотреть:
 
@@ -7288,8 +7683,7 @@ func WithUserID(ctx context.Context, id uuid.UUID) context.Context {
 	// предыдущем ctx и доступен по указателю.
 	noteUserID(ctx, id)
 	return context.WithValue(ctx, userIDKey{}, id)
-}
-```
+}```
 
 Run: `make unit && make vet`
 Expected: PASS.
@@ -7303,6 +7697,9 @@ Expected: PASS.
 запущенный после `auth_flow_test.go`, иначе ловил бы чужой 429 (или не ловил бы свой).
 Девятая база — отдельное пространство именно для этого теста; dev-Redis в compose
 настроен на 16 баз, и их больше никто не трогает.
+
+Хелпер `do` из задачи 17 разбирает каждое тело ответа как JSON, поэтому health
+проверяется без него: прямой `http.Get` — тело «ok» в plain text уронило бы `do`.
 
 ```go
 //go:build integration
@@ -7389,10 +7786,15 @@ func TestRouterServesDocumentedRoutes(t *testing.T) {
 		t.Fatalf("devices without token = %d %v", resp.StatusCode, body)
 	}
 
-	// Health живёт вне /api/v1 и не требует аутентификации.
-	resp, _ = do(t, http.MethodGet, base+"/debug/health", nil, "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("health = %d, want 200", resp.StatusCode)
+	// Health живёт вне /api/v1 и не требует аутентификации. Тело — plain text,
+	// поэтому без do: та разбирает ответ как JSON.
+	hresp, err := http.Get(base + "/debug/health")
+	if err != nil {
+		t.Fatalf("health: %v", err)
+	}
+	defer hresp.Body.Close()
+	if hresp.StatusCode != http.StatusOK {
+		t.Fatalf("health = %d, want 200", hresp.StatusCode)
 	}
 	// Сквозной путь (register → me → devices) здесь не повторяется: он
 	// в auth_flow_test.go. Здесь проверяется именно сборка, а не правила.
@@ -7493,8 +7895,7 @@ func TestRouterRateLimitsAnonymousRoutes(t *testing.T) {
 	if !limited {
 		t.Fatalf("anonymous register must hit the per-IP bucket, got %v", codes)
 	}
-}
-```
+}```
 
 Run: `make integration`
 Expected: FAIL — `undefined: api.NewRouter`, `undefined: api.Deps`. Если падают
@@ -7630,8 +8031,7 @@ func userKey(r *http.Request) string {
 		return "anonymous"
 	}
 	return id.String()
-}
-```
+}```
 
 Три замечания к коду выше:
 
@@ -7704,12 +8104,11 @@ func serve(cfg config.Config) error {
 	}
 	log.Info("stopped")
 	return nil
-}
-```
+}```
 
 Импорты файла целиком: `context`, `errors`, `flag`, `fmt`, `log/slog`, `net/http`, `os`,
 `os/signal`, `syscall`, `time`, `github.com/redis/go-redis/v9`,
-`github.com/novavpn/novavpn/internal/api`, `internal/config`, `internal/db`,
+`github.com/novavpn/novavpn/services/api`, `internal/config`, `internal/db`,
 `internal/db/migrate`, `internal/entitlements`. Из задачи 1 в списке остаётся `net/http`
 (он нужен `http.Server`), а `errors` и `flag` нужны `run` и ветке `migrate` из задачи 5.
 
@@ -7733,10 +8132,15 @@ Run: `make up-dev && make migrate-up`, затем `make run-dev`; в друго�
 Expected: процесс стартует с `"msg":"listening"`; health отвечает `ok`; `/api/v1/devices`
 без токена — конверт 401 с заголовком `X-Request-Id`; несуществующий путь — конверт 404,
 а не `404 page not found`; `PUT /api/v1/auth/login` — 405 с `Allow: POST` и конвертом.
-По `Ctrl-C` появляется `"msg":"stopped"` и процесс выходит с кодом 0 (проверяется
-`echo $?` сразу после выхода). Если выход по сигналу не происходит за 10 секунд —
-`Shutdown` не получил контекст или обработчик завис; это дефект сборки, а не тестовой
-среды.
+По `Ctrl-C` появляется `"msg":"stopped"`, бинарник останавливается штатно. Про код
+выхода — уточнение, проверенное на этом шаге: `go run` (Go 1.25) сигналы дочернему
+процессу не пробрасывает (сигнального кода в `cmd/go/internal/run` нет), а после
+собственного SIGINT ставит exit status 1 (`work/exec.go`, `SetExitStatus`). Поэтому
+под `make run-dev` `echo $?` печатает код обёртки, а не бинарника. Критерий
+«выход 0» проверяется собранным бинарником как PID 1: SIGTERM и SIGINT дают
+`"msg":"stopped"` и код 0 (проверено обоими). Если выход по сигналу не происходит за
+10 секунд — `Shutdown` не получил контекст или обработчик завис; это дефект сборки,
+а не тестовой среды.
 
 Run: `make integration`
 Expected: PASS — все тесты сборки, включая `TestRouterJournalHasNoSecrets` и
@@ -7782,9 +8186,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 Четыре ограничения, которые определяют форму этого теста и править их «по ходу» нельзя:
 
-- `seedUser` (задача 12) может называться `seedUserWithPlan`, если переименование из
-  задачи 13 до неё дожило. Бери то имя, что живёт в `helpers_test.go` сейчас, и не
-  переименовывай обратно ради этого теста.
+- `seedUser` (задача 12) живёт в `helpers_test.go` как `seedUserWithPlan(t, ctx, q,
+  slug)`: переименование из задачи 13 до неё дожило. Блок ниже зовёт именно его, со
+  slug `"internal-default"` — план по умолчанию, который регистрация сажает всем
+  новым аккаунтам (задача 17).
 - Подготовка состояний идёт **не** через HTTP-логин, а через `SessionService.NewSession`
   напрямую: `dec.Anonymous` — bucket на пару (маршрут, IP) с burst 5 (задача 18), и
   матрица, которая заводит участников публичным register, съедала бы собственный лимит и
@@ -7896,7 +8301,7 @@ type actor struct {
 func (e *env) mint(t *testing.T) actor {
 	t.Helper()
 	ctx := context.Background()
-	id := seedUser(t, ctx, e.q)
+	id := seedUserWithPlan(t, ctx, e.q, "internal-default")
 	s, err := e.sess.NewSession(ctx, id, nil)
 	if err != nil {
 		t.Fatalf("NewSession(%s): %v", id, err)
@@ -8465,7 +8870,9 @@ Expected: PASS по почти всем строкам. Что имеет пра
 
 `tests/integration/contract_test.go` читает `api-spec/openapi.yaml` и сверяет с ним
 настоящие ответы настоящего роутера. Это и есть обещание задачи 16 («проверка этого — не
-глаз, а тест»).
+глаз, а тест»). В черновике этого блока не было импорта `net/http` (`liveCase`
+возвращает `*http.Response`), а gofmt выровнял теги полей `node` — блок выше это
+фактические байты файла.
 
 ```go
 //go:build integration
@@ -8476,6 +8883,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -8496,9 +8904,9 @@ import (
 // time.Time и uuid при маршализации (задачи 15 и 17). maxLength/minLength тоже не
 // проверяются: они относятся к телам ЗАПРОСОВ, а этот тест читает ответы.
 type node struct {
-	Ref     string `yaml:"$ref"`
-	AllOf   []node `yaml:"allOf"`
-	Type     any             `yaml:"type"`
+	Ref   string `yaml:"$ref"`
+	AllOf []node `yaml:"allOf"`
+	Type  any    `yaml:"type"`
 	// Значения в properties — всегда схемы (объекты), поэтому map[string]node, а не
 	// map[string]any: раскодировка узлов происходит здесь, а не на уровне any.
 	Required   []string        `yaml:"required"`

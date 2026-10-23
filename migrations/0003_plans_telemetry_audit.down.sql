@@ -1,0 +1,14 @@
+DROP TABLE IF EXISTS bootstrap_tokens;
+DROP TABLE IF EXISTS idempotency_keys;
+DROP TABLE IF EXISTS admin_audit_logs;
+DROP TABLE IF EXISTS admin_users;
+DROP TABLE IF EXISTS device_day_traffic;
+DROP TABLE IF EXISTS connection_events;
+DROP TABLE IF EXISTS server_health;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS subscription_plans;
+DROP TYPE IF EXISTS audit_action;
+DROP TYPE IF EXISTS event_type;
+DROP TYPE IF EXISTS health_status;
+DROP TYPE IF EXISTS subscription_source;
+DROP TYPE IF EXISTS subscription_status;
