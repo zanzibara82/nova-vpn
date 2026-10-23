@@ -9,6 +9,9 @@ import (
 type userIDKey struct{}
 
 func WithUserID(ctx context.Context, id uuid.UUID) context.Context {
+	// Журналу нужен сам субъект, а не новый контекст: аккумулятор живёт в
+	// предыдущем ctx и доступен по указателю.
+	noteUserID(ctx, id)
 	return context.WithValue(ctx, userIDKey{}, id)
 }
 

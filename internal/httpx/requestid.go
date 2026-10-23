@@ -2,9 +2,7 @@ package httpx
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
-	"time"
 )
 
 type ctxKey int
@@ -22,19 +20,12 @@ func RequestIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (s *statusWriter) WriteHeader(code int) {
-	s.status = code
-	s.ResponseWriter.WriteHeader(code)
-}
-
 // NewRequestID присваивает идентификатор и пишет доступный для клиента заголовок.
 // Клиентский X-Request-Id принимается только если он уже правильного формата:
 // иначе заголовок становится каналом для подстановки в логи.
+//
+// Журнал запроса здесь больше не пишется: строка обязана быть одна, и её делает
+// Logging. Здесь остаются контекст и заголовок.
 func NewRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")
@@ -42,13 +33,7 @@ func NewRequestID(next http.Handler) http.Handler {
 			id = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", id)
-		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(sw, r.WithContext(withRequestID(r.Context(), id)))
-		slog.Info("http",
-			"request_id", id, "method", r.Method, "path", r.URL.Path,
-			"status", sw.status, "dur_ms", time.Since(start).Milliseconds(),
-			"remote", r.RemoteAddr)
+		next.ServeHTTP(w, r.WithContext(withRequestID(r.Context(), id)))
 	})
 }
 

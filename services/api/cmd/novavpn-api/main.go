@@ -8,9 +8,17 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/novavpn/novavpn/internal/config"
+	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/db/migrate"
+	"github.com/novavpn/novavpn/internal/entitlements"
+	"github.com/novavpn/novavpn/services/api"
 )
 
 func main() {
@@ -62,12 +70,52 @@ func run(args []string, getenv func(string) string) error {
 }
 
 func serve(cfg config.Config) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /debug/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := db.Pool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	defer rdb.Close()
+
+	handler := api.NewRouter(api.Deps{
+		Cfg: cfg, Pool: pool, RDB: rdb,
+		Ent: entitlements.New(db.New(pool)), Log: log,
 	})
-	slog.Info("listening", "addr", cfg.ListenAddr, "env", cfg.Env)
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: mux, ReadHeaderTimeout: 5e9}
-	return srv.ListenAndServe()
+	srv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	log.Info("listening", "addr", cfg.ListenAddr, "env", cfg.Env)
+
+	select {
+	case err := <-errCh:
+		return fmt.Errorf("listen: %w", err)
+	case <-ctx.Done():
+	}
+
+	// Активные соединения дозаписывают ответ: kill switch у HTTP-сервера без
+	// Shutdown означает «оборви чужую выдачу токенов на середине тела».
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+	log.Info("stopped")
+	return nil
 }
