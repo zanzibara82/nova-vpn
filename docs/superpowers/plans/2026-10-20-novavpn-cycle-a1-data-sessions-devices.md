@@ -8186,9 +8186,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 Четыре ограничения, которые определяют форму этого теста и править их «по ходу» нельзя:
 
-- `seedUser` (задача 12) может называться `seedUserWithPlan`, если переименование из
-  задачи 13 до неё дожило. Бери то имя, что живёт в `helpers_test.go` сейчас, и не
-  переименовывай обратно ради этого теста.
+- `seedUser` (задача 12) живёт в `helpers_test.go` как `seedUserWithPlan(t, ctx, q,
+  slug)`: переименование из задачи 13 до неё дожило. Блок ниже зовёт именно его, со
+  slug `"internal-default"` — план по умолчанию, который регистрация сажает всем
+  новым аккаунтам (задача 17).
 - Подготовка состояний идёт **не** через HTTP-логин, а через `SessionService.NewSession`
   напрямую: `dec.Anonymous` — bucket на пару (маршрут, IP) с burst 5 (задача 18), и
   матрица, которая заводит участников публичным register, съедала бы собственный лимит и
@@ -8300,7 +8301,7 @@ type actor struct {
 func (e *env) mint(t *testing.T) actor {
 	t.Helper()
 	ctx := context.Background()
-	id := seedUser(t, ctx, e.q)
+	id := seedUserWithPlan(t, ctx, e.q, "internal-default")
 	s, err := e.sess.NewSession(ctx, id, nil)
 	if err != nil {
 		t.Fatalf("NewSession(%s): %v", id, err)
@@ -8869,7 +8870,9 @@ Expected: PASS по почти всем строкам. Что имеет пра
 
 `tests/integration/contract_test.go` читает `api-spec/openapi.yaml` и сверяет с ним
 настоящие ответы настоящего роутера. Это и есть обещание задачи 16 («проверка этого — не
-глаз, а тест»).
+глаз, а тест»). В черновике этого блока не было импорта `net/http` (`liveCase`
+возвращает `*http.Response`), а gofmt выровнял теги полей `node` — блок выше это
+фактические байты файла.
 
 ```go
 //go:build integration
@@ -8880,6 +8883,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -8900,9 +8904,9 @@ import (
 // time.Time и uuid при маршализации (задачи 15 и 17). maxLength/minLength тоже не
 // проверяются: они относятся к телам ЗАПРОСОВ, а этот тест читает ответы.
 type node struct {
-	Ref     string `yaml:"$ref"`
-	AllOf   []node `yaml:"allOf"`
-	Type     any             `yaml:"type"`
+	Ref   string `yaml:"$ref"`
+	AllOf []node `yaml:"allOf"`
+	Type  any    `yaml:"type"`
 	// Значения в properties — всегда схемы (объекты), поэтому map[string]node, а не
 	// map[string]any: раскодировка узлов происходит здесь, а не на уровне any.
 	Required   []string        `yaml:"required"`
