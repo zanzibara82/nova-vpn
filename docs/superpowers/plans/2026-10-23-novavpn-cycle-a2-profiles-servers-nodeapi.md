@@ -233,6 +233,18 @@ docs/testing-status.md
     считается в Go (находка 10), и grep по слову выдавал бы ложное совпадение в
     сгенерированном коде. Обе проверки задачи 1 переведены на grep по import'у
     `jackc/pgx/v5/pgtype` — он пуст, что и есть утверждение о типах.
+18. **Случай «серверов нет» из таблицы задачи 2 неисполним на живой dev-базе.** Каталог не
+    фильтруется по пользователю, база между прогонами одна и та же, а порядок запуска тестов
+    в пакете — не инструмент создания пустоты. Проверка перенесена на `emptyDBTX` (стаб
+    `db.DBTX`): утверждение этого случая говорит только о сериализации пустого среза, и
+    оставлять его `t.Skip`-ом «пока база непустая» значило бы держать непроверенный случай
+    контракта.
+19. **`null` и «ключа нет» различимы только до типизированного decode.** Проверка
+    `capacity_mbps`/`latency_ms`/`load` через `servers.Summary` не отличила бы отсутствие
+    поля от `null`, а это ровно та грань, на которой держится обещание ADR-006; ответ
+    разбирается в `[]map[string]json.RawMessage`. Тот же разбор показал, что координаты
+    обязаны выйти JSON-числом: после override'а задачи 1 `lat`/`lon` — строки, и прямая
+    подача их наружу была бы видна только такому тесту.
 
 ---
 
@@ -871,6 +883,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Interfaces:**
 - Consumes: `CatalogServers` (задача 1), `db.VpnServer`, `httpx.Decorators`, `httpx.WriteJSON`.
+  Поле `CatalogServersRow.HealthStatus` — не `*string`, а `db.NullHealthStatus`: LEFT JOIN
+  над nullable-enum генератор покрывает своим null-врапером enum'а, и «значения нет»
+  там живёт в `Valid`, а не в указателе. `HealthObservedAt` — `*time.Time` как и задумано.
 - Produces:
   - `servers.Availability` (`"available" | "unknown"`), `servers.Available(status *string, observedAt *time.Time, now time.Time) Availability`;
   - `servers.NewService(q *db.Queries) *Service`, `(s *Service) Catalog(ctx) ([]Summary, error)`;
@@ -903,10 +918,10 @@ func TestAvailableRequiresFreshOK(t *testing.T) {
 	staleStatus := "stale"
 
 	cases := []struct {
-		name    string
-		status  *string
-		at      *time.Time
-		want    Availability
+		name   string
+		status *string
+		at     *time.Time
+		want   Availability
 	}{
 		{"нет строки health вообще", nil, nil, AvailabilityUnknown},
 		{"health есть, но статус не пришёл", nil, &fresh, AvailabilityUnknown},
@@ -955,6 +970,11 @@ Expected: FAIL — `undefined: Available`, `undefined: Summary`.
 - `CapacityMbps` отдаётся как есть (`*int32`): заявленная ёмкость, не измеренная (ADR-006).
 - `Region` — `string` (пусто, если NULL): `*string` в ответе дал бы `null` там, где у нас
   «не заполнено оператором», и клиент не отличил бы это от «поле не попросили».
+- `Available` остаётся чистой функцией над `*string`, поэтому преобразование
+  `db.NullHealthStatus → *string` делает `Catalog` одним явным шагом
+  (`if row.HealthStatus.Valid { status = &value }`): расчёт «значение или нет»
+  живёт в одном месте, а смена сигнатуры ради типа генератора лишила бы unit-тест
+  шага 1 возможности вызывать функцию без БД.
 
 - [ ] **Step 3: Handler — `internal/servers/handlers.go`**
 
@@ -996,9 +1016,31 @@ Expected: PASS.
 | `online` + health `ok`, `observed_at` свежий | `availability == "available"` |
 | `online` + health `ok`, `observed_at` = now−200s | `availability == "unknown"` |
 | `online` + health `error` | `availability == "unknown"` |
+| `online` + health `stale` | `availability == "unknown"` (значение enum'а из 0003; sweeper задачи 13 выставляет его по тому же окну) |
 | `capacity_mbps` не задан | в JSON ровно `"capacity_mbps":null`, а не `0` (проверка по `map[string]any`, не по struct) |
 | `draining`/`retired` | отсутствуют в каталоге (выведенный узел не должен светиться как выбор) |
 | анонимный запрос через `e.Anonymous == nil`-сценарий | не тестируется здесь: закрытость маршрута доказывает матрица задачи 15 |
+
+Две вещи, которые план не учитывал и которые пришлось зафиксировать при исполнении:
+
+- «серверов нет» нельзя проверить на живом пуле: dev-база между прогонами одна и
+  та же, а каталог не фильтруется по пользователю, поэтому «пусто» означало бы
+  «весь стек пуст» и зависело бы от порядка запуска тестов. Случай закрыт
+  `emptyDBTX` — стабом `db.DBTX` с нулём строк: проверяемое свойство (пустой срез
+  сериализуется в `[]`, статус `200`, а не `null` и не `404`) лежит в слое выдачи,
+  и запрос к БД в этом утверждении не участвует.
+- Все остальные утверждения идут по `id` конкретных фикстур, а не по длине ответа:
+  в каталоге чужие серверы прошлых прогонов. Разбор ответа — в
+  `[]map[string]json.RawMessage`, потому что decode в `Summary` не отличает
+  отсутствующий ключ от `null`, а именно это различие и есть обещание контракта.
+- `seedHealth(t, ctx, q, serverID, status, observedAt)` появляется в этом файле и
+  переиспользуется задачей 10: `UpsertServerHealth` требует полный набор полей
+  heartbeat'а, и писать его заново в каждом тесте — способ разойтись с реальной
+  формой сообщения.
+
+Проверка, что тест живой (а не проходит молча): `DefaultStaleAfter` временно поднят
+до `300 * time.Second` — случай `now−200s` обязан был стать `"available"` и упасть.
+Упал ровно на фикстуре с индексом 3, после правки константы обратно — зелёный.
 
 Run: `make up-dev && make integration`
 Expected: PASS.
