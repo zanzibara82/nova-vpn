@@ -195,11 +195,50 @@ docs/testing-status.md
     поэтому задача 14 начинается с правки этого теста, а не с правки YAML: иначе первое, что
     увидит исполнитель, — падение чужой проверки без объяснения.
 
+Находки задачи 1 — они же правки её же блоков, записаны здесь, чтобы не выглядеть тихими
+расхождениями плана с кодом:
+
+12. **`ANY($n)` без каста массива даёт скаляр.** sqlc 1.27.0 не выводит `[]uuid.UUID` из
+    `allocated_to = ANY($1)`: в сгенерированном `Params` поле становится `*uuid.UUID`, то есть
+    вызов уйдёт в PostgreSQL со скаляром вместо массива. Два запроса плана (`ReleaseAddressesByProfiles`,
+    `HandshakedDevicesAfter`) были в этом виде и сломались бы молча — сейчас каст `::uuid[]`
+    в них восстановлен, а тест `TestArrayParamsMatchRows` вызывает оба вживую. Плата за
+    корректный тип — безымянные поля `Column3` и `dollar_1`: генератор не может связать
+    параметр с колонкой, когда тот массив.
+13. **Ключ override'а для `numeric` — `pg_catalog.numeric`, а не `numeric`.** С просто
+    `numeric` override не применяется **молча**: ни ошибки, ни изменения типа, колонка
+    остаётся `pgtype.Numeric`. Проверено прогоном генератора на `numeric`, `numeric(9,6)`
+    и `numeric(6,3)`.
+14. **Для `date` тот же механизм ведёт себя наоборот: ключ — `date`.** С `pg_catalog.date`
+    override не применяется. Единственная date-колонка схемы — `device_day_traffic.day`, и в
+    исходном списке override'ов её не было вовсе, то есть задача 10 получила бы `pgtype.Date`
+    там, где план обещал отсутствие pgtype. Override добавлен, комментарий в `sqlc.yaml`
+    фиксирует оба асимметричных случая рядом.
+15. **Каст на колонке в SELECT объявляет её NOT NULL.** `p.rotate_from::text`,
+    `rotated_from::text`, `load1::text`, `status::text` заставляли генератор считать nullable-
+    колонку обязательной, и `Scan` падал бы на отсутствующем значении — ровно там, где «данных
+    нет» является рабочим состоянием (health ещё не прислан, ротации не было). Все эти касты
+    сняты: `rotate_from` приходит `*uuid.UUID` (благодаря override'у из задачи 1, а не pgtype),
+    `health_status` — честным `NullHealthStatus`, `load1`/`cpu_pct` — `*string`. Сняты и
+    `$n::numeric`/`$n::cidr` в позициях параметров, где тип берётся из колонки: они лишь
+    порождают `ColumnN` (см. находку 12).
+16. **Окно переиспользования адреса в `ClaimAddress` не работало.** Условие
+    `WHERE allocated_to IS NULL OR (reusable_at IS NOT NULL AND reusable_at <= now())`
+    соединяло «свободен» и «окно истекло» союзом «ИЛИ», поэтому только что освобождённый
+    адрес был доступен немедленно и защита Go-выборки обходилась на каждом конкурентном
+    заходе. `TestClaimAddressIsExclusive` поймал это на первом же прогоне; условие стало
+    дополнением `BusyAddresses` (см. шаг 5).
+17. **Проверка «рукописные слои не касаются pgtype» не может быть grep'ом по слову.** Слово
+    `pgtype` живёт в двух комментариях, объясняющих, почему срок жизни bootstrap-токена
+    считается в Go (находка 10), и grep по слову выдавал бы ложное совпадение в
+    сгенерированном коде. Обе проверки задачи 1 переведены на grep по import'у
+    `jackc/pgx/v5/pgtype` — он пуст, что и есть утверждение о типах.
+
 ---
 
 ## Задачи
 
-### Task 1: sqlc-запросы сетевого слоя, миграция 0006 и два override'а генератора
+### Task 1: sqlc-запросы сетевого слоя, миграция 0006 и три override'а генератора
 
 **Files:**
 - Create: `migrations/0006_node_telemetry_admin.up.sql`, `migrations/0006_node_telemetry_admin.down.sql`,
@@ -218,8 +257,11 @@ docs/testing-status.md
   `RevokeProfile`, `RevokeProfilesForDevices`, `NodeCredentialByHash`, `ConsumeBootstrapToken`,
   `UpsertServerHealth`, `UpsertDeviceDayTraffic`, `InsertConnectionEvent`, `AdminByEmail`,
   `InsertAdminAudit`, `ExpiredActiveProfiles`, `MarkStaleHealth`, …).
-- Типы после override'ов: `numeric` → `string` (nullable → `*string`), nullable `uuid` →
-  `*uuid.UUID`. Оба нужны, чтобы в задачах 9/10/12 не писать ручной мост через `pgtype`.
+- Типы после override'ов: `numeric` → `string` (nullable → `*string`), `date` → `time.Time`,
+  nullable `uuid` → `*uuid.UUID`. Все три нужны, чтобы в задачах 9/10/12 не писать ручной
+  мост через `pgtype`. Ключи поиска у sqlc 1.27.0 выдержаны непоследовательно: `numeric`
+  ищется с префиксом схемы (`pg_catalog.numeric`), а `date` — без него; оба проверены
+  прогоном, и в комментарии к каждому записано, какой именно вариант работает.
 
 - [ ] **Step 1: Миграция 0006 — дословный исходник `migrations/0006_node_telemetry_admin.up.sql`**
 
@@ -261,20 +303,33 @@ ALTER TYPE audit_action_old RENAME TO audit_action;
 
 - [ ] **Step 3: Override'ы генератора — дословная правка `sqlc.yaml`**
 
-В конец блока `overrides:` добавить два элемента (перед `cidr`), не трогая существующие:
+В конец блока `overrides:` добавить четыре элемента (три ключа `db_type`:
+`pg_catalog.numeric`, `pg_catalog.numeric` + `nullable`, `date`, `uuid` + `nullable`) —
+перед `cidr`, не трогая существующие:
 
 ```yaml
           # numeric(9,6) координат и numeric load1/cpu_pct: в задачах 2 и 10 значения
           # читаются и сравниваются, а pgtype.Numeric для этого — лишний слой. Строка
           # сохраняет ровно ту точность, которую даёт numeric в фикстуре, и честно
           # показывает «значения нет» указателем (emit_pointers_for_null_types).
-          - db_type: "numeric"
+          # Ключ — "pg_catalog.numeric": с просто "numeric" override молча не применяется
+          # (проверено прогоном sqlc 1.27.0 на numeric, numeric(9,6) и numeric(6,3)).
+          - db_type: "pg_catalog.numeric"
             go_type: "string"
-          - db_type: "numeric"
+          - db_type: "pg_catalog.numeric"
             nullable: true
             go_type:
               type: "string"
               pointer: true
+          # Единственная date-колонка схемы — device_day_traffic.day. Без override она
+          # приходит pgtype.Date, и задаче 10 пришлось бы руками собирать дату в
+          # pgtype-обёртку ради одного поля; pgx/v5 кодирует time.Time в date нативно.
+          # Ключ — "date": для date sqlc 1.27.0 имя ищет без схемы, и с "pg_catalog.date"
+          # колонка остаётся pgtype.Date (проверено тем же прогоном, что и numeric).
+          - db_type: "date"
+            go_type:
+              import: "time"
+              type: "Time"
           # NULL-uuid без этого остаётся pgtype.UUID, и каждую nullable-ссылку
           # (rotate_from, admin_id, user_id события) приходится оборачивать руками.
           # pgx/v5 кодирует *uuid.UUID нативно.
@@ -287,11 +342,14 @@ ALTER TYPE audit_action_old RENAME TO audit_action;
 ```
 
 Run: `make sqlc-generate && make unit && make vet`
-Expected: PASS. Единственный ожидаемый шум — `internal/db/models.go` и
-`internal/db/devices.sql.go`: `RotationOf pgtype.UUID` становится `*uuid.UUID`. Ни один
-рукописный файл на хосте `pgtype.UUID` не использует (проверить
-`grep -rn "pgtype.UUID" --include=*.go internal services tests | grep -v "^internal/db/"` —
-пусто); `devices.Register` поле `RotationOf` не заполняет, поэтому `nil` там и был.
+Expected: PASS. Ожидаемый шум — `internal/db/models.go`, `internal/db/devices.sql.go` и
+`internal/db/querier.go`: `RotationOf pgtype.UUID` становится `*uuid.UUID`, а в интерфейсе
+`Querier` добавляются методы новых файлов запросов. Ни один рукописный файл `pgtype` не
+использует, и после регенерации его не использует ни один сгенерированный: проверить
+`grep -rn "jackc/pgx/v5/pgtype" --include=*.go .` — пусто. (Слово `pgtype` остаётся в двух
+комментариях, объясняющих, почему срок жизни bootstrap-токена считается в Go, — это текст, а
+не тип, и grep по import'у потому и точнее grep по слову.) `devices.Register` поле `RotationOf`
+не заполняет, поэтому `nil` там и был.
 
 - [ ] **Step 4: `internal/db/query/servers.sql` — дословный исходник**
 
@@ -304,7 +362,7 @@ Expected: PASS. Единственный ожидаемый шум — `internal
 SELECT s.id, s.name, s.advertised_host, s.listen_port, s.mtu, s.keepalive_sec,
        s.provider, s.region, s.capacity_mbps,
        l.country_code, l.city, l.lat, l.lon, l.timezone,
-       h.status::text   AS health_status,
+       h.status         AS health_status,
        h.observed_at    AS health_observed_at
 FROM vpn_servers s
 JOIN server_locations l ON l.id = s.location_id
@@ -339,18 +397,18 @@ RETURNING id, name, maintenance_status;
 -- name: LocationByKey :one
 SELECT id, country_code, city, lat, lon, timezone
 FROM server_locations
-WHERE country_code = $1 AND city = $2 AND lat = $3::numeric AND lon = $4::numeric;
+WHERE country_code = $1 AND city = $2 AND lat = $3 AND lon = $4;
 
 -- name: InsertServerLocation :one
 INSERT INTO server_locations (id, country_code, city, lat, lon, timezone)
-VALUES ($1, $2, $3, $4::numeric, $5::numeric, $6)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING id, country_code, city, lat, lon, timezone;
 
 -- name: InsertServer :one
 INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, public_key,
                          address_pool_v4, mtu, keepalive_sec, provider, region, capacity_mbps,
                          maintenance_status)
-VALUES ($1, $2, $3, $4, $5, $6, $7::cidr, $8, $9, $10, $11, $12, 'maintenance')
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'maintenance')
 RETURNING id, location_id, name, advertised_host, listen_port, public_key,
           address_pool_v4, mtu, dns_mode, keepalive_sec, config_version,
           maintenance_status, provider, region, capacity_mbps;
@@ -396,6 +454,10 @@ WHERE server_id = $1
 -- INSERT..ON CONFLICT DO UPDATE с условием: если адрес успели занять между выборкой
 -- в Go и этим запросом, строка не возвращается, и аллокатор отказывается, а не
 -- перетирает чужое назначение. Это второй слой защиты поверх LockServerRow.
+-- Условие — ровно дополнение BusyAddresses: адрес свободен, только если он никому
+-- не назначен И окно переиспользования (§7.2) закрыто. Раздельные «ИЛИ» здесь
+-- означали бы, что освобождённый адрес можно взять мгновенно, а проверка Go-выборки
+-- обходилась бы на каждом конкурентном заходе.
 INSERT INTO tunnel_addresses (server_id, address, allocated_to)
 VALUES ($1, $2, $3)
 ON CONFLICT (server_id, address) DO UPDATE
@@ -403,8 +465,8 @@ ON CONFLICT (server_id, address) DO UPDATE
         released_at  = NULL,
         reusable_at  = NULL
   WHERE tunnel_addresses.allocated_to IS NULL
-     OR (tunnel_addresses.reusable_at IS NOT NULL
-         AND tunnel_addresses.reusable_at <= now())
+    AND (tunnel_addresses.reusable_at IS NULL
+         OR tunnel_addresses.reusable_at <= now())
 RETURNING address;
 
 -- name: ReleaseAddressByProfile :exec
@@ -468,9 +530,8 @@ ORDER BY p.issued_at;
 -- вместе с ключом устройства. Правила отсечения (окно overlap, преемник, handshake)
 -- живут в servers.Compute (задача 9), потому что проверять их хочется чистой
 -- функцией на случайных данных, а не через БД (§9.1).
--- rotate_from::text — чтобы nullable-ссылка осталась строкой, а не pgtype.UUID.
 SELECT p.id, p.device_id, p.server_id, p.address_v4, p.status, p.expires_at,
-       p.overlap_valid_until, p.peer_state, p.rotate_from::text AS rotate_from,
+       p.overlap_valid_until, p.peer_state, p.rotate_from,
        d.public_key, d.revoked_at AS device_revoked_at
 FROM vpn_profiles p
 JOIN devices d ON d.id = p.device_id
@@ -532,7 +593,7 @@ WHERE device_id = $1 AND status = 'active';
 ```sql
 -- name: NodeCredentialByHash :one
 SELECT id, server_id, issued_at, last_used_at, revoked_at,
-       rotated_from::text AS rotated_from
+       rotated_from
 FROM node_credentials WHERE token_hash = $1 AND revoked_at IS NULL;
 
 -- name: TouchNodeCredential :exec
@@ -592,7 +653,7 @@ ORDER BY created_at;
 INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
                            interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
                            applied_config_version, status, agent_version, agent_uptime_sec)
-VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9, $10, $11, $12)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (server_id) DO UPDATE SET
     observed_at            = EXCLUDED.observed_at,
     peers_configured       = EXCLUDED.peers_configured,
@@ -629,8 +690,8 @@ SELECT id, user_id, public_key FROM devices WHERE public_key = ANY($1::text[]);
 
 -- name: ServerHealthOf :one
 SELECT server_id, observed_at, peers_configured, peers_handshaked,
-       interface_rx_bytes, interface_tx_bytes, load1::text AS load1,
-       cpu_pct::text AS cpu_pct, applied_config_version, status::text AS status,
+       interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
+       applied_config_version, status,
        agent_version, agent_uptime_sec
 FROM server_health WHERE server_id = $1;
 ```
@@ -707,7 +768,7 @@ DELETE FROM idempotency_keys
 - [ ] **Step 11: Убедиться, что запросы генерируются и компилируются**
 
 Run: `make sqlc-generate && make vet`
-Expected: PASS. Проверить, что появились `internal/db/{servers,addresses,profiles,nodeapi,telemetry,admin,maintenance}.sql.go`, а в `models.go` все nullable-uuid стали `*uuid.UUID` и ни одного `pgtype.UUID` не осталось (`grep -c pgtype.UUID internal/db/models.go` → `0`).
+Expected: PASS. Проверить, что появились `internal/db/{servers,addresses,profiles,nodeapi,telemetry,admin,maintenance}.sql.go`, а в `models.go` все nullable-uuid стали `*uuid.UUID` и ни одного `pgtype.UUID` не осталось (`grep -c pgtype.UUID internal/db/models.go` → `0`). Отдельно — что `pgtype` не импортируется вообще (`grep -rn "jackc/pgx/v5/pgtype" --include=*.go .` → пусто): именно это, а не совпадение имён полей, означает, что рукописные слои задач 2–13 не касаются pgtype. И ещё одно, что видно только по сгенерированным сигнатурам: массивный параметр обязан остаться массивом (`ReleaseAddressesByProfiles(ctx, []uuid.UUID)`), см. находку 12 в конце раздела «Что план нашёл».
 
 - [ ] **Step 12: Интеграционный тест запросов — `tests/integration/net_queries_test.go`**
 
@@ -718,35 +779,61 @@ Expected: PASS. Проверить, что появились `internal/db/{serv
 |---|---|---|
 | `TestClaimAddressIsExclusive` | `ClaimAddress` не отдаёт занятый адрес и не перетирает чужой | занять адрес за профилем P1, тот же адрес попробовать за P2 → ноль строк; после `ReleaseAddressByProfile(P1)` сразу → по-прежнему занят (окно 5 мин), `reusable_at` задвинуть UPDATE'ом в прошлое → теперь берётся |
 | `TestBusyAddressesCoversBothKinds` | заняты и `allocated_to IS NOT NULL`, и неистёкшее `reusable_at` | три строки: назначен, освобождён с будущим окном, освобождён с прошлым окном → `BusyAddresses` вернул 2 |
+| `TestArrayParamsMatchRows` | массивные параметры доживают до вызова массивами, а не скалярами | `DevicesByPublicKeys` (два известных ключа + один несуществующий → ровно 2 строки), `ReleaseAddressesByProfiles` одним вызовом на два профиля, `HandshakedDevicesAfter` с окном и чужим устройством в списке |
 | `TestConsumeBootstrapTokenIsOnce` | одноразовость под конкурентным вызовом | два `ConsumeBootstrapToken` одного id → второй `pgx.ErrNoRows` |
 | `TestDesiredCandidatesOnlyActiveSuperseded` | в выборку не попадают revoked/expired | по одному профилю каждого статуса → ровно 2 строки |
 | `TestRevokeProfilesForDevicesReturnsServers` | отзыв возвращает `server_id` для bump | два профиля на разных серверах → 2 строки с разными `server_id` |
 | `TestUpsertServerHealthReplaces` | повторный heartbeat не создаёт вторую строку | два upsert → `count(*)=1`, поля второго |
+| `TestNumericFieldsReadAsStrings` | override numeric работает в обе стороны, а не только на запись | upsert с `load1="1.250"`, `cpu_pct="12.50"` → `ServerHealthOf` отдал те же строки с той же точностью (numeric(6,3) и numeric(5,2)) |
 | `TestUpsertDeviceDayTrafficSums` | агрегат складывает приросты | два upsert на одну пару/сутки → rx=сумма |
 | `TestMarkStaleHealthReturnsServer` | переход ok→stale отдаёт id для события | upsert со `observed_at` = now−200s → ровно 1 id, повторный вызов → 0 |
 | `TestAuditActionNewValuesExist` | значения enum из 0006 реально работают | `InsertAdminAudit` с `server_deleted`, `bootstrap_token_issued` |
-| `TestMaintenanceUpDownUp` | 0006 откатывается и применяется снова | тот же путь, что `migrations_test.go` (задача 5 A-1) |
+| `TestMigration0006UpDownUp` | 0006 откатывается и применяется снова | тот же путь, что `migrations_test.go` (задача 5 A-1) |
 
 Компоненты фикстур — хелперы этой же задачи из `helpers_test.go` (шаг 13).
+
+Две вещи, которые стали ясны только на прогоне и без них тест был бы самообманом:
+
+- Освобождение адреса нельзя моделировать одной строкой `released_at = now(),
+  `reusable_at = <прошлое>`: CHECK `addresses_window` требует `reusable_at >= released_at`,
+  и вставка падает с 23514. Окно «истекло» моделируют сдвигом **обеих** границ
+  (`released_at = now() − 10 min`, `reusable_at = now() − 5 min`) — иначе первый же прогон
+  превращается в отладку фикстуры вместо проверки инварианта.
+- `connection_events.device_id` nullable, поэтому `HandshakedDevicesAfter` приходит как
+  `[]*uuid.UUID`. Задача 9 обязана отбрасывать nil-элементы, а не считать их устройствами:
+  событие без устройства — это событие о сервере, и в выборку «снять предка» оно не входит.
 
 - [ ] **Step 13: Хелперы узлов и серверов — правка `tests/integration/helpers_test.go`**
 
 Схема, не исходник. Добавить (используются задачами 2, 4, 5, 7, 8, 9, 11, 12, 15):
 
 ```go
+// keyFromSeed собирает канонический публичный ключ из произвольной строки: sha256
+// от сида, младшие два бита последнего байта обнулены (spare-биты), иначе ключ
+// упрётся в CHECK формы из 0001 ровно тем вариантом, из-за которого существует
+// devices.ValidateKey. Глобальный UNIQUE на devices.public_key делает «i-й по счёту»
+// ключ столкновением между прогонами, поэтому сид — строка, а не счётчик.
+func keyFromSeed(seed string) string
+
 func seedLocation(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID
-// lat/lon строками ("55.7558", "37.6176") — тип после override'а numeric.
+// lat/lon строками ("52.5200", "13.4050") — тип после override'а numeric. Город
+// несёт суффикс id: UNIQUE (country_code, city, lat, lon) из 0002, а dev-база между
+// прогонами одна и та же.
 
 // seedServer создаёт сервер с maintenance_status='maintenance' (дефолт схемы):
 // «зарегистрирован» ≠ «работает», и перевод в online — отдельный явный шаг теста.
 func seedServer(t *testing.T, ctx context.Context, q *db.Queries, poolV4 string) db.VpnServer
-// poolV4 вида "10.99.1.0/24"; public_key строится как в devices_test.keyAt — из
-// 32 raw-байт, иначе неканонический ключ упрётся в CHECK формы.
+// poolV4 вида "10.99.1.0/24"; advertised_host — из TEST-NET-3 (203.0.113.0/24),
+// чтобы в базе никогда не оказался адрес реального хоста.
 
 func setServerOnline(t *testing.T, ctx context.Context, q *db.Queries, id uuid.UUID)
 func seedProfile(t *testing.T, ctx context.Context, q *db.Queries, deviceID, serverID uuid.UUID,
                  addr string, expiresIn time.Duration) db.VpnProfile
 func seedDevice(t *testing.T, ctx context.Context, q *db.Queries, user uuid.UUID, i int) db.Device
+
+// seededKey отдаёт публичный ключ устройства по id — нужен там, где запрос принимает
+// массив ключей (DevicesByPublicKeys), а фикстура знает только id.
+func seededKey(t *testing.T, ctx context.Context, q *db.Queries, id uuid.UUID) string
 ```
 
 - [ ] **Step 14: Правка спецификации §6**
