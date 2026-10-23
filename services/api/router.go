@@ -16,6 +16,7 @@ import (
 	"github.com/novavpn/novavpn/internal/devices"
 	"github.com/novavpn/novavpn/internal/entitlements"
 	"github.com/novavpn/novavpn/internal/httpx"
+	"github.com/novavpn/novavpn/internal/servers"
 )
 
 // Окна лимитов. Спецификация §5.2 требует «register/login — по IP и по аккаунту»,
@@ -79,6 +80,7 @@ func NewRouter(d Deps) http.Handler {
 	auth.NewHandler(sess, d.Pool, d.Ent, guard, planSlug, d.Log).RegisterRoutes(mux, dec)
 	devices.NewHandler(devices.NewService(d.Pool, d.Ent),
 		httpx.NewIdempotency(httpx.NewPGIdempotency(d.Pool))).RegisterRoutes(mux, dec)
+	servers.NewHandler(servers.NewService(q)).RegisterRoutes(mux, dec)
 
 	// Порядок цепочки: request id (чтобы конверт 404 имел что поставить в
 	// request_id), журнал (видит и 429, и панику, и называет маршрут до диспетчера),
