@@ -9,7 +9,6 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countLiveDevices = `-- name: CountLiveDevices :one
@@ -84,7 +83,7 @@ type InsertDeviceParams struct {
 	PublicKey  string
 	Platform   DevicePlatform
 	Name       string
-	RotationOf pgtype.UUID
+	RotationOf *uuid.UUID
 }
 
 func (q *Queries) InsertDevice(ctx context.Context, arg InsertDeviceParams) (Device, error) {

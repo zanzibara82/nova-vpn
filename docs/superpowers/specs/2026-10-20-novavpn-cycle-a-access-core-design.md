@@ -232,7 +232,7 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 | `tunnel_addresses` | `primary key (server_id, address)`; аллокация под блокировкой строки сервера → коллизия адреса невозможна конструктивно |
 | `subscription_plans` | `slug`, `device_limit`, `server_selector`, `traffic_quota_bytes null = безлимит`, `trial_days` — в A один план `internal-default` |
 | `subscriptions` | `user_id`, `plan_id`, `status`, `starts_at`, `ends_at`, `source enum('manual','trial','billing')` — `billing` появится в D |
-| `server_health` | `server_id`, `observed_at`, `peers_configured`, `peers_handshaked`, `interface_rx/tx_bytes`, `load1`, `cpu_pct`, `applied_config_version`, `status enum('ok','stale','error')` |
+| `server_health` | `server_id`, `observed_at`, `peers_configured`, `peers_handshaked`, `interface_rx/tx_bytes`, `load1`, `cpu_pct`, `applied_config_version`, `status enum('ok','stale','error')`, `agent_version`, `agent_uptime_sec` — последние два приходят heartbeat'ом (§4.1) и добавлены миграцией 0006 цикла A-2 |
 | `connection_events` | `event enum('profile_issued','profile_revoked','profile_expired','peer_applied','peer_removed','handshake_observed','handshake_failed','node_stale','connection_error')`, `detail jsonb` — **только коды ошибок и версии, не содержимое трафика** |
 | `device_day_traffic` | `pk(user_id, device_id, day)`, `rx_bytes`, `tx_bytes` — единственный персистентный след объёмов (решение: агрегат на устройство-сутки) |
 | `admin_users`, `admin_audit_logs` | `admin_audit_logs(admin_id, action, target_type, target_id, reason not null, created_at)` |

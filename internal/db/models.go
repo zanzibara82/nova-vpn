@@ -11,21 +11,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type AuditAction string
 
 const (
-	AuditActionServerCreated     AuditAction = "server_created"
-	AuditActionServerUpdated     AuditAction = "server_updated"
-	AuditActionNodeTokenRevoked  AuditAction = "node_token_revoked"
-	AuditActionNodeEnrolled      AuditAction = "node_enrolled"
-	AuditActionUserLocked        AuditAction = "user_locked"
-	AuditActionUserUnlocked      AuditAction = "user_unlocked"
-	AuditActionProfileRevokedNow AuditAction = "profile_revoked_now"
-	AuditActionServerDrained     AuditAction = "server_drained"
-	AuditActionAdminCreated      AuditAction = "admin_created"
+	AuditActionServerCreated         AuditAction = "server_created"
+	AuditActionServerUpdated         AuditAction = "server_updated"
+	AuditActionNodeTokenRevoked      AuditAction = "node_token_revoked"
+	AuditActionNodeEnrolled          AuditAction = "node_enrolled"
+	AuditActionUserLocked            AuditAction = "user_locked"
+	AuditActionUserUnlocked          AuditAction = "user_unlocked"
+	AuditActionProfileRevokedNow     AuditAction = "profile_revoked_now"
+	AuditActionServerDrained         AuditAction = "server_drained"
+	AuditActionAdminCreated          AuditAction = "admin_created"
+	AuditActionBootstrapTokenIssued  AuditAction = "bootstrap_token_issued"
+	AuditActionBootstrapTokenRevoked AuditAction = "bootstrap_token_revoked"
+	AuditActionServerDeleted         AuditAction = "server_deleted"
 )
 
 func (e *AuditAction) Scan(src interface{}) error {
@@ -503,7 +505,7 @@ func (ns NullUserStatus) Value() (driver.Value, error) {
 
 type AdminAuditLog struct {
 	ID         int64
-	AdminID    pgtype.UUID
+	AdminID    *uuid.UUID
 	Action     AuditAction
 	TargetType string
 	TargetID   string
@@ -523,7 +525,7 @@ type BootstrapToken struct {
 	ID        uuid.UUID
 	TokenHash []byte
 	ServerID  uuid.UUID
-	CreatedBy pgtype.UUID
+	CreatedBy *uuid.UUID
 	CreatedAt time.Time
 	ExpiresAt time.Time
 	UsedAt    *time.Time
@@ -532,9 +534,9 @@ type BootstrapToken struct {
 
 type ConnectionEvent struct {
 	ID        int64
-	UserID    pgtype.UUID
-	DeviceID  pgtype.UUID
-	ServerID  pgtype.UUID
+	UserID    *uuid.UUID
+	DeviceID  *uuid.UUID
+	ServerID  *uuid.UUID
 	Event     EventType
 	Detail    []byte
 	CreatedAt time.Time
@@ -546,7 +548,7 @@ type Device struct {
 	PublicKey  string
 	Platform   DevicePlatform
 	Name       string
-	RotationOf pgtype.UUID
+	RotationOf *uuid.UUID
 	CreatedAt  time.Time
 	LastSeenAt *time.Time
 	RevokedAt  *time.Time
@@ -555,7 +557,7 @@ type Device struct {
 type DeviceDayTraffic struct {
 	UserID   uuid.UUID
 	DeviceID uuid.UUID
-	Day      pgtype.Date
+	Day      time.Time
 	RxBytes  int64
 	TxBytes  int64
 }
@@ -579,7 +581,7 @@ type NodeCredential struct {
 	IssuedAt    time.Time
 	LastUsedAt  *time.Time
 	RevokedAt   *time.Time
-	RotatedFrom pgtype.UUID
+	RotatedFrom *uuid.UUID
 }
 
 type RefreshTokenFamily struct {
@@ -601,18 +603,20 @@ type ServerHealth struct {
 	PeersHandshaked      int32
 	InterfaceRxBytes     int64
 	InterfaceTxBytes     int64
-	Load1                pgtype.Numeric
-	CpuPct               pgtype.Numeric
+	Load1                *string
+	CpuPct               *string
 	AppliedConfigVersion int64
 	Status               HealthStatus
+	AgentVersion         *string
+	AgentUptimeSec       *int64
 }
 
 type ServerLocation struct {
 	ID          uuid.UUID
 	CountryCode string
 	City        string
-	Lat         pgtype.Numeric
-	Lon         pgtype.Numeric
+	Lat         string
+	Lon         string
 	Timezone    string
 }
 
@@ -639,7 +643,7 @@ type SubscriptionPlan struct {
 type TunnelAddress struct {
 	ServerID    uuid.UUID
 	Address     netip.Addr
-	AllocatedTo pgtype.UUID
+	AllocatedTo *uuid.UUID
 	ReleasedAt  *time.Time
 	ReusableAt  *time.Time
 }
@@ -667,7 +671,7 @@ type VpnProfile struct {
 	ExpiresAt         time.Time
 	OverlapValidUntil *time.Time
 	RevokedAt         *time.Time
-	RotateFrom        pgtype.UUID
+	RotateFrom        *uuid.UUID
 	PeerState         PeerState
 }
 

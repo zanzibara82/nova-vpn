@@ -34,6 +34,37 @@ sql:
             go_type:
               type: "time.Time"
               pointer: true
+          # numeric(9,6) координат и numeric load1/cpu_pct: в задачах 2 и 10 значения
+          # читаются и сравниваются, а pgtype.Numeric для этого — лишний слой. Строка
+          # сохраняет ровно ту точность, которую даёт numeric в фикстуре, и честно
+          # показывает «значения нет» указателем (emit_pointers_for_null_types).
+          # Ключ — "pg_catalog.numeric": с просто "numeric" override молча не применяется
+          # (проверено прогоном sqlc 1.27.0 на numeric, numeric(9,6) и numeric(6,3)).
+          - db_type: "pg_catalog.numeric"
+            go_type: "string"
+          - db_type: "pg_catalog.numeric"
+            nullable: true
+            go_type:
+              type: "string"
+              pointer: true
+          # Единственная date-колонка схемы — device_day_traffic.day. Без override она
+          # приходит pgtype.Date, и задаче 10 пришлось бы руками собирать дату в
+          # pgtype-обёртку ради одного поля; pgx/v5 кодирует time.Time в date нативно.
+          # Ключ — "date": для date sqlc 1.27.0 имя ищет без схемы, и с "pg_catalog.date"
+          # колонка остаётся pgtype.Date (проверено тем же прогоном, что и numeric).
+          - db_type: "date"
+            go_type:
+              import: "time"
+              type: "Time"
+          # NULL-uuid без этого остаётся pgtype.UUID, и каждую nullable-ссылку
+          # (rotate_from, admin_id, user_id события) приходится оборачивать руками.
+          # pgx/v5 кодирует *uuid.UUID нативно.
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
           - db_type: "cidr"
             go_type:
               import: "net/netip"
