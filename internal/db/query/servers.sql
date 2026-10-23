@@ -1,8 +1,10 @@
 -- name: CatalogServers :many
 -- Каталог: только выведенные в online. health берётся LEFT JOIN'ом — узел может ещё
 -- ни разу не прислать heartbeat, и «неизвестно» здесь честнее, чем «ошибка».
--- status кастится в text, чтобы nullable-enum не превращался в NullHealthStatus:
--- слой каталога работает со строкой статуса.
+-- status идёт без каста в text: LEFT JOIN делает его nullable-enum, и `h.status::text`
+-- объявил бы колонку обязательной — Scan падал бы ровно там, где health ещё нет.
+-- NullHealthStatus слой каталога (задача 2) разворачивает в *string одним явным
+-- преобразованием, и «значения нет» остаётся отличием от «значение ok».
 SELECT s.id, s.name, s.advertised_host, s.listen_port, s.mtu, s.keepalive_sec,
        s.provider, s.region, s.capacity_mbps,
        l.country_code, l.city, l.lat, l.lon, l.timezone,

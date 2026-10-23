@@ -61,8 +61,10 @@ type CatalogServersRow struct {
 
 // Каталог: только выведенные в online. health берётся LEFT JOIN'ом — узел может ещё
 // ни разу не прислать heartbeat, и «неизвестно» здесь честнее, чем «ошибка».
-// status кастится в text, чтобы nullable-enum не превращался в NullHealthStatus:
-// слой каталога работает со строкой статуса.
+// status идёт без каста в text: LEFT JOIN делает его nullable-enum, и `h.status::text`
+// объявил бы колонку обязательной — Scan падал бы ровно там, где health ещё нет.
+// NullHealthStatus слой каталога (задача 2) разворачивает в *string одним явным
+// преобразованием, и «значения нет» остаётся отличием от «значение ok».
 func (q *Queries) CatalogServers(ctx context.Context) ([]CatalogServersRow, error) {
 	rows, err := q.db.Query(ctx, catalogServers)
 	if err != nil {

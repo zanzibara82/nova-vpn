@@ -29,8 +29,10 @@ type Querier interface {
 	BusyAddresses(ctx context.Context, serverID uuid.UUID) ([]netip.Addr, error)
 	// Каталог: только выведенные в online. health берётся LEFT JOIN'ом — узел может ещё
 	// ни разу не прислать heartbeat, и «неизвестно» здесь честнее, чем «ошибка».
-	// status кастится в text, чтобы nullable-enum не превращался в NullHealthStatus:
-	// слой каталога работает со строкой статуса.
+	// status идёт без каста в text: LEFT JOIN делает его nullable-enum, и `h.status::text`
+	// объявил бы колонку обязательной — Scan падал бы ровно там, где health ещё нет.
+	// NullHealthStatus слой каталога (задача 2) разворачивает в *string одним явным
+	// преобразованием, и «значения нет» остаётся отличием от «значение ok».
 	CatalogServers(ctx context.Context) ([]CatalogServersRow, error)
 	// INSERT..ON CONFLICT DO UPDATE с условием: если адрес успели занять между выборкой
 	// в Go и этим запросом, строка не возвращается, и аллокатор отказывается, а не
