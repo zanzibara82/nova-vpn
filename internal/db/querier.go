@@ -106,6 +106,10 @@ type Querier interface {
 	// GET …/profiles/{server_id} обязан показать и отозванный профиль: человек имеет
 	// право видеть, что с его доступом случилось.
 	LatestProfileByDeviceServer(ctx context.Context, arg LatestProfileByDeviceServerParams) (VpnProfile, error)
+	// Вставить профиль сразу с rotate_from существующим InsertProfile не может: он описывает
+	// выдачу, где предка нет, а переписывать запрос задачи 1 под ротацию значило бы менять
+	// проверенный контракт. Отдельный запрос ставит то же поле в той же транзакции.
+	LinkRotatedProfile(ctx context.Context, arg LinkRotatedProfileParams) error
 	LiveBootstrapTokensOfServer(ctx context.Context, serverID uuid.UUID) ([]LiveBootstrapTokensOfServerRow, error)
 	LiveDevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error)
 	LiveSubscriptionByUser(ctx context.Context, userID uuid.UUID) (LiveSubscriptionByUserRow, error)
@@ -142,6 +146,15 @@ type Querier interface {
 	// клиентом; незавершённые (abandoned) удаляются через неделю, потому что слот
 	// незавершённого ключа и так освобождается Abandon'ом (задача 9 A-1).
 	PurgeOldIdempotencyKeys(ctx context.Context) (int64, error)
+	// §7.3: смена ключа не меняет IP клиента, поэтому профиль потомка получает тот же
+	// address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
+	// (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
+	// следующий клиент получил бы адрес живого соединения.
+	//
+	// Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+	// одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+	// вызов, где их переставили, читается как правильный.
+	ReassignAddress(ctx context.Context, arg ReassignAddressParams) error
 	// Поклаговая разбивка (limit/offset) — то, ради чего §5.1 обещает «аудит»: список
 	// длиннее одного экрана, а фильтра по админу в A-2 нет намеренно (задача 12).
 	RecentAdminAudit(ctx context.Context, arg RecentAdminAuditParams) ([]AdminAuditLog, error)
@@ -177,7 +190,7 @@ type Querier interface {
 	// потомка (для пользователя это то же устройство с новым ключом), и множества нужно
 	// объединить. Вариант «один CTE, объединяющий up и down» PostgreSQL принимает, а
 	// sqlc 1.27.0 — нет («column reference \"id\" is ambiguous»); вариант «два рекурсивных
-	//Term в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
+	// рекурсивных ветвей в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
 	// этого генератор теряется в тех же CTE.
 	RotationAncestorIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
 	// Нижний ход той же цепочки (см. комментарий у RotationAncestorIDs).

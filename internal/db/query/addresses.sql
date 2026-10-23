@@ -40,3 +40,16 @@ UPDATE tunnel_addresses
 
 -- name: AddressOfProfile :one
 SELECT address FROM tunnel_addresses WHERE allocated_to = $1;
+
+-- name: ReassignAddress :exec
+-- §7.3: смена ключа не меняет IP клиента, поэтому профиль потомка получает тот же
+-- address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
+-- (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
+-- следующий клиент получил бы адрес живого соединения.
+--
+-- Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+-- одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+-- вызов, где их переставили, читается как правильный.
+UPDATE tunnel_addresses SET allocated_to = sqlc.arg(new_profile_id)
+ WHERE server_id = sqlc.arg(server_id) AND address = sqlc.arg(address)
+   AND allocated_to = sqlc.arg(old_profile_id);

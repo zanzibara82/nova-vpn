@@ -47,6 +47,72 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux, dec httpx.Decorators) {
 	// сервисе, а не в middleware (спецификация §5.2). Идемпотентный ключ здесь не
 	// нужен: повтор DELETE отвечает 404, и защищать от повторной выдачи нечего.
 	mux.Handle("DELETE /api/v1/devices/{id}", dec.Auth(http.HandlerFunc(h.delete)))
+	// Ротация ключа — идемпотентная операция (§5.2 требует заголовок на трёх POST):
+	// повтор без повтора создаст второе устройство с тем же новым ключом.
+	mux.Handle("POST /api/v1/devices/{id}/keys/rotate", dec.Auth(http.HandlerFunc(h.rotate)))
+}
+
+// rotate — проверка заголовка до обёртки идемпотентности, как в register: требование
+// выставляется модулем, а не обёрткой, иначе отказ на пустом ключе выглядел бы чужим.
+func (h *Handler) rotate(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Idempotency-Key") == "" {
+		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrIdempotencyKeyRequired,
+			"заголовок Idempotency-Key обязателен при ротации ключа", nil)
+		return
+	}
+	var wrapped http.Handler = http.HandlerFunc(h.rotateInner)
+	if h.idem != nil {
+		wrapped = h.idem.Middleware("key_rotate")(wrapped)
+	}
+	wrapped.ServeHTTP(w, r)
+}
+
+func (h *Handler) rotateInner(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.UserIDFromContext(r.Context())
+	if !ok {
+		httpx.WriteError(w, r, http.StatusUnauthorized, httpx.ErrUnauthenticated,
+			"требуется аутентификация", nil)
+		return
+	}
+	parentID, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
+			"идентификатор устройства должен быть uuid", map[string]any{"field": "id"})
+		return
+	}
+	var in struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := httpx.DecodeJSON(r, &in, 1<<14); err != nil {
+		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
+			"некорректное тело запроса", nil)
+		return
+	}
+	d, err := h.svc.RotateKey(r.Context(), userID, parentID, in.PublicKey)
+	switch {
+	case err == nil:
+		// 200, а не 201: создаётся не новый объект в терминах пользователя, а новое
+		// состояние того же устройства. Это надо зафиксировать в контракте (задача 14),
+		// иначе клиент будет ждать 201 и посчитает ответ ошибкой.
+		_ = httpx.WriteJSON(w, http.StatusOK, toView(d))
+	case errors.Is(err, ErrInvalidKey):
+		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
+			"public_key должен быть каноническим base64 от 32 байт",
+			map[string]any{"field": "public_key"})
+	case errors.Is(err, ErrForbiddenDevice):
+		httpx.WriteError(w, r, http.StatusNotFound, httpx.ErrNotFound,
+			"устройство не найдено", nil)
+	case errors.Is(err, ErrNotLiveDevice):
+		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrConflict,
+			"устройство отозвано, ротация невозможна",
+			map[string]any{"reason": "device_revoked"})
+	case errors.Is(err, ErrDuplicateKey):
+		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrDuplicateDevice,
+			"устройство с таким публичным ключом уже существует", nil)
+	default:
+		httpx.WriteError(w, r, http.StatusInternalServerError, httpx.ErrInternal,
+			"внутренняя ошибка", nil)
+	}
 }
 
 // delete отзывает устройство. Ответ — 204 без тела: после отзыва показывать

@@ -104,3 +104,9 @@ WHERE device_id = $1 AND status = 'active';
 SELECT id, device_id, server_id, address_v4, status, issued_at, expires_at,
        overlap_valid_until, revoked_at, rotate_from, peer_state
 FROM vpn_profiles WHERE id = $1;
+
+-- name: LinkRotatedProfile :exec
+-- Вставить профиль сразу с rotate_from существующим InsertProfile не может: он описывает
+-- выдачу, где предка нет, а переписывать запрос задачи 1 под ротацию значило бы менять
+-- проверенный контракт. Отдельный запрос ставит то же поле в той же транзакции.
+UPDATE vpn_profiles SET rotate_from = $2 WHERE id = $1;

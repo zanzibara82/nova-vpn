@@ -227,6 +227,23 @@ func (q *Queries) LatestProfileByDeviceServer(ctx context.Context, arg LatestPro
 	return i, err
 }
 
+const linkRotatedProfile = `-- name: LinkRotatedProfile :exec
+UPDATE vpn_profiles SET rotate_from = $2 WHERE id = $1
+`
+
+type LinkRotatedProfileParams struct {
+	ID         uuid.UUID
+	RotateFrom *uuid.UUID
+}
+
+// Вставить профиль сразу с rotate_from существующим InsertProfile не может: он описывает
+// выдачу, где предка нет, а переписывать запрос задачи 1 под ротацию значило бы менять
+// проверенный контракт. Отдельный запрос ставит то же поле в той же транзакции.
+func (q *Queries) LinkRotatedProfile(ctx context.Context, arg LinkRotatedProfileParams) error {
+	_, err := q.db.Exec(ctx, linkRotatedProfile, arg.ID, arg.RotateFrom)
+	return err
+}
+
 const markProfileExpired = `-- name: MarkProfileExpired :one
 UPDATE vpn_profiles SET status = 'expired'
  WHERE id = $1 AND status = 'active'

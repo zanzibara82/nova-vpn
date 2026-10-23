@@ -191,7 +191,7 @@ SELECT up.id FROM up
 // потомка (для пользователя это то же устройство с новым ключом), и множества нужно
 // объединить. Вариант «один CTE, объединяющий up и down» PostgreSQL принимает, а
 // sqlc 1.27.0 — нет («column reference \"id\" is ambiguous»); вариант «два рекурсивных
-// Term в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
+// рекурсивных ветвей в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
 // этого генератор теряется в тех же CTE.
 func (q *Queries) RotationAncestorIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, rotationAncestorIDs, id)

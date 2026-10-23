@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/novavpn/novavpn/internal/connections"
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/entitlements"
 )
@@ -25,6 +27,10 @@ var (
 	// 404, что и на чужое: различие «отозвано» и «не твоё» ничего не меняет для
 	// вызывающего, а по отдельному ответу его можно было бы различать.
 	ErrDeviceRevoked = errors.New("device is revoked")
+	// ErrNotLiveDevice — ротация отозванного устройства. Отдельный страж, а не
+	// ErrDeviceRevoked из пути выдачи: HTTP-слой обязан ответить 409 с причиной,
+	// потому что «повтори запрос» тут бесполезно — нужно новое устройство.
+	ErrNotLiveDevice = errors.New("device is not live")
 )
 
 type RegisterInput struct {
@@ -248,4 +254,129 @@ func (s *Service) DeleteDevice(ctx context.Context, userID, deviceID uuid.UUID) 
 		return 0, err
 	}
 	return revokedProfiles, nil
+}
+
+// RotateKey меняет публичный ключ устройства: создаётся потомок с новым ключом,
+// профили предка переходят в overlap, а адреса остаются за клиентом (§7.3).
+//
+// Направление импорта — devices → connections: окном владеет профиль, а не
+// устройство, и запрет задачи 3 стоит на обратном направлении.
+//
+// Проверка лимита устройств в этом пути не делается, и это не дыра: предок отзывается в
+// той же транзакции, поэтому живых устройств не становится больше. Без этой слабости ротация на исчерпанном лимите
+// была бы невозможна, а «потомок как четвёртое
+// устройство» сломал бы обещание ТЗ о совместимости.
+func (s *Service) RotateKey(ctx context.Context, userID, parentID uuid.UUID, newPublicKey string) (db.Device, error) {
+	if _, err := ParsePublicKey(newPublicKey); err != nil {
+		return db.Device{}, ErrInvalidKey
+	}
+
+	var created db.Device
+	err := db.RunInTx(ctx, s.pool, func(q *db.Queries) error {
+		parent, err := q.DeviceByID(ctx, parentID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrForbiddenDevice
+		}
+		if err != nil {
+			return fmt.Errorf("device by id: %w", err)
+		}
+		if parent.UserID != userID {
+			return ErrForbiddenDevice
+		}
+		if parent.RevokedAt != nil {
+			return ErrNotLiveDevice
+		}
+		// Дубликат проверяется до вставки и до всего остального: повтор с ключом
+		// живого устройства обязан ответить duplicate_device, а не упереться в
+		// уникальный индекс посреди транзакции (как в Register).
+		if existing, err := q.DeviceByUserAndKey(ctx, db.DeviceByUserAndKeyParams{
+			UserID: userID, PublicKey: newPublicKey,
+		}); err == nil && existing.RevokedAt == nil {
+			return ErrDuplicateKey
+		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("lookup by key: %w", err)
+		}
+
+		created, err = q.InsertDevice(ctx, db.InsertDeviceParams{
+			ID: uuid.New(), UserID: userID, PublicKey: newPublicKey,
+			Platform: parent.Platform, Name: parent.Name, RotationOf: &parent.ID,
+		})
+		if err != nil {
+			if isUniqueViolation(err) {
+				return ErrDuplicateKey
+			}
+			return fmt.Errorf("insert rotated device: %w", err)
+		}
+
+		overlap := time.Now().Add(connections.RotationOverlap)
+		actives, err := q.RevokeAllActiveByDeviceServer(ctx, parent.ID)
+		if err != nil {
+			return fmt.Errorf("active profiles of %v: %w", parent.ID, err)
+		}
+		touched := make(map[uuid.UUID]bool, len(actives))
+		for _, row := range actives {
+			superseded, err := q.SupersedeProfile(ctx, db.SupersedeProfileParams{
+				ID: row.ID, OverlapValidUntil: &overlap,
+			})
+			if err != nil {
+				return fmt.Errorf("supersede profile %v: %w", row.ID, err)
+			}
+			// Тот же адрес и тот же срок: ротация ключа не продлевает доступ и не
+			// пересаживает клиента на другой адрес.
+			child, err := q.InsertProfile(ctx, db.InsertProfileParams{
+				ID: uuid.New(), DeviceID: created.ID, ServerID: superseded.ServerID,
+				AddressV4: superseded.AddressV4, ExpiresAt: superseded.ExpiresAt,
+			})
+			if err != nil {
+				return fmt.Errorf("insert rotated profile: %w", err)
+			}
+			oldID, newID := superseded.ID, child.ID
+			// Ссылка предка нужна не для порядка, а для желаемого множества:
+			// desired set снимает старого пиера только увидев, что у него есть
+			// преемник (задача 9).
+			if err := q.LinkRotatedProfile(ctx, db.LinkRotatedProfileParams{
+				ID: child.ID, RotateFrom: &oldID,
+			}); err != nil {
+				return fmt.Errorf("link rotated profile %v: %w", child.ID, err)
+			}
+			if err := q.ReassignAddress(ctx, db.ReassignAddressParams{
+				ServerID: superseded.ServerID, Address: superseded.AddressV4,
+				OldProfileID: &oldID, NewProfileID: &newID,
+			}); err != nil {
+				return fmt.Errorf("reassign address %v: %w", superseded.AddressV4, err)
+			}
+			touched[superseded.ServerID] = true
+
+			detail, err := json.Marshal(map[string]any{"rotated_from": superseded.ID.String()})
+			if err != nil {
+				return fmt.Errorf("marshal rotation detail: %w", err)
+			}
+			owner, childDevice := userID, created.ID
+			if err := q.InsertConnectionEvent(ctx, db.InsertConnectionEventParams{
+				UserID: &owner, DeviceID: &childDevice, ServerID: &superseded.ServerID,
+				Event: db.EventTypeProfileIssued, Detail: detail,
+			}); err != nil {
+				return fmt.Errorf("event rotated profile issued: %w", err)
+			}
+		}
+		// Версия поднимается один раз на затронутый сервер и только если трогать
+		// было что: bump без изменения набора пиеров заставил бы узел перечитать
+		// то же самое.
+		for serverID := range touched {
+			if _, err := q.BumpServerConfigVersion(ctx, serverID); err != nil {
+				return fmt.Errorf("bump config version of %v: %w", serverID, err)
+			}
+		}
+		// Предок отзывается последним: до этого момента он держит активные профили,
+		// и раньше отозвать его значило бы на секунду оставить устройство без
+		// ключа, по которому можно понять, что кому принадлежит.
+		if err := q.RevokeDevice(ctx, parent.ID); err != nil {
+			return fmt.Errorf("revoke parent device: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return db.Device{}, err
+	}
+	return created, nil
 }

@@ -86,6 +86,37 @@ func (q *Queries) ClaimAddress(ctx context.Context, arg ClaimAddressParams) (net
 	return address, err
 }
 
+const reassignAddress = `-- name: ReassignAddress :exec
+UPDATE tunnel_addresses SET allocated_to = $1
+ WHERE server_id = $2 AND address = $3
+   AND allocated_to = $4
+`
+
+type ReassignAddressParams struct {
+	NewProfileID *uuid.UUID
+	ServerID     uuid.UUID
+	Address      netip.Addr
+	OldProfileID *uuid.UUID
+}
+
+// §7.3: смена ключа не меняет IP клиента, поэтому профиль потомка получает тот же
+// address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
+// (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
+// следующий клиент получил бы адрес живого соединения.
+//
+// Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+// одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+// вызов, где их переставили, читается как правильный.
+func (q *Queries) ReassignAddress(ctx context.Context, arg ReassignAddressParams) error {
+	_, err := q.db.Exec(ctx, reassignAddress,
+		arg.NewProfileID,
+		arg.ServerID,
+		arg.Address,
+		arg.OldProfileID,
+	)
+	return err
+}
+
 const releaseAddressByProfile = `-- name: ReleaseAddressByProfile :exec
 UPDATE tunnel_addresses
    SET allocated_to = NULL, released_at = now(),
