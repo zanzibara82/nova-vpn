@@ -41,10 +41,10 @@ func Envelope(routes PatternResolver) http.Handler {
 		if allow := allowedMethods(routes, r); len(allow) > 0 {
 			w.Header().Set("Allow", strings.Join(allow, ", "))
 			WriteError(w, r, http.StatusMethodNotAllowed, ErrMethodNotAllowed,
-				"method not allowed for this route", map[string]any{"allowed": allow})
+				"метод не разрешён для этого маршрута", map[string]any{"allowed": allow})
 			return
 		}
-		WriteError(w, r, http.StatusNotFound, ErrNotFound, "route not found", nil)
+		WriteError(w, r, http.StatusNotFound, ErrNotFound, "маршрут не найден", nil)
 	})
 }
 

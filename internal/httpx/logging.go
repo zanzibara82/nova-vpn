@@ -131,7 +131,7 @@ func Logging(next http.Handler, routes PatternResolver, log *slog.Logger) http.H
 				// Если обработчик уже начал писать тело, дописывать конверт
 				// нельзя: клиент получил бы JSON в середине ответа.
 				WriteError(sw, req, http.StatusInternalServerError, ErrInternal,
-					"internal error", nil)
+					"внутренняя ошибка", nil)
 			}
 		}()
 
