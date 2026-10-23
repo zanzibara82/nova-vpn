@@ -28,6 +28,8 @@ type Querier interface {
 	LiveSubscriptionByUser(ctx context.Context, userID uuid.UUID) (LiveSubscriptionByUserRow, error)
 	LoadIdempotencyKey(ctx context.Context, arg LoadIdempotencyKeyParams) (IdempotencyKey, error)
 	LockUser(ctx context.Context, arg LockUserParams) error
+	// hashtextextended даёт bigint-ключ из uuid; lock держится до конца транзакции.
+	LockUserForDeviceCount(ctx context.Context, dollar_1 string) error
 	MarkDeviceSeen(ctx context.Context, id uuid.UUID) error
 	PlanBySlug(ctx context.Context, slug string) (PlanBySlugRow, error)
 	PlanIDBySlug(ctx context.Context, slug string) (uuid.UUID, error)
