@@ -761,7 +761,72 @@ SELECT server_id, observed_at, peers_configured, peers_handshaked,
        applied_config_version, status,
        agent_version, agent_uptime_sec
 FROM server_health WHERE server_id = $1;
+
+-- name: MarkObservedHealth :exec
+INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
+                           interface_rx_bytes, interface_tx_bytes, applied_config_version, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'ok')
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    peers_configured = EXCLUDED.peers_configured,
+    peers_handshaked = EXCLUDED.peers_handshaked,
+    interface_rx_bytes = EXCLUDED.interface_rx_bytes,
+    interface_tx_bytes = EXCLUDED.interface_tx_bytes,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok';
+
+-- name: MarkServerHealth :exec
+INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,
+                           applied_config_version, status, agent_version, agent_uptime_sec)
+VALUES ($1, $2, $3, $4, $5, 'ok', $6, $7)
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    load1 = EXCLUDED.load1,
+    cpu_pct = EXCLUDED.cpu_pct,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok',
+    agent_version = EXCLUDED.agent_version,
+    agent_uptime_sec = EXCLUDED.agent_uptime_sec;
+
+-- name: ObservedDevicesByPublicKeys :many
+SELECT d.id, d.user_id, d.public_key FROM devices d
+WHERE d.public_key = ANY(sqlc.arg(public_keys)::text[])
+  AND EXISTS (SELECT 1 FROM vpn_profiles p WHERE p.device_id = d.id AND p.server_id = sqlc.arg(server_id));
+
+-- name: RecordHandshake :exec
+-- Блокировка сервера в вызывающей транзакции сериализует проверку и вставку события.
+WITH inserted AS (
+    INSERT INTO connection_events (user_id, device_id, server_id, event, detail)
+    SELECT d.user_id, d.id, sqlc.arg(server_id)::uuid, 'handshake_observed',
+           jsonb_build_object('handshake_at', sqlc.arg(handshake_at)::timestamptz,
+                              'config_version', sqlc.arg(config_version)::bigint)
+    FROM devices d
+    WHERE d.id = sqlc.arg(device_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM connection_events e
+          WHERE e.server_id = sqlc.arg(server_id)::uuid AND e.device_id = d.id
+            AND e.event = 'handshake_observed'
+            AND (e.detail->>'handshake_at')::timestamptz >= sqlc.arg(handshake_at)::timestamptz
+      )
+    RETURNING device_id
+)
+UPDATE devices SET last_seen_at = GREATEST(last_seen_at, sqlc.arg(handshake_at)::timestamptz)
+WHERE id IN (SELECT device_id FROM inserted);
+
+-- name: ClaimTelemetryPacket :execrows
+-- Квитанция живёт дольше неподтверждённого пакета в Redis (48 часов).
+WITH expired AS (
+    DELETE FROM telemetry_receipts
+    WHERE server_id = $2 AND processed_at < now() - interval '49 hours'
+)
+INSERT INTO telemetry_receipts (id, server_id) VALUES ($1, $2)
+ON CONFLICT (id) DO NOTHING;
 ```
+
+Этот блок — итоговое состояние файла, а не снимок момента задачи 1: запросы
+`MarkObservedHealth`, `MarkServerHealth`, `ObservedDevicesByPublicKeys`,
+`RecordHandshake` и `ClaimTelemetryPacket` появляются вместе с телеметрией в задаче 10,
+и сверка `.scratch/plan_blocks.py` сравнивает с файлом оба блока.
 
 - [ ] **Step 9: `internal/db/query/admin.sql` — дословный исходник**
 
@@ -2431,11 +2496,20 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 **Files:**
 - Create: `internal/telemetry/delta.go`, `internal/telemetry/delta_test.go`,
   `internal/telemetry/service.go`, `tests/integration/telemetry_test.go`
-- Modify: `internal/db/query/telemetry.sql` (добавить `MarkServerHealth`, `SetDeviceSeen`)
+- Modify: `internal/db/query/telemetry.sql` (добавить `MarkObservedHealth`,
+  `MarkServerHealth`, `ObservedDevicesByPublicKeys`, `RecordHandshake`,
+  `ClaimTelemetryPacket`), `internal/db/telemetry.sql.go`, `internal/db/querier.go`,
+  `internal/db/models.go` (генерация sqlc)
+- Create: `migrations/0007_telemetry_receipts.up.sql`,
+  `migrations/0007_telemetry_receipts.down.sql`: квитанции обработки пакетов и индекс handshake
+- Modify: `tests/integration/net_queries_test.go` — `TestMigration0006UpDownUp` сверяет
+  применённую версию с последней миграцией из embedded FS, а не с цифрой 6: с 0007 в
+  наборе жёсткая проверка «applied == 6» падала бы на полностью применившемся наборе
 
 **Interfaces:**
-- Consumes: `UpsertServerHealth`, `UpsertDeviceDayTraffic`, `DevicesByPublicKeys`,
-  `InsertConnectionEvent`, `redis.Client`.
+- Consumes: `pgxpool.Pool`, `db.RunInTx`, `LockServerRow`, запросы телеметрии,
+  `InsertConnectionEvent`, `UpsertDeviceDayTraffic`, `ClaimTelemetryPacket`,
+  `redis.Client`.
 - Produces (пакет `telemetry`):
   - `func Delta(lastRx, lastTx, curRx, curTx int64, haveBase bool) (rx, tx int64, reset bool)`;
   - `func DayOf(now time.Time) time.Time`;
@@ -2446,7 +2520,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     `interface_tx_bytes`, `peers []PeerStat`, `applied_at` (JSON: `config_version`, …);
   - `type Heartbeat struct` — `agent_version`, `agent_uptime_sec`, `load1 *float64`,
     `cpu_pct *float64`, `applied_config_version`;
-  - `func NewService(q *db.Queries, rdb *redis.Client, log *slog.Logger) *Service`;
+  - `func NewService(pool *pgxpool.Pool, rdb *redis.Client, log *slog.Logger) *Service`;
+    пул нужен для атомарной записи и сериализации отчётов одного сервера;
+  - `ErrInvalidReport` — проверяется через `errors.Is` в узловом HTTP-слое;
   - `(s *Service) IngestObserved(ctx context.Context, serverID uuid.UUID, rep ObservedReport, now time.Time) error`;
   - `(s *Service) IngestHeartbeat(ctx context.Context, serverID uuid.UUID, hb Heartbeat, now time.Time) error`;
   - константы `PeerCountersTTL = 48 * time.Hour`, `HandshakeFresh = 3 * time.Minute`.
@@ -2458,16 +2534,6 @@ package telemetry
 
 import "time"
 
-// Delta — прирост счётчиков пиера между двумя отчётами узла.
-//
-// Отрицательного трафика не бывает, а счётчик WireGuard обнуляется при рестарте агента,
-// перезагрузке узла и при удалении пиера. Поэтому «cur < last» — это not «клиент отдал
-// байты назад», а reset: прирост считаем нулём и запоминаем новое основание. Складывать
-// отрицательную дельту в device_day_traffic значило бы тихо уменьшать чужую квоту.
-//
-// Последний аргумент — «основания не было вообще» (первый отчёт пиера или TTL бакета
-// истёк): он тоже даёт ноль, потому что отсутствие предыдущего замера не доказывает,
-// что трафика не было, но и не доказывает, что он был.
 func Delta(lastRx, lastTx, curRx, curTx int64, haveBase bool) (rx, tx int64, reset bool) {
 	switch {
 	case !haveBase:
@@ -2479,21 +2545,15 @@ func Delta(lastRx, lastTx, curRx, curTx int64, haveBase bool) (rx, tx int64, res
 	}
 }
 
-// DayOf — сутки агрегата `device_day_traffic` всегда в UTC: ключ (user, device, day)
-// не должен зависеть от часового пояса ни сервера, ни клиента.
 func DayOf(now time.Time) time.Time {
 	y, m, d := now.UTC().Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
-// CountHandshaked — сколько пиеров действительно живы на момент отчёта.
-// Считать «у latest_handshake вообще есть значение» нельзя: снятый, но ещё видимый
-// ядром пиер имеет старый handshake, и узел выглядел бы нагруженным чужими
-// соединениями.
 func CountHandshaked(peers []PeerStat, at time.Time, fresh time.Duration) int {
 	n := 0
 	for _, p := range peers {
-		if p.LatestHandshake != nil && p.LatestHandshake.After(at.Add(-fresh)) {
+		if p.LatestHandshake != nil && p.LatestHandshake.After(at.Add(-fresh)) && !p.LatestHandshake.After(at) {
 			n++
 		}
 	}
@@ -2505,95 +2565,249 @@ Unit-тест `internal/telemetry/delta_test.go` — схема, не исход
 обязана содержать: `haveBase=false` → `(0,0,false)`; рост `100→180`, `50→50` → `(80,0,false)`;
 падение обоих → `(0,0,true)`; падение только `tx` → `(0,0,true)` (основание сбрасывается по
 обоим счётчикам разом — иначе `rx` следующего цикла сравнится с «прошлым» из другой эпохи);
-нулевой прирост → `(0,0,false)`. `DayOf` — случай «16:30 +0500» обязан дать ту же дату, что
-«11:30 UTC», и случай перехода через полночь UTC. `CountHandshaked` — три пиера
-(свежий, старый, `nil`) → `1`.
+нулевой прирост → `(0,0,false)`, значения у границы int64. `DayOf` проверяется в UTC,
+положительном и отрицательном часовом поясе, включая смену даты. `CountHandshaked`
+считает только отметки из интервала `(now − fresh, now]`: старый, граничный, будущий
+handshake и `nil` не считаются. Будущая отметка не доказывает состоявшееся соединение.
 
-Run: `make unit`
-Expected: FAIL до реализации (`undefined: Delta`), PASS после.
+Run: модульные тесты в контейнере Go.
+Expected: сначала ошибки отсутствующих функций, затем поведенческие падения пустых
+заготовок; после реализации PASS. Отрицательные счётчики отсекаются на входе сервиса.
 
-- [ ] **Step 2: Запросы — дословный исходник, добавить в `internal/db/query/telemetry.sql`**
+- [ ] **Step 2: Запросы телеметрии и миграция квитанций — дословные исходники**
+
+Первый блок — `internal/db/query/telemetry.sql` целиком.
 
 ```sql
--- name: MarkServerHealth :exec
--- Heartbeat не приносит пиерных статистик, поэтому его upsert трогает только свои
--- колонки. Двойка 0,0 в peers_* при самой первой строке — честное «наблюдений ещё не
--- было», а не «пиеров нет»: их перетрёт первый observed. Один общий upsert на оба
--- сообщения (задача 1) для observed, здесь — второй, потому что иначе heartbeat каждый
--- раз обнулял бы счётчики, принесённые observed три секундой раньше.
+-- name: UpsertServerHealth :exec
+-- Один узел = одна строка наблюдаемого состояния; heartbeat и observed пишут её
+-- одними руками, поэтому наивный INSERT убивал бы второй отчёт того же узла.
 INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
                            interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
                            applied_config_version, status, agent_version, agent_uptime_sec)
-VALUES ($1, $2, 0, 0, 0, 0, $3::numeric, $4::numeric, $5, 'ok', $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (server_id) DO UPDATE SET
     observed_at            = EXCLUDED.observed_at,
+    peers_configured       = EXCLUDED.peers_configured,
+    peers_handshaked       = EXCLUDED.peers_handshaked,
+    interface_rx_bytes     = EXCLUDED.interface_rx_bytes,
+    interface_tx_bytes     = EXCLUDED.interface_tx_bytes,
     load1                  = EXCLUDED.load1,
     cpu_pct                = EXCLUDED.cpu_pct,
     applied_config_version = EXCLUDED.applied_config_version,
-    status                 = 'ok',
+    status                 = EXCLUDED.status,
     agent_version          = EXCLUDED.agent_version,
     agent_uptime_sec       = EXCLUDED.agent_uptime_sec;
 
--- name: SetDeviceSeen :one
--- last_seen_at — и поле ответа /devices (контракт A-1), и единственный дешёвый способ
--- понять, что handshake устройства наблюдаем ВПЕРВЫЕ: UPDATE с условием «пришёл момент
--- свежее уже записанного» возвращает строку ровно один раз на каждый новый handshake,
--- и событие handshake_observed не размножается каждым опросом узла. Дедупликация в БД,
--- а не в Redis, обязательна: снятие предка (§7.3) читает события, и отказ Redis не
--- имеет права превращать это в вечный overlap.
-UPDATE devices SET last_seen_at = $2
- WHERE id = $1 AND (last_seen_at IS NULL OR last_seen_at < $2)
- RETURNING id, user_id;
+-- name: InsertConnectionEvent :exec
+-- detail — jsonb из «только коды и версии»: содержимое трафика сюда не кладёт
+-- ни один путь этого плана (ТЗ §11).
+INSERT INTO connection_events (user_id, device_id, server_id, event, detail)
+VALUES ($1, $2, $3, $4, $5);
+
+-- name: UpsertDeviceDayTraffic :exec
+-- Прирост, а не абсолют: узел репортирует счётчики, дельту считает telemetry.Delta
+-- (задача 10), а здесь она складывается в агрегат устройство-сутки (ADR-006).
+INSERT INTO device_day_traffic (user_id, device_id, day, rx_bytes, tx_bytes)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (user_id, device_id, day) DO UPDATE SET
+    rx_bytes = device_day_traffic.rx_bytes + EXCLUDED.rx_bytes,
+    tx_bytes = device_day_traffic.tx_bytes + EXCLUDED.tx_bytes;
+
+-- name: DevicesByPublicKeys :many
+-- Узел называет пиеров публичным ключом; пользователь и устройство — то, чем
+-- этот ключ был выдан. Ключи, которых нет в базе (снятый, но ещё видимый на узле),
+-- просто не возвращаются.
+SELECT id, user_id, public_key FROM devices WHERE public_key = ANY($1::text[]);
+
+-- name: ServerHealthOf :one
+SELECT server_id, observed_at, peers_configured, peers_handshaked,
+       interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
+       applied_config_version, status,
+       agent_version, agent_uptime_sec
+FROM server_health WHERE server_id = $1;
+
+-- name: MarkObservedHealth :exec
+INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
+                           interface_rx_bytes, interface_tx_bytes, applied_config_version, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'ok')
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    peers_configured = EXCLUDED.peers_configured,
+    peers_handshaked = EXCLUDED.peers_handshaked,
+    interface_rx_bytes = EXCLUDED.interface_rx_bytes,
+    interface_tx_bytes = EXCLUDED.interface_tx_bytes,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok';
+
+-- name: MarkServerHealth :exec
+INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,
+                           applied_config_version, status, agent_version, agent_uptime_sec)
+VALUES ($1, $2, $3, $4, $5, 'ok', $6, $7)
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    load1 = EXCLUDED.load1,
+    cpu_pct = EXCLUDED.cpu_pct,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok',
+    agent_version = EXCLUDED.agent_version,
+    agent_uptime_sec = EXCLUDED.agent_uptime_sec;
+
+-- name: ObservedDevicesByPublicKeys :many
+SELECT d.id, d.user_id, d.public_key FROM devices d
+WHERE d.public_key = ANY(sqlc.arg(public_keys)::text[])
+  AND EXISTS (SELECT 1 FROM vpn_profiles p WHERE p.device_id = d.id AND p.server_id = sqlc.arg(server_id));
+
+-- name: RecordHandshake :exec
+-- Блокировка сервера в вызывающей транзакции сериализует проверку и вставку события.
+WITH inserted AS (
+    INSERT INTO connection_events (user_id, device_id, server_id, event, detail)
+    SELECT d.user_id, d.id, sqlc.arg(server_id)::uuid, 'handshake_observed',
+           jsonb_build_object('handshake_at', sqlc.arg(handshake_at)::timestamptz,
+                              'config_version', sqlc.arg(config_version)::bigint)
+    FROM devices d
+    WHERE d.id = sqlc.arg(device_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM connection_events e
+          WHERE e.server_id = sqlc.arg(server_id)::uuid AND e.device_id = d.id
+            AND e.event = 'handshake_observed'
+            AND (e.detail->>'handshake_at')::timestamptz >= sqlc.arg(handshake_at)::timestamptz
+      )
+    RETURNING device_id
+)
+UPDATE devices SET last_seen_at = GREATEST(last_seen_at, sqlc.arg(handshake_at)::timestamptz)
+WHERE id IN (SELECT device_id FROM inserted);
+
+-- name: ClaimTelemetryPacket :execrows
+-- Квитанция живёт дольше неподтверждённого пакета в Redis (48 часов).
+WITH expired AS (
+    DELETE FROM telemetry_receipts
+    WHERE server_id = $2 AND processed_at < now() - interval '49 hours'
+)
+INSERT INTO telemetry_receipts (id, server_id) VALUES ($1, $2)
+ON CONFLICT (id) DO NOTHING;
 ```
 
 Run: `make sqlc-generate && make vet`
-Expected: PASS; в `internal/db/telemetry.sql.go` появились оба метода, у `SetDeviceSeen`
-параметры `ID, LastSeenAt`.
+Expected: PASS; сгенерированы `MarkObservedHealth`, `MarkServerHealth`,
+`ObservedDevicesByPublicKeys` и `RecordHandshake`. Числовые nullable поля параметров
+имеют тип `*string`; `RecordHandshakeParams` содержит `HandshakeAt`, `ServerID`,
+`ConfigVersion`, `DeviceID`.
 
-- [ ] **Step 3: `IngestObserved` — схема, не исходник (порядок шагов менять нельзя)**
+`SetDeviceSeen` из прежнего плана не применяется: одно глобальное `last_seen_at`
+не может дедуплицировать handshake одного устройства на разных серверах. Новый
+`RecordHandshake` проверяет события конкретной пары сервер/устройство, вставляет
+событие и монотонно обновляет `last_seen_at` одним SQL-запросом. Вызывающая транзакция
+держит блокировку сервера, поэтому параллельные отчёты не проходят проверку одновременно.
 
-1. `DevicesByPublicKeys(keys)` → карта `public_key → (device_id, user_id)`. Ключей, которых
-   нет в базе, в карте нет: узел мог ещё не снять пиера после отзыва (окно применения), и
-   это не ошибка отчёта.
-2. `UpsertServerHealth` **до** разбора пиеров: `peers_configured = len(rep.Peers)`,
-   `peers_handshaked = CountHandshaked(rep.Peers, now, HandshakeFresh)`, интерфейсные
-   счётчики как есть, `applied_config_version = rep.ConfigVersion`, `status = 'ok'`,
-   `observed_at = now`, `agent_version`/`agent_uptime_sec` — `nil` (heartbeat их не
-   приносил, выдумывать нечем).
-3. События `handshake_observed` — по каждому известному пиеру с `LatestHandshake != nil`:
-   `SetDeviceSeen(deviceID, *LatestHandshake)`; вернул строку → `InsertConnectionEvent`
-   (`handshake_observed`, `device_id`, `server_id`, `user_id`,
-   `detail {"handshake_at": …,"config_version": …}`). Не вернул (строка не новее) → ничего:
-   дедупликация уже случилась в условии UPDATE.
-4. Дельты по байтам: для каждого известного пиера прочитать основание из Redis
-   (`HGETALL tsc:<server_id>:<device_id>`), посчитать `Delta`, записать текущие счётчики
-   (`HSET` + `PEXPIRE PeerCountersTTL` одним `Pipeline`). Если `rx+tx > 0` —
-   `UpsertDeviceDayTraffic(user_id, device_id, DayOf(now), rx, tx)`.
-5. `peer_applied` / `peer_removed` — diff множества публичных ключей против предыдущего
-   отчёта, сохранённого в Redis (`SMEMBERS`/`SADD`/`SREM peers:<server_id>` с тем же TTL).
-   Событие пишет только код и версию, без адресов и байт (§6).
+Три запроса (`MarkObservedHealth`, `ObservedDevicesByPublicKeys`, `RecordHandshake`)
+нужны потому, что прежний вариант плана писал health одним `UpsertServerHealth` с
+нулевыми чужими полями и искал пиеров глобальным `DevicesByPublicKeys`. Первый затирал
+heartbeat-колонки при каждом observed, второй сопоставлял ключ устройства с произвольным
+узлом и не различал владельцев одного ключа. `ClaimTelemetryPacket` закрывает третью
+дыру: без квитанции пакет, записанный в Redis до отката PostgreSQL, либо теряет дельты,
+либо начисляет их повторно.
 
-Правила отказов, которые обязана реализовать именно эта функция:
+Миграция 0007 — дословные исходники `migrations/0007_telemetry_receipts.up.sql`
+(блок 2) и `migrations/0007_telemetry_receipts.down.sql` (блок 3):
 
-- Ошибка Redis (шаги 4 и 5) — `s.log.Warn("telemetry: redis unavailable, counters skipped", …)`
-  и продолжение: health и события handshake уже записаны, а агрегат по байтам просто
-  не пополняется. Это то же решение, что и fail-open лимитера (§4.3): отказ кэша не должен
-  отрезать доступ, и не должен врать про трафик.
-- Ошибка БД на шаге 2 — вернуть: health этого отчёта не записан, и узел по своей стороне
-  повторит отчёт на следующем опросе (он шлёт его каждый цикл, а не один раз).
-- `RxBytes`/`TxBytes` `< 0` в отчёте — отклонить отчёт целиком (`validationError`, задача 11
-  отдаст `400`): отрицательный счётчик в дельте означает, что узел прислал не то, что мы
-  думаем, а молча сложить его в агрегат — испортить чужую статистику.
-- Пиер, absent в базе (ключ не известен), байты не агрегирует: без `user_id` некуда писать,
-  и придумывать пользователя по адресу — ровно та выдумка, которую запрещает ТЗ §19.3.
+```sql
+CREATE TABLE telemetry_receipts (
+    id uuid PRIMARY KEY,
+    server_id uuid NOT NULL REFERENCES vpn_servers(id) ON DELETE CASCADE,
+    processed_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX telemetry_receipts_server_time ON telemetry_receipts (server_id, processed_at);
+CREATE INDEX connection_events_handshake ON connection_events (server_id, device_id)
+    WHERE event = 'handshake_observed';
+```
+
+```sql
+DROP INDEX connection_events_handshake;
+DROP TABLE telemetry_receipts;
+```
+
+Квитанция живёт дольше неподтверждённого пакета (49 против 48 часов): иначе пакет
+успевает истечь, а квитанция о нём исчезнет, и повтор сообщения начнёт начисления
+заново. Отдельный частичный индекс нужен проверке «event уже был» — без него
+`RecordHandshake` на узле с десятками тысяч событий сканировал бы всю таблицу
+`connection_events`; полное покрытие по `(server_id, device_id)` здесь не нужно,
+другие выборки событий идут по индексам `created` и `user`.
+
+Run: `python .scratch/plan_blocks.py 10`, `make migrate-up && make migrate-down &&
+make migrate-up` либо тест up→down→up из задачи 5 A-1, затем `make sqlc-generate &&
+make vet`.
+Expected: 0 расхождений блоков; миграция применяется и откатывается без ошибок;
+сгенерированы `MarkObservedHealth`, `MarkServerHealth`, `ObservedDevicesByPublicKeys`,
+`RecordHandshake`, `ClaimTelemetryPacket` и `TelemetryReceipt`-модель.
+
+- [ ] **Step 3: `IngestObserved` — схема, не исходник**
+
+1. До любых записей проверить неотрицательность версии и всех счётчиков, отсутствие
+   повторяющихся ключей и ограничение в 4096 пиров. Ошибка — `ErrInvalidReport`.
+2. `db.RunInTx` и `LockServerRow(serverID.String())`. Поиск через
+   `ObservedDevicesByPublicKeys` ограничен устройствами с профилями этого сервера.
+   Ключ, которого нет на сервере, и ключ нескольких владельцев не сопоставляются
+   с произвольным устройством. Исторические профили нужны для наблюдения снятия.
+3. `MarkObservedHealth`: реальные интерфейсные счётчики, число пиров, свежие handshake,
+   версия и `observed_at = now`. Этот запрос не трогает поля heartbeat. В обратном
+   направлении `MarkServerHealth` не трогает счётчики и число пиров.
+4. Для известных устройств с непустым handshake не из будущего вызвать
+   `RecordHandshake`. Событие содержит время handshake и версию. Одинаковая или более
+   старая отметка для того же сервера не создаёт нового события. Общая отметка
+   устройства не уменьшается от более старого наблюдения другого сервера.
+5. Одним Redis Pipeline прочитать основания `tsc:<server_id>:<device_id>` и прошлое
+   множество `peers:<server_id>`. При отсутствии либо некорректности основания дельта
+   равна нулю. Сброс любого счётчика даёт ноль по обоим и отладочную запись без ключа.
+   TxPipeline того же шага сохраняет новые основания с TTL 48 часов, заменяет множество
+   ключей и удаляет основания исчезнувших устройств.
+6. Пакет начислений собирается целиком до записей в Redis: положительные дельты в
+   `device_day_traffic` за `DayOf(now)` (сутки фиксируются в пакете, а не в момент
+   применения) и изменения множества как `peer_applied`/`peer_removed` без адресов и
+   байтов в detail. Проверять `rx > 0 || tx > 0`, а не сумму, которая может переполнить
+   int64. Пакет имеет собственный `id` — он и есть квитанция.
+7. Пакет живёт в Redis до коммита PostgreSQL: тело в `tsp:<server_id>`, основания в
+   `tsc:<server_id>:<device_id>`. Перед началом работы с основаниями читается
+   `tsp:<server_id>`: непустой ключ означает «прежний пакет не подтверждён», тогда он
+   применяется первым и цикл повторяется — только после применения к текущему отчёту
+   применяются дельты.
+8. Применение пакета — `ClaimTelemetryPacket(id, server_id)`: `ON CONFLICT DO NOTHING`
+   под блокировкой сервера. Ноль строк означает «квитанция уже есть», пакет не
+   начисляется второй раз, и это единственный случай, когда Redis-квитанция удаляется
+   без применения. Подтверждение — Lua-скрипт, удаляющий `tsp:<server_id>` только если
+   значение равно подтверждённому телу: пакет более свежего отчёта не исчезает чужими
+   руками.
+9. Зафиксировать транзакцию, затем подтвердить пакет. Журнал содержит сервер, версию и
+   число пиров, не тело отчёта.
+
+Правила отказов:
+- Ошибка Redis при чтении или записи — предупреждение и пропуск байтовых агрегатов
+  и событий изменения множества; health и handshake сохраняются в PostgreSQL.
+- Ошибка PostgreSQL возвращается вызывающему и откатывает транзакцию, в том числе
+  событие handshake вместе с отметкой устройства. Неподтверждённый пакет остаётся в
+  Redis, и следующее сообщение узла применяет его до новых начислений.
+- Redis не участвует в транзакции PostgreSQL: точный однократный учёт держится квитанцией
+  в PostgreSQL, а не распределённой транзакцией. Если PostgreSQL откатил уже применённый
+  пакет, он применится заново при повторе; если пакет подтверждён, но отчёт узла не
+  дошёл до ответа, повтор сообщения не даёт двойной дельты.
+- Ошибка подтверждения пакета (Redis недоступен между коммитом и удалением ключа) —
+  предупреждение и выход из цикла: начисления уже зафиксированы, а повтор применит
+  пакет только если квитанция не совпадёт.
+- Тело пакета пишет только этот код, и ключ живёт 48 часов. Если он не разбирается,
+  пакет выбрасывается с предупреждением, а приём продолжается: возвращать ошибку
+  означало бы потерянную телеметрию узла на всё время жизни ключа. Начисления из
+  неразобранного тела утрачены — это ограниченная потеря, а не двойной учёт.
+- Неизвестные, чужие для узла и неоднозначные ключи не начисляют байты и не порождают
+  пользовательские события; численные показатели интерфейса сохраняются как наблюдение узла.
 
 - [ ] **Step 4: `IngestHeartbeat` — схема, не исходник**
 
 `MarkServerHealth(serverID, now, load1, cpu_pct, applied_config_version, agent_version,
 agent_uptime_sec)`. Отчёт отклоняется **до** обращения к БД, если `agent_version` длиннее 64
-символов, `agent_uptime_sec < 0`, `load1` вне `[0, 999]` или `cpu_pct` вне `[0, 100]`: на
-этих колонках уже стоят CHECK (миграции 0003 и 0006), и внятный `400` клиенту лучше, чем
-`22P02`/`22003`, которые наружу уйдут как `500` и затрут настоящий смысл отказа. Heartbeat
+символов или пуста, `agent_uptime_sec < 0`, версия конфигурации отрицательная,
+`load1` вне `[0, 999]` или `cpu_pct` вне `[0, 100]`. NaN и бесконечность также запрещены.
+Длина версии считается в символах; значения nullable numeric передаются как `*string`.
+`ErrInvalidReport` позволит HTTP-слою вернуть `400`, а не ошибку БД `500`. Heartbeat
 ничего не знает про пиеров и не трогает `device_day_traffic`. Оба метода пишут журнал без
 содержимого отчёта: только `server_id`, версия и число пиеров (§5.2 про журнал, ТЗ §15).
 
@@ -2605,22 +2819,45 @@ agent_uptime_sec)`. Отчёт отклоняется **до** обращени�
 | второй observed, rx+1000, tx+500 | агрегат прибавил ровно `1000/500`; `handshake_observed` **не** продублирован, если `latest_handshake` тот же; продублирован, если стал новее (проверка `count(*)` по событиям) |
 | счётчики упали (`rx` 5000 → 10) | дельта нулевая, агрегат не уменьшился, `reset` в журнале отладочным уровнем, `server_health.interface_rx_bytes` = новое значение |
 | пиер с неизвестным ключом | health посчитан, событий по нему нет, агрегат пуст |
-| observed → heartbeat | `agent_version` и `uptime` заполнены, `peers_configured` сохранилось из observed (не обнулилось) |
+| heartbeat → observed → heartbeat | оба типа сообщения сохраняют чужие поля; `NULL` нагрузки остаётся `NULL` |
 | heartbeat на узле без observed вообще | `server_health` создан, `peers_configured=0`, `status='ok'` |
 | `load1=nil`, `cpu_pct=nil` | в БД `NULL`, а не `0`; каталог (задача 2) по-прежнему отдаёт `load: null` |
 | Redis остановлен (тест: адрес `127.0.0.1:1`) | `IngestObserved` завершился без ошибки, health и `handshake_observed` записаны, `device_day_traffic` пусто; в журнале предупреждение |
-| diff множества 2 → 1 | ровно одно событие `peer_removed` на снятый ключ, одно `peer_applied` на добавленный в обратном переходе |
+| множество 1 → 0 → 0 → 1 | одно событие снятия; повтор пустого отчёта не дублирует событие; повторное появление создаёт применение и новое основание |
+| отрицательные счётчики, повтор ключа, неверные метрики heartbeat | `ErrInvalidReport` до записи health и событий |
+| ключ неизвестен, относится к другому узлу или неоднозначен | нет пользовательских событий и агрегатов, health сохранён |
+| handshake из будущего | не учитывается как состоявшийся и не меняет отметку устройства |
+| одно устройство на двух серверах | событие есть для каждого сервера; более старая отметка второго не уменьшает общий last_seen_at |
+| восемь параллельных одинаковых отчётов | прирост начислен один раз, новый handshake записан один раз |
+| TTL оснований и множества | между 47 и 48 часами; конкретное значение не проверяется, проверается что TTL выставлен |
+| журнал observed и heartbeat | содержит `server_id`, версию и число пиров; не содержит публичный ключ и байтовые значения |
+| PostgreSQL откатил транзакцию после записи пакета в Redis | дельта и событие не потеряны: повтор того же отчёта начисляет ровно `50/25` и одно `peer_applied` (отказ настоящий — переполнение `rx_bytes` CHECK) |
+| подтверждение пакета не прошло (перехвачен Lua-вызов) | неподтверждённый `tsp:<server_id>` остаётся; два повтора не удваивают агрегат; после успеха ключ удалён, `count(*) FROM telemetry_receipts` равно числу применённых пакетов |
+| 20 000 событий `handshake_observed` на двух узлах | `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` для проверки «event уже был» использует `connection_events_handshake` |
+| тело `tsp:<server_id>` не разбирается | приём продолжается: предупреждение, ключ выброшен, дельта текущего отчёта начислена; ошибка вместо этого означала бы потерянную телеметрию на 48 часов |
+| настоящая ротация → observed нового ключа → `Compute` | handshake нового ключа снимает старый ключ из набора узла (`TestTelemetryHandshakeClosesRotationOverlap`); сама логика набора проверена в задаче 9 |
 
-Run: `make unit && make vet && make integration`
+Run: `go test -count=1 ./...`, `go vet ./...`, `go vet -tags=integration ./...`,
+`go test -count=1 -tags=integration ./...` в контейнере Go, `gofmt -l` по изменённым
+пакетам и `git diff --check`. Параметры БД и Redis передаются через внешний env-файл
+(в `make integration` пароль уходит в аргументы командной строки — этот путь закрыт
+постоянным ограничением проекта); команды выполняются без конвейера, чтобы код выхода
+принадлежал самой проверке.
 Expected: PASS.
 
 - [ ] **Step 6: Коммит**
 
 ```bash
-git add internal/telemetry internal/db/query/telemetry.sql tests/integration/telemetry_test.go
+git add internal/telemetry internal/db/query/telemetry.sql internal/db/telemetry.sql.go \
+  internal/db/querier.go internal/db/models.go migrations/0007_telemetry_receipts.up.sql \
+  migrations/0007_telemetry_receipts.down.sql tests/integration/telemetry_test.go \
+  tests/integration/net_queries_test.go
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     commit -m "feat(telemetry): дельты пиерных счётчиков, health узла и события handshake"
 ```
+
+Отдельным коммитом — правка плана и `.scratch/plan_blocks.py` сверяются до него:
+`python .scratch/plan_blocks.py` обязана давать 0 расхождений.
 
 ---
 
