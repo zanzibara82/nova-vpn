@@ -19,3 +19,18 @@ func UserIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	id, ok := ctx.Value(userIDKey{}).(uuid.UUID)
 	return id, ok
 }
+
+type serverIDKey struct{}
+
+// WithServerID — то же, что WithUserID, только для узла: у запроса из
+// /internal/v1 субъект — сервер, а не человек. Нужен двум читателям: журналу
+// (какой узел стучался) и лимитеру (ключ бакета «на узел», а не «на путь»).
+func WithServerID(ctx context.Context, id uuid.UUID) context.Context {
+	noteServerID(ctx, id)
+	return context.WithValue(ctx, serverIDKey{}, id)
+}
+
+func ServerIDFromContext(ctx context.Context) (uuid.UUID, bool) {
+	id, ok := ctx.Value(serverIDKey{}).(uuid.UUID)
+	return id, ok
+}

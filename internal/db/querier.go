@@ -179,6 +179,10 @@ type Querier interface {
 	// revoked_at IS NULL: повторный отзыв не должен двигать отметку времени — по ней судят,
 	// когда доступ действительно перестал существовать.
 	RevokeDevices(ctx context.Context, dollar_1 []uuid.UUID) error
+	// Ротация гасит ровно предъявленный токен, а не «самый свежий токен узла»: у узла
+	// может быть два процесса, и отзыв по server_id лишил бы доступа тот, который
+	// ничего не просил.
+	RevokeNodeCredential(ctx context.Context, id uuid.UUID) (int64, error)
 	RevokeNodeCredentialsForServer(ctx context.Context, serverID uuid.UUID) (int64, error)
 	// overlap_valid_until не обнуляется: констрейнт profiles_peer_state требует
 	// ненулевого окна при peer_state='rotating_old_key', а тихое «починить» констрейнт

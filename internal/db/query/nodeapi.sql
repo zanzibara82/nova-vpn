@@ -17,6 +17,13 @@ RETURNING id, server_id, issued_at;
 UPDATE node_credentials SET revoked_at = now()
  WHERE server_id = $1 AND revoked_at IS NULL;
 
+-- name: RevokeNodeCredential :execrows
+-- Ротация гасит ровно предъявленный токен, а не «самый свежий токен узла»: у узла
+-- может быть два процесса, и отзыв по server_id лишил бы доступа тот, который
+-- ничего не просил.
+UPDATE node_credentials SET revoked_at = now()
+ WHERE id = $1 AND revoked_at IS NULL;
+
 -- name: BootstrapTokenByHash :one
 -- Здесь нет `revoked_at IS NULL` и `expires_at > now()`: различить «нет такого токена»,
 -- «просрочен» и «израсходован» должен сервис, чтобы в журнал попали разные причины,

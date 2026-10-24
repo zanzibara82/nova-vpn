@@ -211,6 +211,22 @@ func (q *Queries) RevokeBootstrapToken(ctx context.Context, id uuid.UUID) (Revok
 	return i, err
 }
 
+const revokeNodeCredential = `-- name: RevokeNodeCredential :execrows
+UPDATE node_credentials SET revoked_at = now()
+ WHERE id = $1 AND revoked_at IS NULL
+`
+
+// Ротация гасит ровно предъявленный токен, а не «самый свежий токен узла»: у узла
+// может быть два процесса, и отзыв по server_id лишил бы доступа тот, который
+// ничего не просил.
+func (q *Queries) RevokeNodeCredential(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeNodeCredential, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeNodeCredentialsForServer = `-- name: RevokeNodeCredentialsForServer :execrows
 UPDATE node_credentials SET revoked_at = now()
  WHERE server_id = $1 AND revoked_at IS NULL

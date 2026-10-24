@@ -17,7 +17,9 @@ import (
 	"github.com/novavpn/novavpn/internal/devices"
 	"github.com/novavpn/novavpn/internal/entitlements"
 	"github.com/novavpn/novavpn/internal/httpx"
+	"github.com/novavpn/novavpn/internal/nodeapi"
 	"github.com/novavpn/novavpn/internal/servers"
+	"github.com/novavpn/novavpn/internal/telemetry"
 )
 
 // Окна лимитов. Спецификация §5.2 требует «register/login — по IP и по аккаунту»,
@@ -45,6 +47,12 @@ const (
 	// окно на пользователя (ключ тот же userKey, что у dec.Auth).
 	profileIssuePerMin = 30.0
 	profileIssueBurst  = 5
+	// Узловые маршруты: bucket на сервер (§4.1). 120 в минуту — это polling desired
+	// раз в секунду с запасом на отчёты, а burst 10 держит «узёл стартовал и навалил
+	// десять вызовов сразу». Числа — решение цикла A-2: спецификация просит
+	// «отдельный лимит для узла», не называя их.
+	nodePerMin = 120.0
+	nodeBurst  = 10
 )
 
 // planSlug — единственный план A-1; он же seed из миграции 0003 (задача 4).
@@ -69,6 +77,11 @@ func NewRouter(d Deps) http.Handler {
 	// "/" здесь нет намеренно: с catch-all'ом Envelope теряет отличие 404 от 405.
 	mux := http.NewServeMux()
 
+	// Контракт узла строится до decorators: обёртка dec.Node берётся у самого
+	// модуля, чтобы проверка токена и маршруты опирались на один экземпляр
+	// Authenticator, иначе «кто этот узел» решалось бы в двух местах.
+	node := nodeapi.NewHandler(q, telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)
+
 	dec := httpx.Decorators{
 		// Закрытый маршрут: сначала проверка access JWT и denylist, потом bucket
 		// на пользователя. Порядок важен — userKey читает user id из контекста,
@@ -78,6 +91,14 @@ func NewRouter(d Deps) http.Handler {
 				lim.Middleware("user", httpx.RatePerMinute(userPerMin), userBurst, userKey)(next))
 		},
 		Anonymous: lim.Middleware("anon", httpx.RatePerMinute(anonPerMin), anonBurst, routeIPKey(mux)),
+		// Узел — тот же порядок, что у Auth: nodeKey читает server_id из контекста,
+		// а появляется он только после проверки токена. Обратно (лимитер до
+		// аутентификации) означало бы общий бакет «unknown» для всех чужих токенов
+		// и отсутствие лимита у настоящего узла.
+		Node: func(next http.Handler) http.Handler {
+			return node.NodeMiddleware()(
+				lim.Middleware("node", httpx.RatePerMinute(nodePerMin), nodeBurst, nodeKey)(next))
+		},
 	}
 
 	mux.HandleFunc("GET /debug/health", health)
@@ -98,6 +119,10 @@ func NewRouter(d Deps) http.Handler {
 		profileIssueBurst, userKey)
 	connections.NewHandler(connections.NewService(d.Pool, d.Ent),
 		httpx.NewIdempotency(httpx.NewPGIdempotency(d.Pool)), profileIssue).RegisterRoutes(mux, dec)
+
+	// Контракт узла монтируется здесь, а не выше: маршруты /internal/v1 не зависят
+	// от пользовательских, но собираются из того же пула и того же Redis.
+	node.RegisterRoutes(mux, dec)
 
 	// Порядок цепочки: request id (чтобы конверт 404 имел что поставить в
 	// request_id), журнал (видит и 429, и панику, и называет маршрут до диспетчера),
@@ -142,6 +167,18 @@ func userKey(r *http.Request) string {
 	id, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
 		return "anonymous"
+	}
+	return id.String()
+}
+
+// nodeKey — бакет на узел, а не на путь: один vpn-сервер, сломавший цикл desired,
+// не имеет права отъедать бюджет у остальных узлов, и тем более у чужих IP.
+// "unknown" — это запрос без принятого токена: у него нет субъекта, а отказ ему
+// всё равно вернётся до лимитера.
+func nodeKey(r *http.Request) string {
+	id, ok := httpx.ServerIDFromContext(r.Context())
+	if !ok {
+		return "unknown"
 	}
 	return id.String()
 }

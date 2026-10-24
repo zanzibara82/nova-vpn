@@ -21,6 +21,11 @@ import (
 const (
 	PeerCountersTTL = 48 * time.Hour
 	HandshakeFresh  = 3 * time.Minute
+	// MaxReportPeers — потолок пиеров в одном отчёте. Он нужен не телеметрии, а
+	// HTTP-слою: это граница, за которой «узел прислал мегабайты» превращается в
+	// отказ, а не в разбор. Наружу отдаётся здесь, чтобы число не размножилось
+	// копией в контракте узла (задача 11).
+	MaxReportPeers = 4096
 )
 
 var ErrInvalidReport = errors.New("telemetry: invalid report")
@@ -59,7 +64,7 @@ func NewService(pool *pgxpool.Pool, rdb *redis.Client, log *slog.Logger) *Servic
 }
 
 func (s *Service) IngestObserved(ctx context.Context, serverID uuid.UUID, rep ObservedReport, now time.Time) error {
-	if rep.ConfigVersion < 0 || rep.InterfaceRxBytes < 0 || rep.InterfaceTxBytes < 0 || len(rep.Peers) > 4096 {
+	if rep.ConfigVersion < 0 || rep.InterfaceRxBytes < 0 || rep.InterfaceTxBytes < 0 || len(rep.Peers) > MaxReportPeers {
 		return ErrInvalidReport
 	}
 	keys := make([]string, 0, len(rep.Peers))
