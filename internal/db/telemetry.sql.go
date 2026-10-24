@@ -12,6 +12,29 @@ import (
 	"github.com/google/uuid"
 )
 
+const claimTelemetryPacket = `-- name: ClaimTelemetryPacket :execrows
+WITH expired AS (
+    DELETE FROM telemetry_receipts
+    WHERE server_id = $2 AND processed_at < now() - interval '49 hours'
+)
+INSERT INTO telemetry_receipts (id, server_id) VALUES ($1, $2)
+ON CONFLICT (id) DO NOTHING
+`
+
+type ClaimTelemetryPacketParams struct {
+	ID       uuid.UUID
+	ServerID uuid.UUID
+}
+
+// Квитанция живёт дольше неподтверждённого пакета в Redis (48 часов).
+func (q *Queries) ClaimTelemetryPacket(ctx context.Context, arg ClaimTelemetryPacketParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimTelemetryPacket, arg.ID, arg.ServerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const devicesByPublicKeys = `-- name: DevicesByPublicKeys :many
 SELECT id, user_id, public_key FROM devices WHERE public_key = ANY($1::text[])
 `
@@ -67,6 +90,155 @@ func (q *Queries) InsertConnectionEvent(ctx context.Context, arg InsertConnectio
 		arg.ServerID,
 		arg.Event,
 		arg.Detail,
+	)
+	return err
+}
+
+const markObservedHealth = `-- name: MarkObservedHealth :exec
+INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
+                           interface_rx_bytes, interface_tx_bytes, applied_config_version, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'ok')
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    peers_configured = EXCLUDED.peers_configured,
+    peers_handshaked = EXCLUDED.peers_handshaked,
+    interface_rx_bytes = EXCLUDED.interface_rx_bytes,
+    interface_tx_bytes = EXCLUDED.interface_tx_bytes,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok'
+`
+
+type MarkObservedHealthParams struct {
+	ServerID             uuid.UUID
+	ObservedAt           time.Time
+	PeersConfigured      int32
+	PeersHandshaked      int32
+	InterfaceRxBytes     int64
+	InterfaceTxBytes     int64
+	AppliedConfigVersion int64
+}
+
+func (q *Queries) MarkObservedHealth(ctx context.Context, arg MarkObservedHealthParams) error {
+	_, err := q.db.Exec(ctx, markObservedHealth,
+		arg.ServerID,
+		arg.ObservedAt,
+		arg.PeersConfigured,
+		arg.PeersHandshaked,
+		arg.InterfaceRxBytes,
+		arg.InterfaceTxBytes,
+		arg.AppliedConfigVersion,
+	)
+	return err
+}
+
+const markServerHealth = `-- name: MarkServerHealth :exec
+INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,
+                           applied_config_version, status, agent_version, agent_uptime_sec)
+VALUES ($1, $2, $3, $4, $5, 'ok', $6, $7)
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    load1 = EXCLUDED.load1,
+    cpu_pct = EXCLUDED.cpu_pct,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok',
+    agent_version = EXCLUDED.agent_version,
+    agent_uptime_sec = EXCLUDED.agent_uptime_sec
+`
+
+type MarkServerHealthParams struct {
+	ServerID             uuid.UUID
+	ObservedAt           time.Time
+	Load1                *string
+	CpuPct               *string
+	AppliedConfigVersion int64
+	AgentVersion         *string
+	AgentUptimeSec       *int64
+}
+
+func (q *Queries) MarkServerHealth(ctx context.Context, arg MarkServerHealthParams) error {
+	_, err := q.db.Exec(ctx, markServerHealth,
+		arg.ServerID,
+		arg.ObservedAt,
+		arg.Load1,
+		arg.CpuPct,
+		arg.AppliedConfigVersion,
+		arg.AgentVersion,
+		arg.AgentUptimeSec,
+	)
+	return err
+}
+
+const observedDevicesByPublicKeys = `-- name: ObservedDevicesByPublicKeys :many
+SELECT d.id, d.user_id, d.public_key FROM devices d
+WHERE d.public_key = ANY($1::text[])
+  AND EXISTS (SELECT 1 FROM vpn_profiles p WHERE p.device_id = d.id AND p.server_id = $2)
+`
+
+type ObservedDevicesByPublicKeysParams struct {
+	PublicKeys []string
+	ServerID   uuid.UUID
+}
+
+type ObservedDevicesByPublicKeysRow struct {
+	ID        uuid.UUID
+	UserID    uuid.UUID
+	PublicKey string
+}
+
+func (q *Queries) ObservedDevicesByPublicKeys(ctx context.Context, arg ObservedDevicesByPublicKeysParams) ([]ObservedDevicesByPublicKeysRow, error) {
+	rows, err := q.db.Query(ctx, observedDevicesByPublicKeys, arg.PublicKeys, arg.ServerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ObservedDevicesByPublicKeysRow
+	for rows.Next() {
+		var i ObservedDevicesByPublicKeysRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.PublicKey); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const recordHandshake = `-- name: RecordHandshake :exec
+WITH inserted AS (
+    INSERT INTO connection_events (user_id, device_id, server_id, event, detail)
+    SELECT d.user_id, d.id, $2::uuid, 'handshake_observed',
+           jsonb_build_object('handshake_at', $1::timestamptz,
+                              'config_version', $3::bigint)
+    FROM devices d
+    WHERE d.id = $4
+      AND NOT EXISTS (
+          SELECT 1 FROM connection_events e
+          WHERE e.server_id = $2::uuid AND e.device_id = d.id
+            AND e.event = 'handshake_observed'
+            AND (e.detail->>'handshake_at')::timestamptz >= $1::timestamptz
+      )
+    RETURNING device_id
+)
+UPDATE devices SET last_seen_at = GREATEST(last_seen_at, $1::timestamptz)
+WHERE id IN (SELECT device_id FROM inserted)
+`
+
+type RecordHandshakeParams struct {
+	HandshakeAt   time.Time
+	ServerID      uuid.UUID
+	ConfigVersion int64
+	DeviceID      uuid.UUID
+}
+
+// Блокировка сервера в вызывающей транзакции сериализует проверку и вставку события.
+func (q *Queries) RecordHandshake(ctx context.Context, arg RecordHandshakeParams) error {
+	_, err := q.db.Exec(ctx, recordHandshake,
+		arg.HandshakeAt,
+		arg.ServerID,
+		arg.ConfigVersion,
+		arg.DeviceID,
 	)
 	return err
 }

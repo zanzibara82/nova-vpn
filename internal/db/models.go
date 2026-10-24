@@ -640,6 +640,12 @@ type SubscriptionPlan struct {
 	CreatedAt         time.Time
 }
 
+type TelemetryReceipt struct {
+	ID          uuid.UUID
+	ServerID    uuid.UUID
+	ProcessedAt time.Time
+}
+
 type TunnelAddress struct {
 	ServerID    uuid.UUID
 	Address     netip.Addr

@@ -6,7 +6,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"io/fs"
 	"net/netip"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,7 +19,33 @@ import (
 	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/db/migrate"
+	"github.com/novavpn/novavpn/migrations"
 )
+
+// latestMigration — номер последней миграции из embedded FS. Проверка «applied == 6»
+// устаревала на каждой новой миграции и впадала в ошибку вида «0006 не применилась»,
+// когда применился весь набор; здесь сравнивается именно полнота набора.
+func latestMigration(t *testing.T) uint {
+	t.Helper()
+	names, err := fs.Glob(migrations.FS, "*.up.sql")
+	if err != nil {
+		t.Fatalf("чтение embedded FS миграций: %v", err)
+	}
+	var max uint64
+	for _, name := range names {
+		n, err := strconv.ParseUint(strings.SplitN(name, "_", 2)[0], 10, 64)
+		if err != nil {
+			t.Fatalf("имя миграции %q не числовое: %v", name, err)
+		}
+		if n > max {
+			max = n
+		}
+	}
+	if max == 0 {
+		t.Fatal("в embedded FS нет ни одной миграции")
+	}
+	return uint(max)
+}
 
 // netFixture — пользователь, устройство и сервер. Меньше нельзя: профиль висит на
 // устройстве (FK), а адрес — на сервере, и «есть что отзывать» появляется только с
@@ -421,8 +450,8 @@ func TestMigration0006UpDownUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("первый up: %v", err)
 	}
-	if v != 6 {
-		t.Errorf("после up версия %d, ожидалось 6: 0006 не применилась", v)
+	if want := latestMigration(t); v != want {
+		t.Errorf("после up версия %d, ожидалось %d: набор миграций применился не полностью", v, want)
 	}
 	v2, err := migrate.Up(ctx, url)
 	if err != nil || v2 != v {

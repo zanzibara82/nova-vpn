@@ -45,6 +45,8 @@ type Querier interface {
 	// ON CONFLICT DO NOTHING вместо SELECT-then-INSERT: два одновременных повтора
 	// одного ключа не должны оба дойти до бизнес-логики.
 	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (int64, error)
+	// Квитанция живёт дольше неподтверждённого пакета в Redis (48 часов).
+	ClaimTelemetryPacket(ctx context.Context, arg ClaimTelemetryPacketParams) (int64, error)
 	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) error
 	// Одноразовость на уровне БД: UPDATE с условием used_at IS NULL отдаёт строку ровно
 	// одному из двух параллельных enroll.
@@ -122,15 +124,18 @@ type Querier interface {
 	// hashtextextended даёт bigint-ключ из uuid; lock держится до конца транзакции.
 	LockUserForDeviceCount(ctx context.Context, dollar_1 string) error
 	MarkDeviceSeen(ctx context.Context, id uuid.UUID) error
+	MarkObservedHealth(ctx context.Context, arg MarkObservedHealthParams) error
 	// Просроченный профиль становится 'expired' отдельной операцией (sweeper, задача 13),
 	// а не «тихо не отдаётся»: событие profile_expired обязано существовать (§6).
 	MarkProfileExpired(ctx context.Context, id uuid.UUID) (MarkProfileExpiredRow, error)
+	MarkServerHealth(ctx context.Context, arg MarkServerHealthParams) error
 	// «Узел не присылал heartbeat 3 интервала» (3 × 30 с = 90 с, §4.3). Возвращает
 	// server_id, чтобы на каждый переход записать событие node_stale.
 	MarkStaleHealth(ctx context.Context) ([]uuid.UUID, error)
 	NodeCredentialByHash(ctx context.Context, tokenHash []byte) (NodeCredentialByHashRow, error)
 	// Анти-фрод-столбец живёт 90 дней, сама семья при этом остаётся (§6).
 	NullOldRefreshIPs(ctx context.Context) (int64, error)
+	ObservedDevicesByPublicKeys(ctx context.Context, arg ObservedDevicesByPublicKeysParams) ([]ObservedDevicesByPublicKeysRow, error)
 	PlanBySlug(ctx context.Context, slug string) (PlanBySlugRow, error)
 	PlanIDBySlug(ctx context.Context, slug string) (uuid.UUID, error)
 	// Нужен после отзыва: RevokeProfile возвращает четыре колонки, а выдаче обязано
@@ -158,6 +163,8 @@ type Querier interface {
 	// Поклаговая разбивка (limit/offset) — то, ради чего §5.1 обещает «аудит»: список
 	// длиннее одного экрана, а фильтра по админу в A-2 нет намеренно (задача 12).
 	RecentAdminAudit(ctx context.Context, arg RecentAdminAuditParams) ([]AdminAuditLog, error)
+	// Блокировка сервера в вызывающей транзакции сериализует проверку и вставку события.
+	RecordHandshake(ctx context.Context, arg RecordHandshakeParams) error
 	// Ротация ищет семью по идентификатору из токена, а не по хэшу: именно это даёт
 	// детект переиспользования (секрет есть, но он не текущий → семья предательски отзывается).
 	RefreshByID(ctx context.Context, id uuid.UUID) (RefreshTokenFamily, error)
