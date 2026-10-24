@@ -293,6 +293,7 @@ docs/testing-status.md
   `BumpServerConfigVersion`, `BusyAddresses`, `ClaimAddress`, `ReleaseAddressByProfile`,
   `InsertProfile`, `DesiredCandidates`, `HandshakedDevicesAfter`, `SupersedeProfile`,
   `RevokeProfile`, `RevokeProfilesForDevices`, `NodeCredentialByHash`, `ConsumeBootstrapToken`,
+  `RevokeNodeCredential` (добавлена задачей 11: отзыв предъявленного токена при ротации),
   `UpsertServerHealth`, `UpsertDeviceDayTraffic`, `InsertConnectionEvent`, `AdminByEmail`,
   `InsertAdminAudit`, `ExpiredActiveProfiles`, `MarkStaleHealth`, …).
 - Типы после override'ов: `numeric` → `string` (nullable → `*string`), `date` → `time.Time`,
@@ -676,6 +677,13 @@ RETURNING id, server_id, issued_at;
 -- name: RevokeNodeCredentialsForServer :execrows
 UPDATE node_credentials SET revoked_at = now()
  WHERE server_id = $1 AND revoked_at IS NULL;
+
+-- name: RevokeNodeCredential :execrows
+-- Ротация гасит ровно предъявленный токен, а не «самый свежий токен узла»: у узла
+-- может быть два процесса, и отзыв по server_id лишил бы доступа тот, который
+-- ничего не просил.
+UPDATE node_credentials SET revoked_at = now()
+ WHERE id = $1 AND revoked_at IS NULL;
 
 -- name: BootstrapTokenByHash :one
 -- Здесь нет `revoked_at IS NULL` и `expires_at > now()`: различить «нет такого токена»,
@@ -2868,26 +2876,45 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `tests/integration/nodeapi_test.go`
 - Modify: `internal/httpx/context.go`, `internal/httpx/logging.go` (server_id в контексте и
   журнале), `internal/httpx/decorators.go` (третья обёртка — `Node`),
+  `internal/httpx/mux.go` (см. находку ниже: `Envelope` обязан диспетчеризовать через
+  `ServeMux.ServeHTTP`, иначе `PathValue("server_id")` пуст),
+  `internal/db/query/nodeapi.sql` и перегенерированный `internal/db/nodeapi.sql.go`
+  (`RevokeNodeCredential` — отзыв ровно предъявленного токена),
+  `internal/telemetry/service.go` (`MaxReportPeers`),
   `services/api/router.go` (монтаж `/internal/v1` и узловой лимитер).
   Правки `internal/config` нет: узловой токен бессрочен до отзыва и ротации, поэтому
   отдельного TTL в конфигурации не появляется.
+
+**Находка при исполнении (вне плана, исправлена этой же задачей):** `httpx.Envelope`
+диспетчеризовал запрос «по возвращённому хендлеру» (`handler, pattern := routes.Handler(r)`),
+а значения сегментов пути `{…}` проставляет только `ServeMux.ServeHTTP`. Каждый маршрут с
+id в пути — `DELETE /api/v1/devices/{id}`, `…/profiles/{server_id}`, весь `/internal/v1/nodes/{server_id}/*`
+— получал пустой `PathValue`. В A-1 это не всплыло, потому что тесты дёргали маршруты без
+джокеров. Исправление: `Envelope` принимает интерфейс `PatternResolver` (embed `http.Handler`
+плюс `Handler(*http.Request) (http.Handler, string)`) и вызывает `routes.ServeHTTP`, а регрессия
+— `internal/httpx/mux_test.go: TestEnvelopePassesWildcardPathValuesToHandler`.
 
 **Interfaces:**
 - Consumes: `auth.Bearer`, `db.Queries`, `devices.ParsePublicKey` (каноничность — единственный
   источник, задача 14 A-1), `servers.Compute`, `servers.DesiredSet`, `telemetry.Service`,
   `httpx.Limiter`, `httpx.Decorators.Node`.
 - Produces (пакет `nodeapi`):
-  - `func NewAuthenticator(q *db.Queries) *Authenticator` с
-    `(a *Authenticator) Middleware(next http.Handler) http.Handler`;
+  - `func NewAuthenticator(q *db.Queries, log *slog.Logger) *Authenticator` с
+    `(a *Authenticator) Middleware(next http.Handler) http.Handler`; у `Handler` —
+    `NodeMiddleware() func(http.Handler) http.Handler`, чтобы сборщик и маршруты
+    опирались на один экземпляр проверяющего;
   - `httpx.WithServerID(ctx, uuid.UUID) context.Context` и
     `httpx.ServerIDFromContext(ctx) (uuid.UUID, bool)`;
   - `type Handler` c `RegisterRoutes(mux *http.ServeMux, dec httpx.Decorators)` и
     `NewHandler(q *db.Queries, tel *telemetry.Service, log *slog.Logger) *Handler`;
-  - ошибки `ErrUnknownNode`, `ErrServerMismatch`, `ErrBootstrapInvalid`;
+  - sentinel-ошибок (`ErrUnknownNode`, `ErrServerMismatch`, `ErrBootstrapInvalid`) **нет**:
+    отказ узла наружу — это код HTTP + стабильный `httpx`-код, а различение причин нужно
+    только журналу, где оно живёт полем `reason`. Второй источник истины о причине был бы
+    способом начать сравнивать строки отказа;
   - JSON-типы контракта: `EnrollRequest{BootstrapToken, PublicKey string}`,
     `NodeTokenResponse{ServerID, NodeToken string}`;
-  - константу `maxNodePeers = 4096` (потолок разбора отчёта) и константы сборщика
-    `nodePerMin = 120.0`, `nodeBurst = 10` в `services/api/router.go`.
+  - константы сборщика `nodePerMin = 120.0`, `nodeBurst = 10` в `services/api/router.go`;
+    потолок разбора отчёта живёт рядом с валидацией отчёта — `telemetry.MaxReportPeers`.
 
 - [ ] **Step 1: Узловая аутентификация — схема, не исходник**
 
@@ -2899,8 +2926,13 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 3. `TouchNodeCredential(id)` — одна запись на запрос, без кэша: `last_used_at` нужен
    отзыву «неиспользуемого» токена (задача 12), и «примерно последний раз» для этого не
    годится.
-4. `httpx.WithServerID(r.Context(), cred.ServerID)` → дальше в `r.WithContext`.
-5. `Authenticator` не проверяет прав по маршрутам: «какой сервер» — всё, что знает узел, и
+4. `httpx.WithServerID(r.Context(), cred.ServerID)` → дальше в `r.WithContext`. Тот же
+   вызов дописывает субъекта и в аккумулятор журнала (`noteServerID` по образцу
+   `noteUserID`), иначе строка запроса от узла не отвечает на «кто стучался».
+5. В тот же контекст кладётся и `id` строки токена (неэкспортируемый `credentialKey`):
+   ротация обязана отзывать **предъявленный** токен, а не «самый свежий токен сервера» —
+   у узла может работать второй процесс со своим токеном.
+6. `Authenticator` не проверяет прав по маршрутам: «какой сервер» — всё, что знает узел, и
    это уже в контексте.
 
 Тест `internal/nodeapi/auth_test.go` (unit, fake-хранилище не нужен — проверяются только
@@ -2910,31 +2942,40 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - [ ] **Step 2: enroll — схема, не исходник**
 
 `POST /internal/v1/nodes/enroll` — **единственный** маршрут префикса, доступный без
-узлового токена (иначе enroll невозможен физически); монтируется под `dec.Node`, где
-`Node` для него = `dec.Anonymous`-подобная обёртка по IP (шаг 4).
+узлового токена (иначе enroll невозможен физически); монтируется под `dec.Anonymous` —
+бакет по паре (маршрут, IP), потому что `server_id` у ещё не зарегистрированного узла
+нет и ключа «на узел» для него взять неоткуда (шаг 4).
 
 1. Тело ≤ 1 MiB (`httpx.DecodeJSON`), `bootstrap_token` и `public_key` обязательны;
    `devices.ParsePublicKey(public_key)` → `400 invalid_request` + details `{"field":
    "public_key"}`.
-2. `BootstrapTokenByHash(sha256(token))` → четыре причины отказа различаются **в журнале**
+2. `BootstrapTokenByHash(sha256(token))` → семь причин отказа различаются **в журнале**
    (`log.Warn("node enroll refused", "reason", …, "server_id", …)`), а наружу уходит один
    `401 unauthenticated` с `"стартовый токен не принят"`: различение по ответу — оракул
    «какие токены существуют» для чужого узла.
-   Причины: `unknown`, `expired`, `used`, `revoked`.
-3. `ConsumeBootstrapToken(id)` → `pgx.ErrNoRows` означает «равно одновременно выиграл
-   другой enroll»: тот же `401`, причина `race` в журнале.
-6. `srv, err := q.ServerByID(serverID)`; `pgx.ErrNoRows` здесь означает «токен валиден, а
+   Причины: `unknown`, `used`, `revoked`, `expired`, `server_missing`, `key_mismatch`, `race`.
+3. `srv, err := q.ServerByID(bt.ServerID)`; `pgx.ErrNoRows` здесь означает «токен валиден, а
    сервера нет» — то есть испорченную операцию админа (FK на `vpn_servers` теоретически это
    исключает, а на практике это значит, что сервер удалили, не отозвав его токен). Ответ —
    `401 unauthenticated` (для узла это ровно одно: «пере-зарегистрируйся»), в журнал —
    `log.Error` с `server_id`: оставить такое состояние без сигнала значило бы, что оператор
    узнает о нём из «узел молчит».
+4. `srv.PublicKey != public_key` → тот же `401`, причина `key_mismatch`. Проверка стоит
+   **до** расходования: `ConsumeBootstrapToken` помечает токен израсходованным, и попытка
+   с опечаткой в ключе сожгла бы одноразовый токен, обязав админа перевыпускать его.
+   Сравнение строк здесь — сравнение ключей, потому что неканонических форм уже не бывает
+   (шаг 1, `ParsePublicKey`).
+5. `ConsumeBootstrapToken(id)` → `pgx.ErrNoRows` означает «равно одновременно выиграл
+   другой enroll»: тот же `401`, причина `race` в журнале. Одноразовость держит условие
+   `used_at IS NULL` в самом UPDATE, а не выборка «проверить потом».
+6. `RevokeNodeCredentialsForServer(serverID)` **перед** вставкой нового: перевыпуск
+   обязан гасить прежний, иначе украденный старый токен живёт вечно рядом с новым.
 7. `node_token = 32 байта crypto/rand → base64.RawURLEncoding`; в БД — только
    `sha256` (`InsertNodeCredential`, `rotated_from = nil`). Ответ содержит сам токен
    **один раз** и больше нигде его не возвращает: это секрет доступа узла, и recover
    его из журнала или из повтора ответа был бы способом переписать чужой узел.
-8. `RevokeNodeCredentialsForServer(serverID)` **перед** вставкой нового: перевыпуск
-   обязан гасить прежний, иначе украденный старый токен живёт вечно рядом с новым.
+8. Ответ — `200`, а не `201`: узел не создаёт объект от имени пользователя, он получает
+   пропуск к уже зарегистрированной за собой строке.
 9. Событие соединения на enroll не пишется: enroll — не событие туннеля, а
    `connection_events` описывает пиеров и доступ (§6). След административного действия —
    `node_enrolled` в `admin_audit_logs` на выдаче bootstrap-токена (задача 12), плюс
@@ -2944,10 +2985,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 | маршрут | поведение |
 |---|---|
-| `GET /internal/v1/nodes/{server_id}/desired` | `serverID != ServerIDFromContext` → `403 forbidden` («несовпадение сервера», §2 узел-самозванец). Иначе `servers.Compute(q, serverID, now)`, а `ETag` — `fmt.Sprintf("%q", "v"+strconv.FormatInt(set.ConfigVersion, 10))`: кавычки обязательны по RFC 9110, сравнение — строгое равенство строки заголовка. Совпавший `If-None-Match` → `304` без тела и без `Content-Type`. Полный ответ при этом всё равно собран, и это осознанно: версия живёт в той же строке сервера, что и `Compute`, а отдельный путь «только ETag» дал бы вторую реализацию одного правила отсечения ради экономии одной сериализации |
-| `POST …/observed` | `httpx.DecodeJSON` в `telemetry.ObservedReport`, `IngestObserved` → `204`; `400 invalid_request` на битое тело, на отрицательные счётчики и на `peers` больше `maxNodePeers = 4096` (потолок тела — единственная защита от «узел прислал мегабайты и мы их разобрали») |
+| `GET /internal/v1/nodes/{server_id}/desired` | `server_id` в пути не UUID → `400 invalid_request` + details `{"field": "server_id"}` (это дефект запроса, а не прав); `serverID != ServerIDFromContext` → `403 forbidden` («несовпадение сервера», §2 узел-самозванец). Иначе `servers.Compute(q, serverID, now)`, а `ETag` — `fmt.Sprintf("%q", "v"+strconv.FormatInt(set.ConfigVersion, 10))`: кавычки обязательны по RFC 9110, сравнение — строгое равенство строки заголовка. Совпавший `If-None-Match` → `304` без тела и без `Content-Type`. Полный ответ при этом всё равно собран, и это осознанно: версия живёт в той же строке сервера, что и `Compute`, а отдельный путь «только ETag» дал бы вторую реализацию одного правила отсечения ради экономии одной сериализации |
+| `POST …/observed` | `httpx.DecodeJSON` в `telemetry.ObservedReport`, `IngestObserved` → `204`; `400 invalid_request` на битое тело, на отрицательные счётчики и на `peers` больше `telemetry.MaxReportPeers = 4096` (потолок тела — единственная защита от «узел прислал мегабайты и мы их разобрали»; константа живёт в `telemetry`, рядом с валидацией, чтобы контракт узла не держал её копию) |
 | `POST …/heartbeat` | `telemetry.Heartbeat`, `IngestHeartbeat` → `204`, `400` на битое тело и `403` на чужой `server_id` |
-| `POST …/token/rotate` | новый токен тем же способом, что и на enroll; `InsertNodeCredential(rotated_from = текущий id)` → `RevokeNodeCredential(id)` ровно текущего → `200 NodeTokenResponse`. Порядок «вставил, потом отозвал предъявленный» обязателен: обратный порядок оставлял бы узел без доступа при ошибке вставки. Узел, потерявший ответ, уходит в enroll заново — цена conscious: висящие валидными оба токена удваивали бы поверхность украденного токена |
+| `POST …/token/rotate` | новый токен тем же способом, что и на enroll; `InsertNodeCredential(rotated_from = текущий id)` → `RevokeNodeCredential(id)` ровно текущего → `200 NodeTokenResponse`. Порядок «вставил, потом отозвал предъявленный» обязателен: обратный порядок оставлял бы узел без доступа при ошибке вставки. Узел, потерявший ответ, уходит в enroll заново — цена размена известна: висящие валидными оба токена удваивали бы поверхность украденного токена. Отзыв по `id`, а не по `server_id`: чужой процесс того же узла не обязан терять доступ из-за чужой ротации |
 | всё, кроме enroll | под `dec.Node`: аутентификация узла **до** лимитера по `server_id` (как `dec.Auth` в A-1: ключ бакета читает контекст, появляющийся только после проверки токена) |
 
 - [ ] **Step 4: Третья обёртка в `httpx.Decorators` — схема, не исходник**
@@ -2960,24 +3001,29 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 `Auth` и `Anonymous` не меняются ни поведением, ни порядком — существующие тесты A-1
 обязаны пройти без правок (проверка: `make unit && make integration` на этом шаге).
 
-В `services/api/router.go`:
+В `services/api/router.go` (`node` — уже собранный `nodeapi.NewHandler(q,
+telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)`, конструируется до `dec`, потому что
+обёртку отдаёт сам модуль):
 
 ```go
 	Node: func(next http.Handler) http.Handler {
-		return nodeapi.NewAuthenticator(q)(
+		return node.NodeMiddleware()(
 			lim.Middleware("node", httpx.RatePerMinute(nodePerMin), nodeBurst, nodeKey)(next))
 	},
 ```
 
 `nodeKey` — `server_id` из контекста, иначе `"unknown"`; enroll монтируется отдельно под
-`dec.Anonymous` (по IP), потому что у ещё не зарегистрированного узла `server_id` нет.
+`dec.Anonymous` (бакет по паре маршрут+IP), потому что у ещё не зарегистрированного узла
+`server_id` нет.
 
 - [ ] **Step 5: Интеграционный тест — `tests/integration/nodeapi_test.go`, схема, не исходник**
 
-Стенд: `httptest.NewServer(api.NewRouter(...))`? — нет, в существующей практике A-1
-тесты дёргают `mux` напрямую через `httptest.NewRecorder`; здесь так же, но **сквозь**
-настоящий роутер задачи 6 (чтобы проверка 404/405 и конверт были те же, что в проде).
-Fake-узел = последовательность HTTP-вызовов из теста.
+Стенд: `newRouter(t)` из задачи 18 — настоящий `api.NewRouter` за `httptest.NewServer`
+и чистый Redis (база 9, `FlushDB` на тест), чтобы проверка 404/405, конверт, журнал и
+оба лимитера были те же, что в проде. Fake-узел = последовательность HTTP-вызовов из
+теста. Отдельная ветка без сборщика (`nodeStandalone`, обёртки = passthrough) нужна
+только гонке enroll'ов: десять горутин сквозь `dec.Anonymous` упёрлись бы в бакет по IP
+и проверяли бы не одноразовость токена.
 
 | случай | ожидание |
 |---|---|
@@ -2985,6 +3031,8 @@ Fake-узел = последовательность HTTP-вызовов из т
 | enroll валидным токеном | `200`, `node_token` совпадает с `^[A-Za-z0-9_-]{43}$` (32 байта в base64url без дополнений), `server_id` = сервер токена; в `node_credentials` — только `sha256` от него, а не сам токен; повторный enroll тем же токеном → `401`, в журнале причина `used` |
 | два параллельных enroll одним токеном (10 горутин) | ровно один `200`, остальные `401`; в `node_credentials` одна активная строка на сервер |
 | desired с чужим токеном (`server_id` в пути ≠ токену) | `403 forbidden` |
+| desired с не-UUID в пути | `400 invalid_request`, поле в `details.field = server_id`; это НЕ 401 и НЕ 404: маршрут существует, токен принят, сломан путь |
+| enroll каноническим ключом чужого узла, а затем тем же токеном своим ключом | первый — `401`, второй — `200`: отказ по ключу не имеет права израсходовать одноразовый токен (порядок шага 2.4) |
 | desired без токена / с битым | `401` |
 | desired, первый вызов | `200`, `ETag` присутствует, JSON совпадает с §4.1 по именам полей, `peers` — массив (пустой, если профилей нет), приватных ключей нет (`checkEvidence`) |
 | desired с тем же `If-None-Match` | `304`, пустое тело |
@@ -2992,18 +3040,34 @@ Fake-узел = последовательность HTTP-вызовов из т
 | observed c `peers` (один известный ключ) | `204`, `server_health` заполнен, событие `handshake_observed` одно |
 | observed с отрицательным `rx_bytes` | `400 invalid_request` |
 | heartbeat после observed | `204`, `agent_version` в health, `peers_configured` сохранился |
-| token/rotate | `200` новый токен; старый → `401` на desired; новый → `200`; в `node_credentials` `rotated_from` = id первого |
-| 130 запросов desired одним узлом подряд | хотя бы один `429` с `Retry-After` (окно 120/мин, burst 10 — числа сборщика) |
-| журнал всех вызовов | нет ни одного из переданных токенов, есть `server_id` |
+| token/rotate | `200` новый токен; старый → `401` на desired; новый → `200`; в `node_credentials` `rotated_from` = id первого; вторая ротация ссылается на второй токен |
+| rotate при втором живом токене того же сервера | отзыв касается только предъявленного: чужой процесс продолжает получать `200`, живых токенов остаётся два (подмена отзыва на «по server_id» обязана упасть здесь) |
+| 130 запросов desired одним узлом подряд | хотя бы один `429` с числовым `Retry-After`, и первый `429` не позже ~15-го запроса: иначе сработало базовое окно по IP (burst 60), а бакета «на узел» (burst 10) в сборке нет |
+| два узла: у первого бакет исчерпан | у второго — `200`, и первый остаётся `429`: обратный порядок обёрток (лимитер до аутентификации) дал бы обоим общий бакет `"unknown"` |
+| журнал всех вызовов | нет ни одного из переданных токенов, есть `server_id`; проверяется разбором строк `msg=request` по маршруту, а не `Contains` по буферу — сервисные строки (`telemetry: heartbeat accepted`) содержат `server_id` и закрыли бы его отсутствие в строке запроса |
 
-Run: `make unit && make vet && make integration`
+Run: `go test ./... && go vet ./... && go vet -tags=integration ./... && gofmt -l .` и
+интеграционный набор в том же контейнере (`go test -tags=integration ./tests/integration/`,
+учётные данные через `--env-file`, а не в аргументах команды). Те же шаги по имени —
+`make unit`, `make vet`, `make integration`, но на хосте Windows Go нет, а `make integration`
+подставляет пароль в аргументы `docker exec`, поэтому прогон идёт контейнером напрямую.
 Expected: PASS.
 
-- [ ] **Step 6: Коммит**
+- [ ] **Step 6: Коммиты**
+
+Правка `httpx.Envelope` — отдельный коммит: это продовдефект сборки с собственной
+регрессией, и в одном коммите с контрактом узла он выглядел бы как «попутная» строка
+диффа, хотя ломал каждый маршрут с id в пути, включая устройства и профили A-2.
 
 ```bash
+git add internal/httpx/mux.go internal/httpx/mux_test.go
+git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
+    commit -m "fix(httpx): конверт диспетчеризует через ServeMux — PathValue доходит до хендлера"
+
 git add internal/nodeapi internal/httpx/context.go internal/httpx/logging.go \
-        internal/httpx/decorators.go services/api/router.go tests/integration/nodeapi_test.go
+        internal/httpx/decorators.go internal/db/query/nodeapi.sql internal/db/nodeapi.sql.go \
+        internal/db/querier.go internal/telemetry/service.go services/api/router.go \
+        tests/integration/nodeapi_test.go
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     commit -m "feat(nodeapi): контракт /internal/v1 — enroll, desired+ETag, отчёты, ротация токена"
 ```
@@ -3939,20 +4003,31 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 | путь | методы |
 |---|---|
-| `/internal/v1/nodes/enroll` | `POST`, `security: []`, тело `NodeEnrollRequest` → 201 `NodeToken`; 400, 401, 429 |
+| `/internal/v1/nodes/enroll` | `POST`, `security: []`, тело `NodeEnrollRequest` → 200 `NodeToken`; 400, 401, 429 |
 | `/internal/v1/nodes/{server_id}/desired` | `GET` под `nodeBearerAuth`; 200 `DesiredSet` + заголовок `ETag`, 304 **без тела** (отдельный response без `content`), 401, 403, 404, 429 |
 | `/internal/v1/nodes/{server_id}/observed` | `POST` → 204; 400, 401, 403, 429 |
 | `/internal/v1/nodes/{server_id}/heartbeat` | `POST` → 204; 400, 401, 403, 429 |
 | `/internal/v1/nodes/{server_id}/token/rotate` | `POST` → 200 `NodeToken`; 401, 403, 429 |
 
-Схемы: `DesiredSet{server_id, config_version, mtu, keepalive_sec, endpoint_host,
-endpoint_port, dns_servers[], allowed_ips[], peers[]}`, `Peer{public_key,
-allowed_ips[], endpoint_hint?, presplit?, persistent_keepalive?, comment}` — набор полей
-обязан совпасть с `servers.Peer` задачи 9 **по именам json-тегов**, а не по памяти;
+Схемы (по фактическим json-тегам, а не по памяти — правка после задачи 11, тест
+`TestNodeDesiredETagAndFieldNames` сверяет имена живьём):
+`DesiredSet{server_id, config_version, mtu, listen_port, dns_servers[], keepalive_sec,
+peers[], measured_at}`, `Peer{public_key, allowed_ips[], expires_at, state}` —
+`endpoint_host` с `endpoint_port` в набор не входят: узлу нужен порт прослушивания из
+`listen_port`, а адрес наружной стороны знает админ (задача 12), и `servers.Peer` задачи 9
+никогда не имел полей `endpoint_hint`, `presplit`, `persistent_keepalive`, `comment`;
 `NodeEnrollRequest{bootstrap_token, public_key}`, `NodeToken{server_id, node_token}`,
-`ObservedReport{server_id, applied_config_version, interface_rx_bytes, interface_tx_bytes,
-peers[{public_key, rx_bytes, tx_bytes, last_handshake_unix}]}`,
-`Heartbeat{server_id, agent_version, agent_uptime_sec, applied_config_version}`.
+`ObservedReport{config_version, applied_at, interface_rx_bytes, interface_tx_bytes,
+peers[{public_key, latest_handshake, rx_bytes, tx_bytes}]}`,
+`Heartbeat{agent_version, agent_uptime_sec, load1?, cpu_pct?, applied_config_version}` —
+имена берутся из json-тегов `telemetry.ObservedReport`, `telemetry.PeerStat` и
+`telemetry.Heartbeat` (задача 10), а `load1` с `cpu_pct` обязаны быть `nullable`:
+неизмеренное не превращается в ноль (§13.4).
+
+В телах отчётов поля `server_id` нет намеренно: субъект запроса — токен узла, а сервер,
+которому он принадлежит, берётся из пути и сверяется с токеном (задача 11). Второе
+указание сервера в теле означало бы, что узел может сообщить один id, а получить доступ
+по другому.
 
 `304` — единственный случай «ответ без тела» во всём контракте, и он обязан быть
 описан явно: клиент, который читает спецификацию как список тел, иначе станет искать
