@@ -2121,9 +2121,8 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 **Interfaces:**
 - Consumes: `DesiredCandidates`, `HandshakedDevicesAfter`, `ServerByID` (задача 1),
   `connections.NodeTunnelAddress` и `connections.RotationOverlap` (задачи 4 и 5).
-  Направление `servers → connections` разрешено и является единственным: запрет задачи 3
-  стоит на `connections → devices`, а зацикливание `servers ↔ connections` появилось бы,
-  умри адресная арифметика в другом месте.
+  Направление `servers → connections` разрешено; обратный импорт запрещён, чтобы
+  не возник цикл зависимостей. Адресная арифметика остаётся в `connections`.
 - Produces (пакет `servers`):
   - `type Peer struct` — JSON ровно как в примере спецификации §4.1: `public_key`,
     `allowed_ips` (массив строк CIDR), `expires_at` (RFC 3339 UTC), `state`
@@ -2134,25 +2133,45 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   - ошибку `ErrServerUnknown`;
   - непубличный `type candidate struct` и чистую `selectPeers`.
 
-- [ ] **Step 1: Чистое отсечение — дословный исходник (часть `internal/servers/desired.go`)**
+- [ ] **Step 1: Вычисление набора и чистое отсечение — дословный исходник `internal/servers/desired.go`**
 
 ```go
 package servers
 
 import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/novavpn/novavpn/internal/connections"
 	"github.com/novavpn/novavpn/internal/db"
 )
 
-// candidate — срез строки DesiredCandidates, достаточный для правила отсечения.
-// Отдельный тип нужен, чтобы чистая часть не зависела ни от sqlc, ни от БД: §9.1
-// требует проверять свойство desired set на случайных данных, а случайные данные
-// проще строить как структури, чем как строки результата запроса.
+type Peer struct {
+	PublicKey  string    `json:"public_key"`
+	AllowedIPs []string  `json:"allowed_ips"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	State      string    `json:"state"`
+}
+
+type DesiredSet struct {
+	ServerID      string    `json:"server_id"`
+	ConfigVersion int64     `json:"config_version"`
+	MTU           int       `json:"mtu"`
+	ListenPort    int       `json:"listen_port"`
+	DNSServers    []string  `json:"dns_servers"`
+	KeepaliveSec  int       `json:"keepalive_sec"`
+	Peers         []Peer    `json:"peers"`
+	MeasuredAt    time.Time `json:"measured_at"`
+}
+
 type candidate struct {
 	ProfileID       uuid.UUID
 	DeviceID        uuid.UUID
@@ -2165,10 +2184,60 @@ type candidate struct {
 	DeviceRevokedAt *time.Time
 }
 
-// selectPeers — единственное место, где решается, кто имеет право попасть в desired
-// set (спецификация §4.1). Порядок ответа — по адресу, а не по порядку строк: узел
-// сравнивает наборы как отсортированный список, и детерминированный порядок нужен
-// хотя бы для того, чтобы ETag не менялся от перестановки одинаковых пиеров.
+var ErrServerUnknown = errors.New("servers: server not found")
+
+func Compute(ctx context.Context, q *db.Queries, serverID uuid.UUID, now time.Time) (DesiredSet, error) {
+	srv, err := q.ServerByID(ctx, serverID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DesiredSet{}, ErrServerUnknown
+	}
+	if err != nil {
+		return DesiredSet{}, fmt.Errorf("servers: server by id: %w", err)
+	}
+	out := DesiredSet{
+		ServerID: serverID.String(), ConfigVersion: srv.ConfigVersion,
+		MTU: int(srv.Mtu), ListenPort: int(srv.ListenPort),
+		DNSServers:   []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()},
+		KeepaliveSec: int(srv.KeepaliveSec), Peers: []Peer{}, MeasuredAt: now.UTC(),
+	}
+	if srv.MaintenanceStatus != db.MaintenanceStatusOnline {
+		return out, nil
+	}
+	rows, err := q.DesiredCandidates(ctx, serverID)
+	if err != nil {
+		return DesiredSet{}, fmt.Errorf("servers: desired candidates: %w", err)
+	}
+	cands := make([]candidate, 0, len(rows))
+	ids := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		cands = append(cands, candidate{
+			ProfileID: row.ID, DeviceID: row.DeviceID, PublicKey: row.PublicKey,
+			Address: row.AddressV4, Status: row.Status, ExpiresAt: row.ExpiresAt,
+			OverlapUntil: row.OverlapValidUntil, RotateFrom: row.RotateFrom,
+			DeviceRevokedAt: row.DeviceRevokedAt,
+		})
+		if row.RotateFrom != nil {
+			ids = append(ids, row.DeviceID)
+		}
+	}
+	handshaked := make(map[uuid.UUID]bool)
+	if len(ids) > 0 {
+		observed, err := q.HandshakedDevicesAfter(ctx, db.HandshakedDevicesAfterParams{
+			ServerID: &serverID, CreatedAt: now.Add(-connections.RotationOverlap), Column3: ids,
+		})
+		if err != nil {
+			return DesiredSet{}, fmt.Errorf("servers: observed handshakes: %w", err)
+		}
+		for _, id := range observed {
+			if id != nil {
+				handshaked[*id] = true
+			}
+		}
+	}
+	out.Peers = selectPeers(cands, handshaked, now)
+	return out, nil
+}
+
 func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time) []Peer {
 	successor := make(map[uuid.UUID]candidate, len(cands))
 	for _, c := range cands {
@@ -2176,68 +2245,72 @@ func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time
 			successor[*c.RotateFrom] = c
 		}
 	}
-
-	peers := make([]Peer, 0, len(cands))
-	for _, c := range cands {
-		// Мёртвое устройство не имеет права быть в наборе, даже если его профиль по
-		// какой-то причине остался active: критерий приёмки 10 сформулирован как
-		// «ни при каких условиях», и проверка здесь дешевле дыры в туннеле.
-		if c.DeviceRevokedAt != nil {
-			continue
+	sorted := slices.Clone(cands)
+	slices.SortFunc(sorted, func(a, b candidate) int {
+		if order := a.Address.Compare(b.Address); order != 0 {
+			return order
 		}
+		return cmp.Compare(a.PublicKey, b.PublicKey)
+	})
+	peers := make([]Peer, 0, len(cands))
+	for _, c := range sorted {
 		if !c.ExpiresAt.After(now) {
 			continue
 		}
+		var state string
 		switch c.Status {
 		case db.ProfileStatusActive:
-			peers = append(peers, newPeer(c, string(db.PeerStateActive)))
+			if c.DeviceRevokedAt != nil {
+				continue
+			}
+			state = string(db.PeerStateActive)
 		case db.ProfileStatusSuperseded:
-			succ, ok := successor[c.ProfileID]
-			if !ok || succ.DeviceRevokedAt != nil || !succ.ExpiresAt.After(now) {
+			// Ротация отзывает старое устройство, но сохраняет его ключ до закрытия окна.
+			next, ok := successor[c.ProfileID]
+			if !ok || next.Status != db.ProfileStatusActive || next.DeviceRevokedAt != nil || !next.ExpiresAt.After(now) {
 				continue
 			}
-			if c.OverlapUntil == nil || !c.OverlapUntil.After(now) {
+			if c.OverlapUntil == nil || !c.OverlapUntil.After(now) || handshaked[next.DeviceID] {
 				continue
 			}
-			// Наблюдённый handshake нового ключа снимает старый немедленно (§7.3),
-			// не дожидаясь конца окна.
-			if handshaked[succ.DeviceID] {
-				continue
-			}
-			peers = append(peers, newPeer(c, string(db.PeerStateRotatingOldKey)))
+			state = string(db.PeerStateRotatingOldKey)
+		default:
+			continue
 		}
+		peers = append(peers, Peer{
+			PublicKey:  c.PublicKey,
+			AllowedIPs: []string{c.Address.String() + "/32"},
+			ExpiresAt:  c.ExpiresAt.UTC(),
+			State:      state,
+		})
 	}
-
-	sorted := slices.Clone(cands)
-	slices.SortFunc(sorted, func(a, b candidate) int { return a.Address.Compare(b.Address) })
-	byAddr := make(map[string]Peer, len(peers))
-	for _, p := range peers {
-		byAddr[p.AllowedIPs[0]] = p
+	counts := make(map[string]int, len(peers))
+	for _, peer := range peers {
+		counts[peer.PublicKey]++
 	}
-	out := make([]Peer, 0, len(peers))
-	for _, c := range sorted {
-		if p, ok := byAddr[c.Address.String()+"/32"]; ok {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func newPeer(c candidate, state string) Peer {
-	return Peer{
-		PublicKey: c.PublicKey,
-		// /32 — единственная разрешённая маска клиентского адреса: 32-битный хост в
-		// туннеле, а не подсеть (задача 3 проверяет это и на разборе).
-		AllowedIPs: []string{c.Address.String() + "/32"},
-		ExpiresAt:  c.ExpiresAt.UTC(),
-		State:      state,
-	}
+	// Ключ не уникален между пользователями; при коллизии нельзя выбирать владельца.
+	return slices.DeleteFunc(peers, func(peer Peer) bool {
+		return counts[peer.PublicKey] > 1
+	})
 }
 ```
 
-Сортировка через `byAddr`, а не `sort` по готовым `Peer`, потому что адрес есть у
-кандидата и он уникален в пределах узла (PK `tunnel_addresses`), а `Peer` адреса не
-хранит: дублировать адрес в ответе значило бы дать два источника одного факта.
+Сортируется копия кандидатов: сначала численно по IPv4, затем по публичному ключу.
+При ротации у предка и преемника один адрес, поэтому сворачивание через `byAddr`
+теряло бы один ключ и могло бы продублировать другой. Отзыв старого устройства
+в `RotateKey` не закрывает окно: `DeviceRevokedAt` проверяется для активного профиля
+и его преемника, но не запрещает сам `superseded` профиль. Отзыв через `DeleteDevice`
+снимает профили всей цепочки, поэтому они исключаются по статусу.
+
+Независимое ревью выявило ещё одну допустимую схемой ситуацию: одинаковый публичный
+ключ у разных пользователей (`devices_user_key` уникален только внутри пользователя).
+Если после отбора остались несколько профилей одного ключа, исключить **все** записи
+этого ключа, сохранив остальные. Выбор первого адреса скрывал бы неоднозначность
+владельца. Снятый профиль не участвует в подсчёте коллизий. Это отказ в доступе при
+неоднозначности, а не замена отдельного решения о глобальной уникальности ключей.
+
+Сначала написать тесты шагов 2 и 4, подтвердить падения на пустых реализациях, затем
+добавлять соответствующую часть исходника. Наличие исходника выше не меняет порядок TDD.
 
 - [ ] **Step 2: Падающий unit-тест — `internal/servers/desired_test.go`, схема, не исходник**
 
@@ -2248,17 +2321,18 @@ func newPeer(c candidate, state string) Peer {
   падение воспроизводилось;
 - генератор строит от 1 до 12 кандидатов: `ProfileID` и `DeviceID` — детерминированные из
   индекса (`uuid.MustParse` из `fmt.Sprintf` с фиксированным префиксом), `PublicKey` —
-  уникальный по индексу строка вида `k007` (чистая функция ключ не валидирует: каноничность
-  проверяет `devices`, задача 14 A-1), `Address` — `10.99.<i/250>.<i%250>`, уникальный;
+  уникальная строка вида `k007` (чистая функция ключ не валидирует: каноничность
+  проверяет `devices`, задача 14 A-1), `Address` — `10.99.0.<i+2>`;
 - `Status` — случайно из четырёх значений `db.ProfileStatus` (включая `revoked` и
   `expired`, хотя SQL их не отдаёт: функция обязана быть безопасной и без фильтра БД);
-- `ExpiresAt` — случайное «в прошлом» или «now+1с…30 сут»; `OverlapUntil` — `nil`,
-  «в прошлом» или «в будущем»; `DeviceRevokedAt` — `nil` или «в прошлом»;
-- `RotateFrom`: с вероятностью 1/3 указывает на **предыдущий** кандидат (`out[i-1]`), иначе
-  `nil`. Два правила, оба из-за ловушек: указатель брать нельзя (адрес элемента растущего
-  среза инвалидируется `append`, и `RotateFrom` указывал бы в мусор — копировать id в
-  локальную переменную), и цель обязана быть одна на предка (иначе карта `successor` выбрала
-  бы одного из двух преемников, а проверка-оракул в тесте видела бы другого);
+- `ExpiresAt` — случайное время в пределах 30 суток до или после `now`;
+  `OverlapUntil` — `nil` либо время в пределах 10 минут до или после `now`;
+  `DeviceRevokedAt` — `nil` или «в прошлом»;
+- `RotateFrom`: с вероятностью 1/3 ссылается на предыдущего кандидата, иначе `nil`.
+  При ссылке адрес наследуется от предка: разные ключи с одним IP обязательны для
+  проверки ротации. Идентификатор копируется в локальную переменную; утверждение
+  прежнего текста о висячем указателе после `append` было ошибочным — Go сохраняет
+  достижимый массив. В генераторе у предка не более одного прямого преемника;
 - `handshaked` — случайно помеченные `DeviceID` из тех же кандидатов.
 
 Инварианты, которые обязана проверять каждая итерация (проверка идёт по исходным
@@ -2266,53 +2340,53 @@ func newPeer(c candidate, state string) Peer {
 ту же функцию):
 
 1. каждый выданный `Peer` имеет `State` из `{active, rotating_old_key}`;
-2. у источника каждого выданного пиера `DeviceRevokedAt == nil` и `ExpiresAt.After(now)`;
-3. если источник — `superseded`: у него есть живой `active`-преемник (тот же критерий
-   времени и отзыва), окно открыто (`OverlapUntil != nil && After(now)`) и преемник **не**
-   в множестве наблюденных handshake;
-4. ни один пиер не выдан дважды (по `PublicKey`) и ни один `AllowedIPs` не содержит ничего,
-   кроме одного `/32`;
-5. `selectPeers` на **перевёрнутом** входе даёт результат, побайтово равный результату на
-   исходном (детерминированность и порядок);
-6. пиеров не больше кандидатов.
+2. у источника каждого пира `ExpiresAt.After(now)`; для `active` обязательны
+   `Status == active` и `DeviceRevokedAt == nil`;
+3. для `rotating_old_key` источник имеет статус `superseded` и живого `active`-преемника,
+   окно открыто (`OverlapUntil != nil && After(now)`), преемник не входит в множество
+   наблюдённых handshake. Старое устройство может быть отозвано самой ротацией;
+4. ни один пир не выдан дважды (по `PublicKey`), `AllowedIPs` содержит только адрес
+   источника с маской `/32`, а срок в ответе совпадает со сроком профиля;
+5. `selectPeers` на перевёрнутом входе даёт побайтово тот же JSON;
+6. пиров не больше кандидатов.
+
+Свойство безопасности само по себе пропустило бы всегда пустой ответ. Поэтому
+обязательны таблицы примеров: выдача активного пира, два разных ключа с общим IP,
+отозванный ротацией предок, снятие после handshake, границы срока и окна, отсутствие
+или неактивность преемника. Отдельная проверка числового порядка адресов `.2/.3/.10`,
+неизменности входного среза, UTC и пустого массива.
 
 Run: `make unit`
-Expected: FAIL до реализации (`undefined: selectPeers`), PASS после.
+Expected: FAIL до реализации: сначала отсутствуют типы и функция, затем пустая
+заготовка компилируется, но падает на ожидаемых пирах. После реализации — PASS.
 
 - [ ] **Step 3: `Compute` — схема, не исходник**
 
-1. `srv, err := q.ServerByID(ctx, serverID)`; `pgx.ErrNoRows` → `ErrServerUnknown` (для
-   nodeapi это `404`, и узел по нему уходит на повторный enroll, а не на пустой набор).
-2. `cands, err := q.DesiredCandidates(ctx, serverID)` → перекладывание в `[]candidate`:
-   `RotateFrom` (`*string` из-за `::text`) парсится `uuid.Parse`, ошибка парсинга —
-   `fmt.Errorf("servers: profile %s: bad rotate_from: %w", …)`, а не «пустой предок»:
-   молча потерять ссылку означало бы снять предка раньше окна.
-3. handshake-свидетельство: `ids` — `DeviceID` кандидатов с `RotateFrom != nil`; если
-   `len(ids) > 0`, один вызов
-   `q.HandshakedDevicesAfter(ctx, serverID, now.Add(-connections.RotationOverlap), ids)` →
-   `map[uuid.UUID]bool`. Почему порога достаточно: любое открытое окно длится ровно
-   `RotationOverlap`, значит любое релевантное событие не старше `now − RotationOverlap`;
-   более старые события (от уже закрытых ротаций) в выборку не попадают. Граница
-   сравнивается по `created_at` базы, а не по времени из отчёта узла: часы узла нам не
-   свидетели (задача 10).
-4. `srv.MaintenanceStatus != db.MaintenanceStatusOnline` → `Peers` = пустой **слайс**
-   (`[]Peer{}`, не `nil`: `nil` сериализуется в `null`, а контракт §4.1 обещает массив) и
-   никаких запросов за кандидатами. §7.6: `draining` → desired пуст; `maintenance` и
-   `retired` — тем более. MTU, порт, keepalive и версия при этом отдаются настоящие: узел
-   обязан видеть, что набор опустел именно по решению оператора.
-5. `DNSServers = []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()}` —
-   адрес рекурсора в туннеле это адрес `wg0` узла (§8, пример §4.1 `10.99.0.1` при пуле
-   `10.99.0.0/24`); вторых DNS в цикле A нет, и выдумывать `8.8.8.8` запрещает §8 же.
-6. `ConfigVersion: srv.ConfigVersion`, `MTU: int(srv.Mtu)`, `ListenPort: int(srv.ListenPort)`,
-   `KeepaliveSec: int(srv.KeepaliveSec)`, `MeasuredAt: now.UTC()`,
-   `ServerID: serverID.String()`.
-7. `Peers: selectPeers(cands, handshaked, now)` для online-узла.
+1. `srv, err := q.ServerByID(ctx, serverID)`; `pgx.ErrNoRows` → `ErrServerUnknown`.
+   Прочие ошибки запросов возвращаются с контекстом, а не превращаются в пустой набор.
+2. Собрать параметры: `ConfigVersion`, `MTU`, `ListenPort`, `KeepaliveSec` из сервера,
+   `MeasuredAt: now.UTC()`, `ServerID: serverID.String()`, `Peers: []Peer{}`.
+   `DNSServers = []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()}`:
+   единственный DNS — рекурсор узла в туннеле (§8).
+3. Если `MaintenanceStatus != online`, вернуть параметры с пустым массивом **до**
+   запроса кандидатов. Это относится к `draining`, `maintenance` и `retired` (§7.6).
+4. `DesiredCandidates(ctx, serverID)` переложить в `[]candidate`. `RotateFrom`
+   уже имеет тип `*uuid.UUID`, повторное строковое преобразование не требуется.
+5. `ids` — `DeviceID` кандидатов с `RotateFrom != nil`. При непустом списке вызвать
+   `HandshakedDevicesAfter` с `db.HandshakedDevicesAfterParams{ServerID: &serverID,
+   CreatedAt: now.Add(-connections.RotationOverlap), Column3: ids}`. Результат
+   `[]*uuid.UUID` преобразовать в `map[uuid.UUID]bool`, пропуская nil.
+   Любое релевантное событие открытого окна не старше `now − RotationOverlap`.
+   Порог включительный, сравнивается с `created_at` базы, не с часами узла.
+6. `Peers: selectPeers(cands, handshaked, now)` для online-узла.
 
 - [ ] **Step 4: Интеграционный тест — `tests/integration/desired_test.go`, схема, не исходник**
 
-Фикстуры — `seedServer`/`setServerOnline`/`seedDevice`/`seedProfile` из задачи 1, события —
-прямой `INSERT INTO connection_events … ('handshake_observed', …)` в тесте (создавать их
-через телеметрию здесь незачем: проверяется отсечение).
+Фикстуры — `seedServer`/`setServerOnline`/`seedDevice`/`seedProfile` из задачи 1.
+Пара ротации создаётся настоящими `Issue` и `RotateKey`: это проверяет совместимость
+с отзывом старого устройства и общим IP, а не только вручную собранные строки.
+События — прямой `INSERT INTO connection_events … ('handshake_observed', …)`:
+проверяется отсечение, а телеметрия появится в задаче 10.
 
 | случай | ожидание |
 |---|---|
@@ -2324,12 +2398,21 @@ Expected: FAIL до реализации (`undefined: selectPeers`), PASS пос
 | `superseded` с закрытым окном | предка нет |
 | `superseded` без преемника вообще | предка нет (иначе снятый ключ жил бы вечно) |
 | предок жив, преемник отозван (`revoked` профиль) | предка нет |
-| событие handshake **старше** `now − RotationOverlap` | предок остался: порог отсекает свидетельства закрытых ротаций |
-| `draining` | `peers` сериализуется в `[]`, версия и MTU — из строки сервера |
-| два вызова `Compute` подряд без изменений | побайтово одинаковый JSON (условие стабильности ETag, задача 11) |
-| сервер из `seedServer` в `maintenance` | `dns_servers = ["<база+1>"]`, `keepalive_sec` и `listen_port` совпадают со строкой |
+| событие handshake старше `now − RotationOverlap` на микросекунду | предок остался |
+| событие точно на границе `now − RotationOverlap` | предок снят |
+| событие другого узла или старого ключа | предок остался |
+| отозвано устройство преемника | обоих ключей нет |
+| выполнен `DeleteDevice` для преемника | вся цепочка отсутствует |
+| `draining`, `maintenance`, `retired` | `peers` сериализуется в `[]`, версия и настройки — из строки сервера |
+| два вызова `Compute` без изменений с одинаковым `now` | побайтово одинаковый JSON; при другом `now` меняется `measured_at` |
+| настройки сервера | `dns_servers = ["<база+1>"]`, MTU, версия, порт и keepalive совпадают со строкой; время UTC |
+| неизвестный сервер | `ErrServerUnknown`, не пустой набор |
+| один ключ у двух пользователей на одном узле | оба конфликтующих пира исключены, независимый ключ сохранён; после отзыва одного профиля второй снова выдаётся |
 
-Run: `make unit && make vet && make integration`
+Run: модульные тесты, `go vet ./...`, `go vet -tags=integration ./...` и интеграционные
+тесты в контейнере Go. Параметры БД передавать только через `--env-file` вне репозитория;
+текущая цель `make integration` передаёт пароль в аргументе и не используется.
+Команды запускаются без конвейера, чтобы код выхода принадлежал самой проверке.
 Expected: PASS.
 
 - [ ] **Step 5: Коммит**
