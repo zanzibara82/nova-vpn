@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -22,6 +23,55 @@ func (q *Queries) DeleteOldConnectionEvents(ctx context.Context) (int64, error) 
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const dormantActiveProfiles = `-- name: DormantActiveProfiles :many
+SELECT p.id, p.server_id, p.device_id, d.user_id
+FROM vpn_profiles p
+JOIN devices d ON d.id = p.device_id
+WHERE p.status = 'active' AND p.issued_at < $1
+  AND NOT EXISTS (
+      SELECT 1 FROM connection_events e
+       WHERE e.server_id = p.server_id AND e.device_id = p.device_id
+         AND e.event = 'handshake_observed' AND e.created_at >= p.issued_at)
+ORDER BY p.id
+`
+
+type DormantActiveProfilesRow struct {
+	ID       uuid.UUID
+	ServerID uuid.UUID
+	DeviceID uuid.UUID
+	UserID   uuid.UUID
+}
+
+// Порог приходит timestamptz'ом, вычисленным в Go (now.Add(-DormantAfter)), а не
+// interval-параметром: override'а на interval в sqlc.yaml нет, и $1::interval стал бы
+// pgtype.Interval — тот же сюрприз, что с InsertBootstrapToken в задаче 1.
+// Окно привязано к issued_at, а не к порогу: профиль, выданный вчера, обязан иметь
+// право быть новым, а handshake полгода назад для недельного dormancy — не доказательство.
+func (q *Queries) DormantActiveProfiles(ctx context.Context, issuedAt time.Time) ([]DormantActiveProfilesRow, error) {
+	rows, err := q.db.Query(ctx, dormantActiveProfiles, issuedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []DormantActiveProfilesRow
+	for rows.Next() {
+		var i DormantActiveProfilesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ServerID,
+			&i.DeviceID,
+			&i.UserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const expiredActiveProfiles = `-- name: ExpiredActiveProfiles :many

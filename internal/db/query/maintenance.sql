@@ -34,3 +34,19 @@ UPDATE refresh_token_families SET ip = NULL
 DELETE FROM idempotency_keys
  WHERE (completed_at IS NOT NULL AND completed_at < now() - interval '24 hours')
     OR (completed_at IS NULL AND created_at < now() - interval '7 days');
+
+-- name: DormantActiveProfiles :many
+-- Порог приходит timestamptz'ом, вычисленным в Go (now.Add(-DormantAfter)), а не
+-- interval-параметром: override'а на interval в sqlc.yaml нет, и $1::interval стал бы
+-- pgtype.Interval — тот же сюрприз, что с InsertBootstrapToken в задаче 1.
+-- Окно привязано к issued_at, а не к порогу: профиль, выданный вчера, обязан иметь
+-- право быть новым, а handshake полгода назад для недельного dormancy — не доказательство.
+SELECT p.id, p.server_id, p.device_id, d.user_id
+FROM vpn_profiles p
+JOIN devices d ON d.id = p.device_id
+WHERE p.status = 'active' AND p.issued_at < $1
+  AND NOT EXISTS (
+      SELECT 1 FROM connection_events e
+       WHERE e.server_id = p.server_id AND e.device_id = p.device_id
+         AND e.event = 'handshake_observed' AND e.created_at >= p.issued_at)
+ORDER BY p.id;

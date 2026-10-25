@@ -7,6 +7,7 @@ package db
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -77,6 +78,12 @@ type Querier interface {
 	// этот ключ был выдан. Ключи, которых нет в базе (снятый, но ещё видимый на узле),
 	// просто не возвращаются.
 	DevicesByPublicKeys(ctx context.Context, dollar_1 []string) ([]DevicesByPublicKeysRow, error)
+	// Порог приходит timestamptz'ом, вычисленным в Go (now.Add(-DormantAfter)), а не
+	// interval-параметром: override'а на interval в sqlc.yaml нет, и $1::interval стал бы
+	// pgtype.Interval — тот же сюрприз, что с InsertBootstrapToken в задаче 1.
+	// Окно привязано к issued_at, а не к порогу: профиль, выданный вчера, обязан иметь
+	// право быть новым, а handshake полгода назад для недельного dormancy — не доказательство.
+	DormantActiveProfiles(ctx context.Context, issuedAt time.Time) ([]DormantActiveProfilesRow, error)
 	// Профиль, у которого expires_at прошёл, но статус ещё 'active', — дыра: desired
 	// обязан его не отдавать (условие по времени в задаче 9), а «просрочено» как факт
 	// появляется только здесь (§6: событие profile_expired).

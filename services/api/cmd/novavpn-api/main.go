@@ -20,6 +20,7 @@ import (
 
 	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/config"
+	"github.com/novavpn/novavpn/internal/connections"
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/db/migrate"
 	"github.com/novavpn/novavpn/internal/entitlements"
@@ -145,6 +146,8 @@ func serve(cfg config.Config) error {
 
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	defer rdb.Close()
+
+	go connections.Run(ctx, connections.NewStore(pool), log, connections.DefaultSweepInterval)
 
 	handler := api.NewRouter(api.Deps{
 		Cfg: cfg, Pool: pool, RDB: rdb,
