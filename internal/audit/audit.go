@@ -48,27 +48,14 @@ func Do(ctx context.Context, pool *pgxpool.Pool, a Action, mutate func(*db.Queri
 		if err := mutate(q); err != nil {
 			return err
 		}
-		return Insert(ctx, q, a)
-	})
-}
-
-// Insert дописывает запись аудита запросами вызывающей стороны — то есть
-// транзакционными, когда Insert вызван изнутри mutate. Нужен одному случаю: решение,
-// которое по-честному записывается двумя действиями («узел отрезан» и «набор снят»),
-// не имеет права разбиваться на две транзакции, иначе журнал показал бы два шага там,
-// где оператор принимал один. check повторяется намеренно: вторая запись обязана
-// проходить те же границы, что и первая, а не «дописываться как попало».
-func Insert(ctx context.Context, q *db.Queries, a Action) error {
-	if err := check(a); err != nil {
-		return err
-	}
-	return q.InsertAdminAudit(ctx, db.InsertAdminAuditParams{
-		AdminID:    &a.AdminID,
-		Action:     a.Action,
-		TargetType: a.TargetType,
-		TargetID:   a.TargetID,
-		Reason:     a.Reason,
-		RequestID:  a.RequestID,
+		return q.InsertAdminAudit(ctx, db.InsertAdminAuditParams{
+			AdminID:    &a.AdminID,
+			Action:     a.Action,
+			TargetType: a.TargetType,
+			TargetID:   a.TargetID,
+			Reason:     a.Reason,
+			RequestID:  a.RequestID,
+		})
 	})
 }
 
