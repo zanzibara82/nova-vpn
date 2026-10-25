@@ -5,15 +5,20 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/config"
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/db/migrate"
@@ -22,13 +27,20 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:], os.Getenv); err != nil {
+	if err := run(os.Args[1:], os.Getenv, readStdin); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, getenv func(string) string) error {
+// readStdin — источник пароля для `admin create`. Пароль не берётся ни из argv
+// (виден в ps и в истории shell'а), ни из env-файла: это единственный фактор,
+// который у администратора не отозвать.
+func readStdin() ([]byte, error) {
+	return io.ReadAll(os.Stdin)
+}
+
+func run(args []string, getenv func(string) string, input func() ([]byte, error)) error {
 	fs := flag.NewFlagSet("novavpn-api", flag.ContinueOnError)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -62,11 +74,60 @@ func run(args []string, getenv func(string) string) error {
 		default:
 			return errors.New("usage: novavpn-api migrate up|all|version")
 		}
+	case "admin":
+		return createAdmin(cfg, fs.Args()[1:], input)
 	case "":
 		return errors.New("usage: novavpn-api serve|migrate <up|all>")
 	default:
 		return errors.New("usage: novavpn-api serve|migrate <up|all>")
 	}
+}
+
+// createAdmin — первый администратор в пустой базе. Аудит-записи у этого пути нет
+// намеренно: admin_audit_logs.admin_id — внешний ключ на admin_users, и «создал сам
+// себя» нечем записать до появления строки. След остаётся строкой stdout и created_at.
+func createAdmin(cfg config.Config, args []string, input func() ([]byte, error)) error {
+	fs := flag.NewFlagSet("admin", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.Arg(0) != "create" || fs.Arg(1) == "" {
+		return errors.New("usage: novavpn-api admin create <email>")
+	}
+	email := strings.TrimSpace(fs.Arg(1))
+
+	raw, err := input()
+	if err != nil {
+		return fmt.Errorf("read password from stdin: %w", err)
+	}
+	// Хвостовой перевод строки — от `echo`: обрезан он, а не пробелы внутри,
+	// потому что пробел в пароле — часть пароля.
+	password := strings.TrimRight(string(raw), "\r\n")
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		return fmt.Errorf("password: %w", err)
+	}
+
+	ctx := context.Background()
+	pool, err := db.Pool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	row, err := db.New(pool).InsertAdminUser(ctx, db.InsertAdminUserParams{
+		ID: uuid.New(), Email: email, PasswordHash: hash,
+	})
+	if err != nil {
+		// На admin_users UNIQUE только email, поэтому код 23505 здесь означает
+		// ровно одно — и скрипту раскатки нужен ненулевой выход, а не молчаливый успех.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return fmt.Errorf("администратор с таким email уже есть: %s", email)
+		}
+		return err
+	}
+	fmt.Printf("id %s\nemail %s\n", row.ID, row.Email)
+	return nil
 }
 
 func serve(cfg config.Config) error {

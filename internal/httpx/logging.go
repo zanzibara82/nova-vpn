@@ -27,6 +27,8 @@ type journal struct {
 	hasUser   bool
 	serverID  uuid.UUID
 	hasServer bool
+	adminID   uuid.UUID
+	hasAdmin  bool
 }
 
 type journalKey struct{}
@@ -66,6 +68,18 @@ func noteServerID(ctx context.Context, id uuid.UUID) {
 	}
 }
 
+// noteAdminID — то же для администратора. Вызывается из WithAdminID (задача 12) и
+// обязан быть безопасен без журнала. Email в журнал не кладётся: §10 и §15 запрещают
+// личности там, где есть id, а admin_id достаточно, чтобы сопоставить строку с
+// записью аудита.
+func noteAdminID(ctx context.Context, id uuid.UUID) {
+	if j, ok := ctx.Value(journalKey{}).(*journal); ok {
+		j.mu.Lock()
+		j.adminID, j.hasAdmin = id, true
+		j.mu.Unlock()
+	}
+}
+
 func (j *journal) attrs() []any {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -79,6 +93,9 @@ func (j *journal) attrs() []any {
 	}
 	if j.hasServer {
 		attrs = append(attrs, "server_id", j.serverID.String())
+	}
+	if j.hasAdmin {
+		attrs = append(attrs, "admin_id", j.adminID.String())
 	}
 	return attrs
 }

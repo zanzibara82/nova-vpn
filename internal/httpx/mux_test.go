@@ -291,3 +291,44 @@ func TestWithUserIDWithoutJournalDoesNotPanic(t *testing.T) {
 		t.Errorf("UserIDFromContext = (%v, %v), want (%v, true)", got, ok, id)
 	}
 }
+
+func TestLoggingCarriesAdminIDSeparatelyFromUser(t *testing.T) {
+	admin := uuid.New()
+	var buf bytes.Buffer
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/admin/audit", func(w http.ResponseWriter, r *http.Request) {
+		// Так делает admin.Middleware: id администратора появляется только после
+		// проверки токена, а строка журнала пишется снаружи.
+		ctx := WithAdminID(r.Context(), admin)
+		if got, ok := AdminIDFromContext(ctx); !ok || got != admin {
+			t.Errorf("AdminIDFromContext = (%v, %v), want (%v, true)", got, ok, admin)
+		}
+		if _, ok := UserIDFromContext(ctx); ok {
+			t.Error("admin id leaked into UserIDFromContext: субъекты обязаны различаться типом ключа")
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	w := httptest.NewRecorder()
+	chain(mux, slog.New(slog.NewJSONHandler(&buf, nil))).ServeHTTP(w,
+		httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	entry := jsonLine(t, &buf)
+	if got, _ := entry["admin_id"].(string); got != admin.String() {
+		t.Errorf("admin_id = %q, want %q", got, admin.String())
+	}
+	// Пустого user_id в строке быть не должно: маршрут не может иметь оба субъекта,
+	// и общая «универсальная» переменная субъекта здесь же сломала бы различие.
+	if _, ok := entry["user_id"]; ok {
+		t.Error("user_id present on an admin route")
+	}
+	// Email в журнал не кладётся (§10, §15): проверяем, что единственное поле
+	// личности — id, а не «admin_email» или «subject».
+	for k := range entry {
+		if strings.Contains(k, "email") {
+			t.Errorf("journal carries an identity field %q", k)
+		}
+	}
+}

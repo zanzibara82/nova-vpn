@@ -16,6 +16,10 @@ type Querier interface {
 	AddressOfProfile(ctx context.Context, allocatedTo *uuid.UUID) (netip.Addr, error)
 	AdminByEmail(ctx context.Context, email string) (AdminUser, error)
 	AdminByID(ctx context.Context, id uuid.UUID) (AdminByIDRow, error)
+	// Не UserByID: тот выбирает password_hash, а админ-просмотр не имеет права его
+	// даже читать. Отдельный запрос — способ «не создать возможность», а не «не забыть
+	// не показывать».
+	AdminUserView(ctx context.Context, id uuid.UUID) (AdminUserViewRow, error)
 	// Здесь нет `revoked_at IS NULL` и `expires_at > now()`: различить «нет такого токена»,
 	// «просрочен» и «израсходован» должен сервис, чтобы в журнал попали разные причины,
 	// а наружу уйти один отказ (задача 11).
@@ -112,6 +116,10 @@ type Querier interface {
 	// выдачу, где предка нет, а переписывать запрос задачи 1 под ротацию значило бы менять
 	// проверенный контракт. Отдельный запрос ставит то же поле в той же транзакции.
 	LinkRotatedProfile(ctx context.Context, arg LinkRotatedProfileParams) error
+	// Админский список серверов: то же, что каталог (§7 задачи 2), плюс служебное —
+	// maintenance_status, config_version и число активных профилей («сколько пиеров
+	// сорвётся при удалении», §7.6).
+	ListAllServers(ctx context.Context) ([]ListAllServersRow, error)
 	LiveBootstrapTokensOfServer(ctx context.Context, serverID uuid.UUID) ([]LiveBootstrapTokensOfServerRow, error)
 	LiveDevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error)
 	LiveSubscriptionByUser(ctx context.Context, userID uuid.UUID) (LiveSubscriptionByUserRow, error)
@@ -174,6 +182,10 @@ type Querier interface {
 	// перенос обязан быть атомарным по всем серверам, где устройство сидит.
 	RevokeAllActiveByDeviceServer(ctx context.Context, deviceID uuid.UUID) ([]RevokeAllActiveByDeviceServerRow, error)
 	RevokeAllFamiliesForUser(ctx context.Context, userID uuid.UUID) error
+	// Все профили пользователя, включая устройства, отозванные раньше: у предка из цепочки
+	// ротации мог остаться незакрытым overlap-окно, и «заблокировали — а пиер живёт» для
+	// заблокированного аккаунта недопустимо.
+	RevokeAllProfilesOfUser(ctx context.Context, userID uuid.UUID) ([]RevokeAllProfilesOfUserRow, error)
 	RevokeBootstrapToken(ctx context.Context, id uuid.UUID) (RevokeBootstrapTokenRow, error)
 	RevokeDevice(ctx context.Context, id uuid.UUID) error
 	// revoked_at IS NULL: повторный отзыв не должен двигать отметку времени — по ней судят,
@@ -209,11 +221,19 @@ type Querier interface {
 	ServerByID(ctx context.Context, id uuid.UUID) (VpnServer, error)
 	ServerConfigVersion(ctx context.Context, id uuid.UUID) (int64, error)
 	ServerHealthOf(ctx context.Context, serverID uuid.UUID) (ServerHealth, error)
+	// Порядок задаёт админ, а не планировщик: advisory-блокировки серверов в задаче 8
+	// берутся ровно в этом порядке, и у двух параллельных блокировок разных пользователей
+	// не будет способа зайти в клинч.
+	ServersOfUserProfiles(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
 	SetServerMaintenance(ctx context.Context, arg SetServerMaintenanceParams) (SetServerMaintenanceRow, error)
 	SupersedeProfile(ctx context.Context, arg SupersedeProfileParams) (VpnProfile, error)
 	// last_used_at — доказательство жизни токена: отзыв «неиспользуемого» без этого поля
 	// был бы слепым.
 	TouchNodeCredential(ctx context.Context, id uuid.UUID) error
+	// Суммарный объём на устройство за окно (окно передаёт хендлер: 30 суток по умолчанию).
+	// Абсолюты за произвольное окно, а не «весь срок»: весь срок — это device_day_traffic
+	// без границы, и он растёт быстрее, чем экран админа.
+	TrafficByUserSince(ctx context.Context, arg TrafficByUserSinceParams) ([]TrafficByUserSinceRow, error)
 	UnlockUser(ctx context.Context, id uuid.UUID) error
 	// Не COALESCE по каждому полю: `capacity_mbps = null` означает «заявленная ёмкость
 	// снята», а не «не присылали». Обновление приходит полным набором (задача 12),

@@ -30,14 +30,40 @@ type Issuer struct {
 
 var ErrInvalidToken = errors.New("access token is invalid")
 
-func NewIssuer(secret []byte, ttl time.Duration) *Issuer {
+// Два значения iss на одном секрете. Различить «это id пользователя» и «это id
+// администратора» по форме невозможно — оба uuid, — поэтому админский токен обязан
+// отклоняться пользовательской проверкой и наоборот на уровне claim'а, а не по догадке.
+// Иначе токен участника с id, совпавшим по длине, открывал бы /api/v1/admin/*.
+const (
+	issUser  = "novavpn-api"
+	issAdmin = "novavpn-admin"
+)
+
+func newIssuer(secret []byte, ttl time.Duration, iss string) *Issuer {
 	if len(secret) < 32 {
 		// config.Load уже это проверяет; проверка здесь — защита от прямого вызова
 		// (тесты, будущие внутренние команды), а не от пользователя.
 		panic("auth: JWT secret must be at least 32 bytes")
 	}
-	return &Issuer{secret: secret, ttl: ttl, iss: "novavpn-api"}
+	return &Issuer{secret: secret, ttl: ttl, iss: iss}
 }
+
+func NewIssuer(secret []byte, ttl time.Duration) *Issuer {
+	return newIssuer(secret, ttl, issUser)
+}
+
+// NewAdminIssuer — токен администратора. Refresh-пары у него нет: срок равен AccessTTL
+// (конфигурация не допускает больше 30 минут), а вход — маршрут под LoginGuard.
+// Срочного отзыва admin-токена в A-2 тоже нет: см. «чего сознательно нет в A-2» ниже.
+func NewAdminIssuer(secret []byte, ttl time.Duration) *Issuer {
+	return newIssuer(secret, ttl, issAdmin)
+}
+
+// TTL — срок, который Issuer реально подставляет в exp. Отдаётся наружу, потому что
+// ответ входа обязан назвать то же число, что стоит в токене: второй источник (config
+// в хендлере) обязан когда-нибудь разойтись с первым, и расхождение клиент увидит как
+// «токен протух раньше, чем обещали».
+func (i *Issuer) TTL() time.Duration { return i.ttl }
 
 func (i *Issuer) Issue(_ context.Context, userID uuid.UUID) (AccessToken, error) {
 	if userID == uuid.Nil {

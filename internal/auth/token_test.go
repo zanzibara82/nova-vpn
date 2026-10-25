@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -73,5 +74,34 @@ func TestParseRejectsExpiredAndWrongAlg(t *testing.T) {
 func TestIssueRefusesEmptyUserID(t *testing.T) {
 	if _, err := newTestIssuer(t).Issue(context.Background(), uuid.Nil); err == nil {
 		t.Fatal("nil user id issued a token")
+	}
+}
+
+func TestAdminAndUserIssuersRejectEachOther(t *testing.T) {
+	secret := bytes32("shared-secret-for-issuer-split-test")
+	user := NewIssuer(secret, 10*time.Minute)
+	admin := NewAdminIssuer(secret, 10*time.Minute)
+
+	uc, err := user.Issue(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("user issue: %v", err)
+	}
+	ac, err := admin.Issue(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("admin issue: %v", err)
+	}
+
+	if _, err := admin.Parse(uc.Value); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("admin issuer accepted a user token: %v", err)
+	}
+	if _, err := user.Parse(ac.Value); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("user issuer accepted an admin token: %v", err)
+	}
+	// Обратная проверка: свой токен обязан проходить, иначе две проверки выше проходили бы «на пустоте».
+	if _, err := admin.Parse(ac.Value); err != nil {
+		t.Errorf("admin issuer rejected its own token: %v", err)
+	}
+	if _, err := user.Parse(uc.Value); err != nil {
+		t.Errorf("user issuer rejected its own token: %v", err)
 	}
 }

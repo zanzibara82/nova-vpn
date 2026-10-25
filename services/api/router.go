@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/novavpn/novavpn/internal/admin"
 	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/config"
 	"github.com/novavpn/novavpn/internal/connections"
@@ -71,6 +72,11 @@ func NewRouter(d Deps) http.Handler {
 	lim := httpx.NewLimiter(d.RDB, d.Log)
 	deny := auth.NewRedisDenylist(d.RDB, d.Log)
 	iss := auth.NewIssuer(d.Cfg.JWTSecret, d.Cfg.AccessTTL)
+	// Второй Issuer на том же секрете: различить id участника и id администратора
+	// по форме нельзя (оба uuid), поэтому роль держится в claim'е iss, а не в догадке
+	// вызывающей стороны. Отдельного env-параметра для срока админ-токена нет: второе
+	// число, которое никто не просил, обязано когда-нибудь разойтись с первым.
+	issAdmin := auth.NewAdminIssuer(d.Cfg.JWTSecret, d.Cfg.AccessTTL)
 	sess := auth.NewSessionService(q, iss, deny, d.Cfg.RefreshTTL, d.Log)
 	guard := auth.NewLoginGuard(d.RDB, d.Log)
 
@@ -99,6 +105,16 @@ func NewRouter(d Deps) http.Handler {
 			return node.NodeMiddleware()(
 				lim.Middleware("node", httpx.RatePerMinute(nodePerMin), nodeBurst, nodeKey)(next))
 		},
+		// Админ — четвёртый класс доступа, а не «пользователь с другим id»: свой
+		// iss в токене, свой бакет лимитера и право на чужие данные. Порядок тот же,
+		// что у Auth и Node: adminKey читает admin_id из контекста, поэтому лимитер
+		// обязан идти после проверки токена. Числа окна совпадают с пользовательскими
+		// не потому, что это один бюджет, а потому что консоль оператора делает
+		// столько же кликов в минуту; бакеты при этом разные.
+		Admin: func(next http.Handler) http.Handler {
+			return admin.Middleware(issAdmin, d.Log)(
+				lim.Middleware("admin", httpx.RatePerMinute(userPerMin), userBurst, adminKey)(next))
+		},
 	}
 
 	mux.HandleFunc("GET /debug/health", health)
@@ -123,6 +139,11 @@ func NewRouter(d Deps) http.Handler {
 	// Контракт узла монтируется здесь, а не выше: маршруты /internal/v1 не зависят
 	// от пользовательских, но собираются из того же пула и того же Redis.
 	node.RegisterRoutes(mux, dec)
+
+	// Админский контур — последний: он делит с остальными и пул, и LoginGuard, и
+	// журнал, но не делит бакеты лимитеров. Маршрут входа смонтирован под
+	// dec.Anonymous, поэтому он существует до того, как кто-то получил токен.
+	admin.NewHandler(d.Pool, q, issAdmin, guard, d.Log).RegisterRoutes(mux, dec)
 
 	// Порядок цепочки: request id (чтобы конверт 404 имел что поставить в
 	// request_id), журнал (видит и 429, и панику, и называет маршрут до диспетчера),
@@ -179,6 +200,19 @@ func nodeKey(r *http.Request) string {
 	id, ok := httpx.ServerIDFromContext(r.Context())
 	if !ok {
 		return "unknown"
+	}
+	return id.String()
+}
+
+// adminKey — бакет на администратора, а не на IP: операторы сидят в одной сети, где
+// адрес один на всех, и общий по IP бакет означал бы, что один человек с открытой
+// консолью исчерпывает бюджет коллег. Без admin_id ключом становится IP — это ветка
+// для маршрута, смонтированного без dec.Admin (опечатка в сборке), а не для
+// отклонённого токена: отказ выдаёт сам Middleware и до лимитера не доходит.
+func adminKey(r *http.Request) string {
+	id, ok := httpx.AdminIDFromContext(r.Context())
+	if !ok {
+		return ipKey(r)
 	}
 	return id.String()
 }

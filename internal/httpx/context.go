@@ -34,3 +34,20 @@ func ServerIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	id, ok := ctx.Value(serverIDKey{}).(uuid.UUID)
 	return id, ok
 }
+
+type adminIDKey struct{}
+
+// WithAdminID — копия пары WithUserID с собственным ключом. «Универсальный» ключ
+// субъекта здесь запрещён намеренно: админ — не «пользователь с другим id», а другой
+// класс доступа (другой iss, другой бакет лимитера, право на чужие данные), и опечатка
+// в хендлере, прочитавшая id админа как id пользователя, с общим ключом была бы
+// неотличима от исправного кода.
+func WithAdminID(ctx context.Context, id uuid.UUID) context.Context {
+	noteAdminID(ctx, id)
+	return context.WithValue(ctx, adminIDKey{}, id)
+}
+
+func AdminIDFromContext(ctx context.Context) (uuid.UUID, bool) {
+	id, ok := ctx.Value(adminIDKey{}).(uuid.UUID)
+	return id, ok
+}

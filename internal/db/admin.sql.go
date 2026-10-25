@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"net/netip"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +43,39 @@ func (q *Queries) AdminByID(ctx context.Context, id uuid.UUID) (AdminByIDRow, er
 	row := q.db.QueryRow(ctx, adminByID, id)
 	var i AdminByIDRow
 	err := row.Scan(&i.ID, &i.Email, &i.CreatedAt)
+	return i, err
+}
+
+const adminUserView = `-- name: AdminUserView :one
+SELECT id, email, display_name, status, locked_reason, locale, created_at
+FROM users WHERE id = $1
+`
+
+type AdminUserViewRow struct {
+	ID           uuid.UUID
+	Email        string
+	DisplayName  *string
+	Status       UserStatus
+	LockedReason *string
+	Locale       string
+	CreatedAt    time.Time
+}
+
+// Не UserByID: тот выбирает password_hash, а админ-просмотр не имеет права его
+// даже читать. Отдельный запрос — способ «не создать возможность», а не «не забыть
+// не показывать».
+func (q *Queries) AdminUserView(ctx context.Context, id uuid.UUID) (AdminUserViewRow, error) {
+	row := q.db.QueryRow(ctx, adminUserView, id)
+	var i AdminUserViewRow
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.DisplayName,
+		&i.Status,
+		&i.LockedReason,
+		&i.Locale,
+		&i.CreatedAt,
+	)
 	return i, err
 }
 
@@ -97,6 +131,77 @@ func (q *Queries) InsertAdminUser(ctx context.Context, arg InsertAdminUserParams
 	return i, err
 }
 
+const listAllServers = `-- name: ListAllServers :many
+SELECT s.id, s.name, s.advertised_host, s.listen_port, s.public_key,
+       s.address_pool_v4, s.mtu, s.keepalive_sec, s.config_version,
+       s.maintenance_status, s.provider, s.region, s.capacity_mbps,
+       l.country_code, l.city,
+       (SELECT count(*) FROM vpn_profiles p
+         WHERE p.server_id = s.id AND p.status = 'active')::int AS peers_active
+FROM vpn_servers s
+JOIN server_locations l ON l.id = s.location_id
+ORDER BY s.name, s.id
+`
+
+type ListAllServersRow struct {
+	ID                uuid.UUID
+	Name              string
+	AdvertisedHost    string
+	ListenPort        int32
+	PublicKey         string
+	AddressPoolV4     netip.Prefix
+	Mtu               int32
+	KeepaliveSec      int32
+	ConfigVersion     int64
+	MaintenanceStatus MaintenanceStatus
+	Provider          string
+	Region            *string
+	CapacityMbps      *int32
+	CountryCode       string
+	City              string
+	PeersActive       int32
+}
+
+// Админский список серверов: то же, что каталог (§7 задачи 2), плюс служебное —
+// maintenance_status, config_version и число активных профилей («сколько пиеров
+// сорвётся при удалении», §7.6).
+func (q *Queries) ListAllServers(ctx context.Context) ([]ListAllServersRow, error) {
+	rows, err := q.db.Query(ctx, listAllServers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAllServersRow
+	for rows.Next() {
+		var i ListAllServersRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.AdvertisedHost,
+			&i.ListenPort,
+			&i.PublicKey,
+			&i.AddressPoolV4,
+			&i.Mtu,
+			&i.KeepaliveSec,
+			&i.ConfigVersion,
+			&i.MaintenanceStatus,
+			&i.Provider,
+			&i.Region,
+			&i.CapacityMbps,
+			&i.CountryCode,
+			&i.City,
+			&i.PeersActive,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recentAdminAudit = `-- name: RecentAdminAudit :many
 SELECT id, admin_id, action, target_type, target_id, reason, request_id, created_at
 FROM admin_audit_logs
@@ -129,6 +234,131 @@ func (q *Queries) RecentAdminAudit(ctx context.Context, arg RecentAdminAuditPara
 			&i.Reason,
 			&i.RequestID,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const revokeAllProfilesOfUser = `-- name: RevokeAllProfilesOfUser :many
+UPDATE vpn_profiles p
+   SET status = 'revoked', revoked_at = now()
+  FROM devices d
+ WHERE p.device_id = d.id
+   AND d.user_id = $1
+   AND p.status IN ('active', 'superseded')
+ RETURNING p.id, p.server_id, p.device_id, d.user_id
+`
+
+type RevokeAllProfilesOfUserRow struct {
+	ID       uuid.UUID
+	ServerID uuid.UUID
+	DeviceID uuid.UUID
+	UserID   uuid.UUID
+}
+
+// Все профили пользователя, включая устройства, отозванные раньше: у предка из цепочки
+// ротации мог остаться незакрытым overlap-окно, и «заблокировали — а пиер живёт» для
+// заблокированного аккаунта недопустимо.
+func (q *Queries) RevokeAllProfilesOfUser(ctx context.Context, userID uuid.UUID) ([]RevokeAllProfilesOfUserRow, error) {
+	rows, err := q.db.Query(ctx, revokeAllProfilesOfUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RevokeAllProfilesOfUserRow
+	for rows.Next() {
+		var i RevokeAllProfilesOfUserRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ServerID,
+			&i.DeviceID,
+			&i.UserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const serversOfUserProfiles = `-- name: ServersOfUserProfiles :many
+SELECT DISTINCT p.server_id
+FROM vpn_profiles p
+JOIN devices d ON d.id = p.device_id
+WHERE d.user_id = $1 AND p.status IN ('active', 'superseded')
+ORDER BY 1
+`
+
+// Порядок задаёт админ, а не планировщик: advisory-блокировки серверов в задаче 8
+// берутся ровно в этом порядке, и у двух параллельных блокировок разных пользователей
+// не будет способа зайти в клинч.
+func (q *Queries) ServersOfUserProfiles(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, serversOfUserProfiles, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var server_id uuid.UUID
+		if err := rows.Scan(&server_id); err != nil {
+			return nil, err
+		}
+		items = append(items, server_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const trafficByUserSince = `-- name: TrafficByUserSince :many
+SELECT device_id, SUM(rx_bytes)::bigint AS rx_bytes, SUM(tx_bytes)::bigint AS tx_bytes,
+       count(*)::int AS days
+FROM device_day_traffic
+WHERE user_id = $1 AND day >= $2
+GROUP BY device_id
+ORDER BY device_id
+`
+
+type TrafficByUserSinceParams struct {
+	UserID uuid.UUID
+	Day    time.Time
+}
+
+type TrafficByUserSinceRow struct {
+	DeviceID uuid.UUID
+	RxBytes  int64
+	TxBytes  int64
+	Days     int32
+}
+
+// Суммарный объём на устройство за окно (окно передаёт хендлер: 30 суток по умолчанию).
+// Абсолюты за произвольное окно, а не «весь срок»: весь срок — это device_day_traffic
+// без границы, и он растёт быстрее, чем экран админа.
+func (q *Queries) TrafficByUserSince(ctx context.Context, arg TrafficByUserSinceParams) ([]TrafficByUserSinceRow, error) {
+	rows, err := q.db.Query(ctx, trafficByUserSince, arg.UserID, arg.Day)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TrafficByUserSinceRow
+	for rows.Next() {
+		var i TrafficByUserSinceRow
+		if err := rows.Scan(
+			&i.DeviceID,
+			&i.RxBytes,
+			&i.TxBytes,
+			&i.Days,
 		); err != nil {
 			return nil, err
 		}
