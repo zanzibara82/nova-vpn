@@ -3635,8 +3635,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `DeleteOldConnectionEvents`, `NullOldRefreshIPs`, `PurgeOldIdempotencyKeys` (задача 1);
   `RevokeProfile` (задача 1); `db.RunInTx`; `DefaultProfileTTL` (задача 5).
 - Produces (пакет `connections`):
-  - константы `DefaultSweepInterval = time.Hour`, `DormantAfter = 7 * 24 * time.Hour`,
-    `TrafficWindowDays = 30` (её читает admin-просмотр задачи 12);
+  - константы `DefaultSweepInterval = time.Hour`, `DormantAfter = 7 * 24 * time.Hour`
+    (`TrafficWindowDays = 30` здесь не появляется: её завёл admin-просмотр задачи 12
+    в `internal/admin/handlers.go`, и метле она не нужна);
   - `type Store interface { SweepExpired; SweepDormant; SweepStale; SweepRetention }` (шаг 1);
   - `type Retention struct{ EventsDeleted, IPsCleared, KeysPurged int64 }`,
     `type Report struct{ Expired, Dormant, Stale int; Retention Retention }`;
@@ -3661,7 +3662,6 @@ const (
 	// столько. Смысл числа: «выдал и забыл» становится мусором в desired set, а
 	// каждый лишний пиер — это строка в конфиге узла и адрес, занявший пул.
 	DormantAfter = 7 * 24 * time.Hour
-
 )
 
 // Retention — сколько строк метла убрала из каждого стола. Это не «для статистики»:
@@ -3777,10 +3777,11 @@ ORDER BY p.id;
 
 `SweepExpired` — одна транзакция **на профиль**, не одна на всю выборку:
 
-1. `ExpiredActiveProfiles(now)` → rows (запрос уже отдаёт `user_id`);
-2. на каждый row в `db.RunInTx`: `MarkProfileExpired(id)` → `ReleaseAddressByProfile(id)`
-   → `BumpServerConfigVersion(server_id)` → `InsertConnectionEvent(profile_expired,
-   user_id, device_id, server_id, detail {})`.
+1. `ExpiredActiveProfiles(ctx)` → rows (запрос уже отдаёт `user_id`; граница
+   `expires_at <= now()` стоит в SQL задачи 1, поэтому времени в аргументах нет);
+2. на каждый row в `db.RunInTx`: `MarkProfileExpired(id)` → `ReleaseAddressByProfile(&id)`
+   (`:exec`, возвращает только ошибку) → `BumpServerConfigVersion(server_id)` →
+   `InsertConnectionEvent(profile_expired, user_id, device_id, server_id, detail {})`.
 
 `SweepDormant(now)` — та же форма, `DormantActiveProfiles(now.Add(-DormantAfter))`,
 и вместо `MarkProfileExpired` — `RevokeProfile(id)` (статус `revoked`, `revoked_at` —
@@ -3909,7 +3910,7 @@ func TestSweepAllRunsEveryKindDespiteErrors(t *testing.T) {
 		t.Errorf("kinds = %v, want all four in order", st.calls)
 	}
 	// Упавшие виды работы обязаны быть слышны, а не проглочены: ровно две Error-строки.
-	if n := strings.Count(buf.String(), `"lvl":"ERROR"`); n != 2 {
+	if n := strings.Count(buf.String(), `"level":"ERROR"`); n != 2 {
 		t.Errorf("journal has %d error lines, want 2 (%s)", n, buf.String())
 	}
 }
@@ -3921,10 +3922,21 @@ func TestSweepAllRunsEveryKindDespiteErrors(t *testing.T) {
 
 - [ ] **Step 7: Интеграционный тест — `tests/integration/sweeper_test.go`, схема, не исходник**
 
-Хранилище — настоящее (`connections.NewStore(pool)`), время подставляется в явные
-аргументы методов: просрочку играют UPDATE'ом `expires_at` в прошлое (иначе «подождать
+Шапка файла — `//go:build integration` и `package integration`, как у остальных тестов
+каталога: без тега unit-набор (`go test ./...`) компилирует файл и падает на хелперах,
+которых в этой сборке нет.
+
+Хранилище — настоящее (`connections.NewStore(pool)`), а время живёт в данных и в явных
+аргументах методов: просрочку играют UPDATE'ом `expires_at` в прошлое (иначе «подождать
 30 суток» — тест, который никто не запускал), а dormancy — `issued_at` в прошлое. Это
 не «подмена логики»: пороги живут в SQL-условиях и в константе, а тест двигает данные.
+Просрочка двигает и `issued_at` вместе с `expires_at`: constraint `profiles_window`
+требует `expires_at > issued_at`, и UPDATE одного `expires_at` база отклонит.
+
+Общая dev-база между прогонами одна и та же, и чужой просроченный профиль, оставшийся от
+предыдущего прогона, попал бы в счёт `SweepExpired`. Поэтому expired/dormant/concurrent
+тесты перед созданием фикстуры делают «осушающий» проход метлы, и только потом создают
+свои строки: точные счётчики тогда принадлежат только этому тесту.
 
 | случай | ожидание |
 |---|---|
@@ -3937,7 +3949,7 @@ func TestSweepAllRunsEveryKindDespiteErrors(t *testing.T) {
 | события старше 90 суток (вставить `created_at` UPDATE'ом) | `SweepRetention` → `EventsDeleted` ≥ 1; молодые события целы |
 | refresh-семья старше 90 суток с `ip` | `IPsCleared` ≥ 1, `ip` стал NULL, сама семья цела (детект переиспользования не должен ослепнуть) |
 | завершённый idempotency-ключ старше 24 часов и незавершённый старше 7 суток | `KeysPurged` = 2 |
-| `sweepAll` на стенде со всеми четырьмя видами | `Report` содержит все четыре числа, в журнале одна `sweep`-строка с ними же |
+| `Run` на стенде со всеми четырьмя видами (тикер 10 мс, отмена после первой `sweep`-строки) | в журнале одна строка `"msg":"sweep"` с ненулевыми `expired`, `dormant`, `stale`, `events_deleted`: `sweepAll` неэкспортируема, и наружный контракт метлы наблюдаем только через `Run` |
 | два параллельных `SweepExpired` (2 горутинки) на одном профиле | суммарно ровно 1 (не 2): `MarkProfileExpired` защищён условием статуса, и вторая транзакция видит уже `expired` |
 
 Run: `make unit && make vet && make integration`
