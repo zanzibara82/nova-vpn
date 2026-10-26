@@ -119,6 +119,11 @@ func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time
 		if !c.ExpiresAt.After(now) {
 			continue
 		}
+		// Срок пиера — момент, после которого он больше не нужен: у активного это
+		// срок профиля, у старого ключа — закрытие overlap-окна (§7.3). Без второго
+		// узел не знал бы, когда снять старый ключ, и держал бы его до истечения
+		// профиля, то есть месяц вместо десяти минут.
+		expiresAt := c.ExpiresAt
 		var state string
 		switch c.Status {
 		case db.ProfileStatusActive:
@@ -136,13 +141,14 @@ func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time
 				continue
 			}
 			state = string(db.PeerStateRotatingOldKey)
+			expiresAt = *c.OverlapUntil
 		default:
 			continue
 		}
 		peers = append(peers, Peer{
 			PublicKey:  c.PublicKey,
 			AllowedIPs: []string{c.Address.String() + "/32"},
-			ExpiresAt:  c.ExpiresAt.UTC(),
+			ExpiresAt:  expiresAt.UTC(),
 			State:      state,
 		})
 	}

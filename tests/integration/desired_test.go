@@ -185,7 +185,13 @@ func TestDesiredComputeRotation(t *testing.T) {
 			}
 			for _, peer := range got.Peers {
 				state, ok := want[peer.PublicKey]
-				if !ok || peer.State != state || !slices.Equal(peer.AllowedIPs, []string{old.AddressV4.String() + "/32"}) || !peer.ExpiresAt.Equal(old.ExpiresAt) {
+				wantExpiry := old.ExpiresAt
+				if state == "rotating_old_key" {
+					// Старый ключ живёт не до срока профиля, а до закрытия окна (§7.3):
+					// иначе агенту нечем исполнить «окно закрылось, пиер снять».
+					wantExpiry = *old.OverlapValidUntil
+				}
+				if !ok || peer.State != state || !slices.Equal(peer.AllowedIPs, []string{old.AddressV4.String() + "/32"}) || !peer.ExpiresAt.Equal(wantExpiry) {
 					t.Fatalf("неверный пир: %+v", peer)
 				}
 				delete(want, peer.PublicKey)

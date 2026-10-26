@@ -92,11 +92,11 @@ func TestSelectPeersRotation(t *testing.T) {
 			keys := make([]string, 0, len(got))
 			for _, p := range got {
 				keys = append(keys, p.PublicKey)
-				state := "active"
+				state, wantExpiry := "active", now.Add(time.Hour)
 				if p.PublicKey == old.PublicKey {
-					state = "rotating_old_key"
+					state, wantExpiry = "rotating_old_key", *old.OverlapUntil
 				}
-				if p.State != state || !slices.Equal(p.AllowedIPs, []string{"10.99.0.2/32"}) || !p.ExpiresAt.Equal(now.Add(time.Hour)) {
+				if p.State != state || !slices.Equal(p.AllowedIPs, []string{"10.99.0.2/32"}) || !p.ExpiresAt.Equal(wantExpiry) {
 					t.Fatalf("неверные данные пира: %+v", p)
 				}
 			}
@@ -193,7 +193,13 @@ func TestDesiredSetNeverContainsRemovedAccess(t *testing.T) {
 				t.Fatalf("итерация %d: неизвестный ключ %s", iteration, p.PublicKey)
 			}
 			c := cands[index]
-			if !c.ExpiresAt.After(now) || !p.ExpiresAt.Equal(c.ExpiresAt) {
+			// Срок пиера — момент, когда он больше не нужен: у активного это срок
+			// профиля, у старого ключа — закрытие overlap-окна (§7.3).
+			wantExpiry := c.ExpiresAt
+			if p.State == "rotating_old_key" {
+				wantExpiry = *c.OverlapUntil
+			}
+			if !c.ExpiresAt.After(now) || !p.ExpiresAt.Equal(wantExpiry) {
 				t.Fatalf("итерация %d: неверный срок", iteration)
 			}
 			if !slices.Equal(p.AllowedIPs, []string{c.Address.String() + "/32"}) {
