@@ -38,6 +38,11 @@ type NodeTokenResponse struct {
 // колонках. base64url без дополнений из 32 байт — 43 символа.
 const nodeTokenBytes = 32
 
+// errEnrollRace — условие used_at IS NULL в ConsumeBootstrapToken не нашло строку:
+// одноразовый токен выиграл параллельный enroll. Отдельная ошибка нужна, чтобы
+// отличить гонку (401 без оракула) от настоящего отказа БД (500).
+var errEnrollRace = errors.New("nodeapi: bootstrap token race")
+
 func newNodeToken() (string, error) {
 	var b [nodeTokenBytes]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -118,32 +123,43 @@ func (h *Handler) enroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	owner, err := h.q.ConsumeBootstrapToken(r.Context(), bt.ID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// Условие used_at IS NULL в том же UPDATE: выиграл один из параллельных enroll.
-		h.refuse(w, r, "race", bt.ServerID)
-		return
-	}
-	if err != nil {
-		h.internal(w, r, err, "bootstrap token consume")
-		return
-	}
-
-	// Прежние токены гасятся до вставки: украденный старый не имеет права жить
-	// рядом с новым, а узел в этом месте всё равно перерегистрируется.
-	if _, err := h.q.RevokeNodeCredentialsForServer(r.Context(), owner); err != nil {
-		h.internal(w, r, err, "previous node credentials revoke")
-		return
-	}
+	// Токен генерируется до расхода стартового: отказ crypto/rand не имеет права
+	// сжечь одноразовый токен.
 	token, err := newNodeToken()
 	if err != nil {
 		h.internal(w, r, err, "node token generation")
 		return
 	}
-	if _, err := h.q.InsertNodeCredential(r.Context(), db.InsertNodeCredentialParams{
-		ID: uuid.New(), ServerID: owner, TokenHash: hashToken(token),
-	}); err != nil {
-		h.internal(w, r, err, "node credential insert")
+	// Расход, отзыв прежних и вставка нового — одна транзакция. По отдельности отказ
+	// вставки оставлял бы сожжённый стартовый токен и уже отозванный рабочий:
+	// перерегистрация невозможна ни старым токеном, ни новым.
+	var owner uuid.UUID
+	err = db.RunInTx(r.Context(), h.pool, func(q *db.Queries) error {
+		var err error
+		owner, err = q.ConsumeBootstrapToken(r.Context(), bt.ID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errEnrollRace
+		}
+		if err != nil {
+			return err
+		}
+		// Прежние токены гасятся до вставки: украденный старый не имеет права жить
+		// рядом с новым, а узел в этом месте всё равно перерегистрируется.
+		if _, err := q.RevokeNodeCredentialsForServer(r.Context(), owner); err != nil {
+			return err
+		}
+		_, err = q.InsertNodeCredential(r.Context(), db.InsertNodeCredentialParams{
+			ID: uuid.New(), ServerID: owner, TokenHash: hashToken(token),
+		})
+		return err
+	})
+	if errors.Is(err, errEnrollRace) {
+		// Условие used_at IS NULL в том же UPDATE: выиграл один из параллельных enroll.
+		h.refuse(w, r, "race", bt.ServerID)
+		return
+	}
+	if err != nil {
+		h.internal(w, r, err, "enroll transaction")
 		return
 	}
 	h.log.Info("node enrolled", "server_id", owner)

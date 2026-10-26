@@ -402,6 +402,63 @@ func TestNodeReenrollRevokesPreviousCredential(t *testing.T) {
 	}
 }
 
+// TestNodeEnrollRollsBackTokenWhenCredentialInsertFails — расход стартового токена,
+// отзыв прежнего и вставка нового — одна транзакция. Иначе отказ вставки оставлял бы
+// сожжённый одноразовый токен и уже отозванный рабочий: перерегистрация невозможна
+// ни старым токеном (израсходован), ни новым (не выдан).
+func TestNodeEnrollRollsBackTokenWhenCredentialInsertFails(t *testing.T) {
+	f := newNodeFixture(t)
+	pub := f.server.PublicKey
+
+	firstRaw, _ := f.seedBootstrap(t)
+	first := f.enrollOK(t, firstRaw, pub)
+	if n := liveCredentialCount(t, f.ctx, f.server.ID); n != 1 {
+		t.Fatalf("живых токенов после первого enroll %d, want 1", n)
+	}
+
+	if _, err := pool(t).Exec(f.ctx, `
+		CREATE OR REPLACE FUNCTION test_fail_node_credential() RETURNS trigger
+		LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced credential insert failure'; END $$`); err != nil {
+		t.Fatalf("функция-сбой: %v", err)
+	}
+	if _, err := pool(t).Exec(f.ctx, `
+		CREATE TRIGGER test_fail_node_credential BEFORE INSERT ON node_credentials
+		FOR EACH ROW EXECUTE FUNCTION test_fail_node_credential()`); err != nil {
+		t.Fatalf("триггер-сбой: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool(t).Exec(context.Background(),
+			`DROP TRIGGER IF EXISTS test_fail_node_credential ON node_credentials`); err != nil {
+			t.Errorf("снятие триггера: %v", err)
+		}
+		if _, err := pool(t).Exec(context.Background(),
+			`DROP FUNCTION IF EXISTS test_fail_node_credential()`); err != nil {
+			t.Errorf("снятие функции-сбоя: %v", err)
+		}
+	})
+
+	secondRaw, secondID := f.seedBootstrap(t)
+	resp, body := f.enroll(t, secondRaw, pub)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("enroll при отказе вставки = %d %v, want 500", resp.StatusCode, body)
+	}
+
+	var used *time.Time
+	if err := pool(t).QueryRow(f.ctx,
+		`SELECT used_at FROM bootstrap_tokens WHERE id = $1`, secondID).Scan(&used); err != nil {
+		t.Fatalf("used_at второго токена: %v", err)
+	}
+	if used != nil {
+		t.Fatalf("неудавшаяся вставка сожгла стартовый токен: used_at = %v", used)
+	}
+	if n := liveCredentialCount(t, f.ctx, f.server.ID); n != 1 {
+		t.Fatalf("живых токенов после отката %d, want 1: отзыв прежнего не откатился", n)
+	}
+	if resp, body = nodeCall(t, http.MethodGet, f.nodeURL(f.server.ID, "/desired"), "", first, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("прежний токен после отката = %d %v, want 200", resp.StatusCode, body)
+	}
+}
+
 func TestNodeEnrollValidatesPublicKeyShapeAndOwnership(t *testing.T) {
 	f := newNodeFixture(t)
 	pub := f.server.PublicKey
@@ -473,13 +530,13 @@ func TestNodeEnrollKeyMismatchLeavesTokenUnspent(t *testing.T) {
 // nodeStandalone — тот же модуль без сборщика: обёртки «passthrough», чтобы
 // одновременно пришедшие enroll'ы не упирались в бакет по IP, а споралась только
 // одноразовость токена в БД.
-func nodeStandalone(t *testing.T, q *db.Queries, logs *slog.Logger) http.Handler {
+func nodeStandalone(t *testing.T, logs *slog.Logger) http.Handler {
 	t.Helper()
 	mux := http.NewServeMux()
 	passthrough := func(next http.Handler) http.Handler { return next }
 	dec := httpx.Decorators{Auth: passthrough, Anonymous: passthrough, Node: passthrough}
 	tel := telemetry.NewService(pool(t), redisClient(t), logs)
-	nodeapi.NewHandler(q, tel, logs).RegisterRoutes(mux, dec)
+	nodeapi.NewHandler(pool(t), tel, logs).RegisterRoutes(mux, dec)
 	return mux
 }
 
@@ -491,7 +548,7 @@ func TestNodeEnrollRaceHasOneWinner(t *testing.T) {
 	server := seedServer(t, ctx, q, "10.98.22.0/24")
 	setServerOnline(t, ctx, q, server.ID)
 	seedProfile(t, ctx, q, seedDevice(t, ctx, q, user, 0).ID, server.ID, "10.98.22.2", time.Hour)
-	h := nodeStandalone(t, q, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	h := nodeStandalone(t, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 
 	raw, _ := insertBootstrap(t, ctx, q, server.ID)
 	body := mustJSON(t, map[string]string{"bootstrap_token": raw, "public_key": server.PublicKey})

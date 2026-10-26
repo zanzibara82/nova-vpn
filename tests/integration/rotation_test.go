@@ -244,6 +244,51 @@ func TestRotateKeyDoesNotConsumeDeviceLimit(t *testing.T) {
 	}
 }
 
+// TestRotateKeyWaitsForUserDeviceLock — ротация читает предка и вставляет ребёнка под
+// тем же advisory lock пользователя, что и Register. Без него две параллельные
+// ротации одного предка обе видели бы его живым: первая отзывала бы предка, а вторая
+// всё равно вставляла ребёнка, и живых устройств становилось бы на одно больше лимита.
+func TestRotateKeyWaitsForUserDeviceLock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	svc, q := newDeviceSvc(t)
+	user := seedUser(t, ctx, q, true)
+	parent := seedDevice(t, ctx, q, user, 0)
+
+	tx, err := pool(t).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`, user.String()); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("advisory lock: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.RotateKey(ctx, user, parent.ID, keyFromSeed("locked-"+parent.ID.String()))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		_ = tx.Rollback(ctx)
+		t.Fatalf("ротация не ждала advisory lock пользователя: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ротация после снятия блокировки: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("ротация не завершилась после снятия блокировки")
+	}
+}
+
 func TestRotateKeyWithoutProfiles(t *testing.T) {
 	ctx := context.Background()
 	q := db.New(pool(t))

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/httpx"
@@ -33,14 +34,17 @@ const (
 )
 
 type Handler struct {
+	pool *pgxpool.Pool
 	q    *db.Queries
 	tel  *telemetry.Service
 	auth *Authenticator
 	log  *slog.Logger
 }
 
-func NewHandler(q *db.Queries, tel *telemetry.Service, log *slog.Logger) *Handler {
-	return &Handler{q: q, tel: tel, auth: NewAuthenticator(q, log), log: log}
+// NewHandler принимает пул, а не готовые Queries: расход стартового токена, отзыв
+// прежнего и вставка нового идут одной транзакцией, а RunInTx работает с пулом.
+func NewHandler(pool *pgxpool.Pool, tel *telemetry.Service, log *slog.Logger) *Handler {
+	return &Handler{pool: pool, q: db.New(pool), tel: tel, auth: NewAuthenticator(db.New(pool), log), log: log}
 }
 
 // NodeMiddleware — обёртка dec.Node для сборщика. Один Authenticator на весь

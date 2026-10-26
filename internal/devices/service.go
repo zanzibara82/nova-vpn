@@ -273,6 +273,12 @@ func (s *Service) RotateKey(ctx context.Context, userID, parentID uuid.UUID, new
 
 	var created db.Device
 	err := db.RunInTx(ctx, s.pool, func(q *db.Queries) error {
+		// Тот же advisory lock, что и в Register: без него две параллельные ротации
+		// одного предка обе увидят его живым, вторая вставит второго ребёнка после
+		// того, как первая отозвала предка, и живых устройств станет больше лимита.
+		if err := q.LockUserForDeviceCount(ctx, userID.String()); err != nil {
+			return fmt.Errorf("advisory lock: %w", err)
+		}
 		parent, err := q.DeviceByID(ctx, parentID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrForbiddenDevice

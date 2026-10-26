@@ -86,7 +86,7 @@ func NewRouter(d Deps) http.Handler {
 	// Контракт узла строится до decorators: обёртка dec.Node берётся у самого
 	// модуля, чтобы проверка токена и маршруты опирались на один экземпляр
 	// Authenticator, иначе «кто этот узел» решалось бы в двух местах.
-	node := nodeapi.NewHandler(q, telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)
+	node := nodeapi.NewHandler(d.Pool, telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)
 
 	dec := httpx.Decorators{
 		// Закрытый маршрут: сначала проверка access JWT и denylist, потом bucket
