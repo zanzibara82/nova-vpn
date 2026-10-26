@@ -174,9 +174,13 @@ func TestTelemetryRejectsInvalidReportsBeforeWrites(t *testing.T) {
 	for _, change := range []func(*telemetry.ObservedReport){
 		func(r *telemetry.ObservedReport) { r.InterfaceRxBytes = -1 },
 		func(r *telemetry.ObservedReport) { r.InterfaceTxBytes = -1 },
+		func(r *telemetry.ObservedReport) { r.InterfaceRxBytes = math.MaxInt64 },
+		func(r *telemetry.ObservedReport) { r.InterfaceTxBytes = telemetry.MaxCounterBytes + 1 },
 		func(r *telemetry.ObservedReport) { r.ConfigVersion = -1 },
 		func(r *telemetry.ObservedReport) { r.Peers[0].RxBytes = -1 },
 		func(r *telemetry.ObservedReport) { r.Peers[0].TxBytes = -1 },
+		func(r *telemetry.ObservedReport) { r.Peers[0].RxBytes = math.MaxInt64 },
+		func(r *telemetry.ObservedReport) { r.Peers[0].TxBytes = telemetry.MaxCounterBytes + 1 },
 		func(r *telemetry.ObservedReport) { r.Peers = append(r.Peers, r.Peers[0]) },
 	} {
 		rep := f.report(1, 2)
@@ -448,6 +452,48 @@ func TestTelemetryRecoversAfterDatabaseRollback(t *testing.T) {
 	}
 	if n := telemetryEventCount(t, f.server.ID, second.ID, "peer_applied"); n != 1 {
 		t.Fatalf("потеря или повтор применения: %d", n)
+	}
+}
+
+// TestTelemetryDropsPendingPacketAfterSecondFailure — пакет, который не удаётся
+// применить ни при постановке, ни на повторе, снимается: иначе каждый отчёт узла
+// повторял бы одну и ту же ошибку до истечения TTL и приём телеметрии был бы
+// выключен на 48 часов.
+func TestTelemetryDropsPendingPacketAfterSecondFailure(t *testing.T) {
+	f := newTelemetryFixture(t)
+	f.ingest(t, f.report(100, 50))
+	if err := f.q.UpsertDeviceDayTraffic(f.ctx, db.UpsertDeviceDayTrafficParams{
+		UserID: f.device.UserID, DeviceID: f.device.ID, Day: telemetry.DayOf(f.now), RxBytes: math.MaxInt64,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rep := f.report(150, 75)
+	if err := f.svc.IngestObserved(f.ctx, f.server.ID, rep, f.now); err == nil {
+		t.Fatal("ожидалась ошибка переполнения агрегата")
+	}
+	packetKey := "tsp:" + f.server.ID.String()
+	if exists, err := f.rdb.Exists(f.ctx, packetKey).Result(); err != nil || exists != 1 {
+		t.Fatalf("неподтверждённый пакет не поставлен: %d / %v", exists, err)
+	}
+
+	if err := f.svc.IngestObserved(f.ctx, f.server.ID, rep, f.now); err != nil {
+		t.Fatalf("второй отказ не снял пакет: %v", err)
+	}
+	if exists, err := f.rdb.Exists(f.ctx, packetKey).Result(); err != nil || exists != 0 {
+		t.Fatalf("отравленный пакет остался в Redis: %d / %v", exists, err)
+	}
+	if !strings.Contains(f.logs.String(), "pending packet dropped") {
+		t.Fatalf("в журнале нет предупреждения о снятии пакета: %s", f.logs.String())
+	}
+
+	// Приём продолжает работать: основания счётчиков сдвинуты неудавшейся попыткой
+	// (150/75), поэтому после очистки агрегата считается дельта следующего отчёта.
+	if _, err := pool(t).Exec(f.ctx, "UPDATE device_day_traffic SET rx_bytes = 0 WHERE device_id = $1", f.device.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.ingest(t, f.report(200, 100))
+	if _, rx, tx := telemetryTraffic(t, f.device.ID); rx != 50 || tx != 25 {
+		t.Fatalf("дельта после снятия пакета: %d/%d", rx, tx)
 	}
 }
 

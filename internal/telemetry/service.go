@@ -26,6 +26,14 @@ const (
 	// отказ, а не в разбор. Наружу отдаётся здесь, чтобы число не размножилось
 	// копией в контракте узла (задача 11).
 	MaxReportPeers = 4096
+	// MaxCounterBytes — верхняя граница счётчиков байт в отчёте. Счётчик WireGuard
+	// растёт с момента поднятия интерфейса, поэтому значение порядка max int64 —
+	// это не «много трафика», а сломанный агент: такая дельта переполняет bigint
+	// дневного агрегата, транзакция откатывается, а неподтверждённый пакет
+	// остаётся в Redis и повторяется при каждом отчёте. Петабайт на пиера не
+	// набегает за время жизни основания (48 часов), и даже MaxReportPeers таких
+	// значений дают 2^62 — вдвое меньше предела bigint.
+	MaxCounterBytes int64 = 1 << 50
 )
 
 var ErrInvalidReport = errors.New("telemetry: invalid report")
@@ -63,16 +71,31 @@ func NewService(pool *pgxpool.Pool, rdb *redis.Client, log *slog.Logger) *Servic
 	return &Service{pool: pool, rdb: rdb, log: log}
 }
 
-func (s *Service) IngestObserved(ctx context.Context, serverID uuid.UUID, rep ObservedReport, now time.Time) error {
-	if rep.ConfigVersion < 0 || rep.InterfaceRxBytes < 0 || rep.InterfaceTxBytes < 0 || len(rep.Peers) > MaxReportPeers {
+// validateObserved отклоняет отчёт до любых обращений к БД и Redis. Верхняя
+// граница счётчиков здесь не формальность: без неё дельта порядка max int64
+// переполняет bigint дневного агрегата уже после записи пакета в Redis.
+func validateObserved(rep ObservedReport) error {
+	if rep.ConfigVersion < 0 || rep.InterfaceRxBytes < 0 || rep.InterfaceRxBytes > MaxCounterBytes ||
+		rep.InterfaceTxBytes < 0 || rep.InterfaceTxBytes > MaxCounterBytes || len(rep.Peers) > MaxReportPeers {
 		return ErrInvalidReport
+	}
+	present := make(map[string]bool, len(rep.Peers))
+	for _, peer := range rep.Peers {
+		if peer.RxBytes < 0 || peer.RxBytes > MaxCounterBytes || peer.TxBytes < 0 || peer.TxBytes > MaxCounterBytes || present[peer.PublicKey] {
+			return ErrInvalidReport
+		}
+		present[peer.PublicKey] = true
+	}
+	return nil
+}
+
+func (s *Service) IngestObserved(ctx context.Context, serverID uuid.UUID, rep ObservedReport, now time.Time) error {
+	if err := validateObserved(rep); err != nil {
+		return err
 	}
 	keys := make([]string, 0, len(rep.Peers))
 	present := make(map[string]bool, len(rep.Peers))
 	for _, peer := range rep.Peers {
-		if peer.RxBytes < 0 || peer.TxBytes < 0 || present[peer.PublicKey] {
-			return ErrInvalidReport
-		}
 		present[peer.PublicKey] = true
 		keys = append(keys, peer.PublicKey)
 	}
@@ -110,7 +133,19 @@ func (s *Service) IngestObserved(ctx context.Context, serverID uuid.UUID, rep Ob
 			return err
 		})
 		if err != nil {
-			return fmt.Errorf("telemetry: ingest observed: %w", err)
+			if !recovered {
+				return fmt.Errorf("telemetry: ingest observed: %w", err)
+			}
+			// Пакет уже отказывал при постановке — это второй отказ. Оставить его в
+			// Redis значит повторять ту же ошибку при каждом отчёте до истечения TTL,
+			// то есть выключить приём телеметрии узла на 48 часов. Начисления
+			// выброшенного пакета утрачены, но основания счётчиков уже сдвинуты
+			// неудавшейся попыткой, поэтому повторно эти байты не начислятся.
+			if delErr := s.rdb.Del(ctx, "tsp:"+serverID.String()).Err(); delErr != nil {
+				return fmt.Errorf("telemetry: ingest observed: %w", err)
+			}
+			s.log.Warn("telemetry: pending packet dropped after second failure", "server_id", serverID)
+			continue
 		}
 		if staged != "" {
 			if err := acknowledgePacket.Run(ctx, s.rdb, []string{"tsp:" + serverID.String()}, staged).Err(); err != nil {
