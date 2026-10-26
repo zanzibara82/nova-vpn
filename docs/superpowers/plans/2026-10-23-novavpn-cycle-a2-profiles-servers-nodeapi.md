@@ -2330,6 +2330,11 @@ func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time
 		if !c.ExpiresAt.After(now) {
 			continue
 		}
+		// Срок пиера — момент, после которого он больше не нужен: у активного это
+		// срок профиля, у старого ключа — закрытие overlap-окна (§7.3). Без второго
+		// узел не знал бы, когда снять старый ключ, и держал бы его до истечения
+		// профиля, то есть месяц вместо десяти минут.
+		expiresAt := c.ExpiresAt
 		var state string
 		switch c.Status {
 		case db.ProfileStatusActive:
@@ -2347,13 +2352,14 @@ func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time
 				continue
 			}
 			state = string(db.PeerStateRotatingOldKey)
+			expiresAt = *c.OverlapUntil
 		default:
 			continue
 		}
 		peers = append(peers, Peer{
 			PublicKey:  c.PublicKey,
 			AllowedIPs: []string{c.Address.String() + "/32"},
-			ExpiresAt:  c.ExpiresAt.UTC(),
+			ExpiresAt:  expiresAt.UTC(),
 			State:      state,
 		})
 	}
@@ -2466,7 +2472,7 @@ Expected: FAIL до реализации: сначала отсутствуют 
 | активный профиль | один пиер, `state=active`, `allowed_ips=["<адрес>/32"]`, `expires_at` = срок профиля |
 | два активных профиля + один `revoked` | двух пиеров, отозванного нет; `DesiredCandidates` его строки не возвращает вообще |
 | `active`, но `expires_at` в прошлом | пиера нет (это и есть «просроченный не попадает», до свиппера) |
-| `superseded` с открытым окном и живым преемником, handshake нет | **два** пиера: предок в состоянии `rotating_old_key` |
+| `superseded` с открытым окном и живым преемником, handshake нет | **два** пиера: предок в состоянии `rotating_old_key`, его `expires_at` = `overlap_valid_until` (закрытие окна), а не срок профиля: иначе узлу нечем исполнить «окно закрылось, пиер снять» и он держал бы старый ключ месяц вместо десяти минут |
 | тот же набор + событие `handshake_observed` на преемника | предка нет, преемник есть |
 | `superseded` с закрытым окном | предка нет |
 | `superseded` без преемника вообще | предка нет (иначе снятый ключ жил бы вечно) |
@@ -2510,9 +2516,13 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `internal/db/models.go` (генерация sqlc)
 - Create: `migrations/0007_telemetry_receipts.up.sql`,
   `migrations/0007_telemetry_receipts.down.sql`: квитанции обработки пакетов и индекс handshake
+- Create: `migrations/0008_node_query_indexes.up.sql`,
+  `migrations/0008_node_query_indexes.down.sql`: индексы под `ObservedDevicesByPublicKeys`
+  этой задачи и `DesiredCandidates` задачи 9, плюс два индекса внешних ключей ротации
 - Modify: `tests/integration/net_queries_test.go` — `TestMigration0006UpDownUp` сверяет
   применённую версию с последней миграцией из embedded FS, а не с цифрой 6: с 0007 в
-  наборе жёсткая проверка «applied == 6» падала бы на полностью применившемся наборе
+  наборе жёсткая проверка «applied == 6» падала бы на полностью применившемся наборе;
+  новый `TestNetQueriesUseIndexes` снимает план двух запросов горячего пути
 
 **Interfaces:**
 - Consumes: `pgxpool.Pool`, `db.RunInTx`, `LockServerRow`, запросы телеметрии,
@@ -2749,10 +2759,26 @@ Expected: 0 расхождений блоков; миграция применя
 сгенерированы `MarkObservedHealth`, `MarkServerHealth`, `ObservedDevicesByPublicKeys`,
 `RecordHandshake`, `ClaimTelemetryPacket` и `TelemetryReceipt`-модель.
 
+Миграция 0008 — индексы горячего пути — схема, не исходник. Пять индексов:
+`devices_public_key` (уникальность в схеме есть только по `(user_id, public_key)`,
+а отчёт узла ищет по одному ключу), полный `profiles_device_server` (частичный
+`profiles_one_active_per_device_server` не покрывает `EXISTS` без фильтра статуса),
+`profiles_server_address` (`DesiredCandidates` отдаёт профили сервера уже в порядке
+адреса), `devices_rotation_of` и `profiles_rotate_from` (внешние ключи
+`ON DELETE SET NULL` без индекса: удаление строки-родителя перебирает всю таблицу).
+Последние два индекса найдены замером тестовой очистки, а не чтением схемы: удаление
+20 000 устройств занимало 14.4 с без индекса `devices.rotation_of` и 0.62 с с ним,
+а вместе с профилями — 30 с без `vpn_profiles.rotate_from` и 1.18 с с ним.
+`TestNetQueriesUseIndexes` подтверждает оба плана `EXPLAIN (ANALYZE, BUFFERS,
+FORMAT JSON)` с настоящими параметрами, а не литеральную копию запроса.
+
 - [ ] **Step 3: `IngestObserved` — схема, не исходник**
 
 1. До любых записей проверить неотрицательность версии и всех счётчиков, отсутствие
-   повторяющихся ключей и ограничение в 4096 пиров. Ошибка — `ErrInvalidReport`.
+   повторяющихся ключей и ограничение в 4096 пиров. Счётчики байт ограничены сверху
+   `MaxCounterBytes = 1 << 50`: дельта порядка max int64 переполняет bigint суточного
+   агрегата, транзакция откатывается, а неподтверждённый пакет остаётся в Redis и
+   повторяется при каждом отчёте до истечения TTL. Ошибка — `ErrInvalidReport`.
 2. `db.RunInTx` и `LockServerRow(serverID.String())`. Поиск через
    `ObservedDevicesByPublicKeys` ограничен устройствами с профилями этого сервера.
    Ключ, которого нет на сервере, и ключ нескольких владельцев не сопоставляются
@@ -2801,6 +2827,10 @@ Expected: 0 расхождений блоков; миграция применя
 - Ошибка подтверждения пакета (Redis недоступен между коммитом и удалением ключа) —
   предупреждение и выход из цикла: начисления уже зафиксированы, а повтор применит
   пакет только если квитанция не совпадёт.
+- Пакет, который отказал при постановке и отказал повторно при применении, снимается
+  из Redis после второго отказа: иначе одна ошибка выключала бы приём телеметрии узла
+  на все 48 часов TTL. Начисления такого пакета утрачены, но основания счётчиков уже
+  сдвинуты неудавшейся попыткой, поэтому повторно эти байты не начислятся.
 - Тело пакета пишет только этот код, и ключ живёт 48 часов. Если он не разбирается,
   пакет выбрасывается с предупреждением, а приём продолжается: возвращать ошибку
   означало бы потерянную телеметрию узла на всё время жизни ключа. Начисления из
@@ -2833,6 +2863,8 @@ agent_uptime_sec)`. Отчёт отклоняется **до** обращени�
 | Redis остановлен (тест: адрес `127.0.0.1:1`) | `IngestObserved` завершился без ошибки, health и `handshake_observed` записаны, `device_day_traffic` пусто; в журнале предупреждение |
 | множество 1 → 0 → 0 → 1 | одно событие снятия; повтор пустого отчёта не дублирует событие; повторное появление создаёт применение и новое основание |
 | отрицательные счётчики, повтор ключа, неверные метрики heartbeat | `ErrInvalidReport` до записи health и событий |
+| счётчик байт выше `MaxCounterBytes`, включая пиерный и `math.MaxInt64` | `ErrInvalidReport` до обращений к БД и Redis: дельта такого размера переполнила бы bigint суточного агрегата |
+| пакет отказал при постановке и повторно при применении | после второго отказа `tsp:<server_id>` снят, ошибка вызывающему не возвращена; следующий корректный отчёт начисляет только свою дельту |
 | ключ неизвестен, относится к другому узлу или неоднозначен | нет пользовательских событий и агрегатов, health сохранён |
 | handshake из будущего | не учитывается как состоявшийся и не меняет отметку устройства |
 | одно устройство на двух серверах | событие есть для каждого сервера; более старая отметка второго не уменьшает общий last_seen_at |
@@ -2858,7 +2890,8 @@ Expected: PASS.
 ```bash
 git add internal/telemetry internal/db/query/telemetry.sql internal/db/telemetry.sql.go \
   internal/db/querier.go internal/db/models.go migrations/0007_telemetry_receipts.up.sql \
-  migrations/0007_telemetry_receipts.down.sql tests/integration/telemetry_test.go \
+  migrations/0007_telemetry_receipts.down.sql migrations/0008_node_query_indexes.up.sql \
+  migrations/0008_node_query_indexes.down.sql tests/integration/telemetry_test.go \
   tests/integration/net_queries_test.go
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     commit -m "feat(telemetry): дельты пиерных счётчиков, health узла и события handshake"
@@ -2985,8 +3018,8 @@ id в пути — `DELETE /api/v1/devices/{id}`, `…/profiles/{server_id}`, в
 
 | маршрут | поведение |
 |---|---|
-| `GET /internal/v1/nodes/{server_id}/desired` | `server_id` в пути не UUID → `400 invalid_request` + details `{"field": "server_id"}` (это дефект запроса, а не прав); `serverID != ServerIDFromContext` → `403 forbidden` («несовпадение сервера», §2 узел-самозванец). Иначе `servers.Compute(q, serverID, now)`, а `ETag` — `fmt.Sprintf("%q", "v"+strconv.FormatInt(set.ConfigVersion, 10))`: кавычки обязательны по RFC 9110, сравнение — строгое равенство строки заголовка. Совпавший `If-None-Match` → `304` без тела и без `Content-Type`. Полный ответ при этом всё равно собран, и это осознанно: версия живёт в той же строке сервера, что и `Compute`, а отдельный путь «только ETag» дал бы вторую реализацию одного правила отсечения ради экономии одной сериализации |
-| `POST …/observed` | `httpx.DecodeJSON` в `telemetry.ObservedReport`, `IngestObserved` → `204`; `400 invalid_request` на битое тело, на отрицательные счётчики и на `peers` больше `telemetry.MaxReportPeers = 4096` (потолок тела — единственная защита от «узел прислал мегабайты и мы их разобрали»; константа живёт в `telemetry`, рядом с валидацией, чтобы контракт узла не держал её копию) |
+| `GET /internal/v1/nodes/{server_id}/desired` | `server_id` в пути не UUID → `400 invalid_request` + details `{"field": "server_id"}` (это дефект запроса, а не прав); `serverID != ServerIDFromContext` → `403 forbidden` («несовпадение сервера», §2 узел-самозванец). Иначе `servers.Compute(q, serverID, now)`, а `ETag` — сильный валидатор от содержимого набора: sha256 канонического JSON с обнулённым `measured_at` (время ответа — не содержимое). Версия для ETag не годится: overlap-окно закрывается по времени, а старый ключ снимается сразу после handshake нового (§7.3), и с версионным ETag узел получал бы `304` и держал снятый ключ до следующего явного изменения. Кавычки обязательны по RFC 9110, сравнение — строгое равенство строки заголовка. Совпавший `If-None-Match` → `304` без тела и без `Content-Type`. Полный набор при этом всё равно собран, и это осознанно: отдельный путь «только ETag» дал бы вторую реализацию одного правила отсечения ради экономии одной сериализации |
+| `POST …/observed` | `httpx.DecodeJSON` в `telemetry.ObservedReport`, `IngestObserved` → `204`; `400 invalid_request` на битое тело, на отрицательные счётчики, на значения выше `telemetry.MaxCounterBytes = 1 << 50` и на `peers` больше `telemetry.MaxReportPeers = 4096` (потолки живут в `telemetry`, рядом с валидацией, чтобы контракт узла не держал их копии; верхняя граница счётчиков защищает bigint суточного агрегата от переполнения) |
 | `POST …/heartbeat` | `telemetry.Heartbeat`, `IngestHeartbeat` → `204`, `400` на битое тело и `403` на чужой `server_id` |
 | `POST …/token/rotate` | новый токен тем же способом, что и на enroll; `InsertNodeCredential(rotated_from = текущий id)` → `RevokeNodeCredential(id)` ровно текущего → `200 NodeTokenResponse`. Порядок «вставил, потом отозвал предъявленный» обязателен: обратный порядок оставлял бы узел без доступа при ошибке вставки. Узел, потерявший ответ, уходит в enroll заново — цена размена известна: висящие валидными оба токена удваивали бы поверхность украденного токена. Отзыв по `id`, а не по `server_id`: чужой процесс того же узла не обязан терять доступ из-за чужой ротации |
 | всё, кроме enroll | под `dec.Node`: аутентификация узла **до** лимитера по `server_id` (как `dec.Auth` в A-1: ключ бакета читает контекст, появляющийся только после проверки токена) |
@@ -3037,8 +3070,9 @@ telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)`, конструируетс�
 | desired, первый вызов | `200`, `ETag` присутствует, JSON совпадает с §4.1 по именам полей, `peers` — массив (пустой, если профилей нет), приватных ключей нет (`checkEvidence`) |
 | desired с тем же `If-None-Match` | `304`, пустое тело |
 | desired после выдачи профиля | `config_version` вырос, `ETag` другой, пиер появился |
+| desired после handshake нового ключа при ротации | старый ключ снят из набора, но `config_version` не изменился; повтор с прежним `If-None-Match` обязан дать `200` и другой `ETag` — версионный валидатор здесь отдал бы `304` и оставил снятый ключ |
 | observed c `peers` (один известный ключ) | `204`, `server_health` заполнен, событие `handshake_observed` одно |
-| observed с отрицательным `rx_bytes` | `400 invalid_request` |
+| observed с отрицательным или выше `MaxCounterBytes` счётчиком | `400 invalid_request` до записи health и событий |
 | heartbeat после observed | `204`, `agent_version` в health, `peers_configured` сохранился |
 | token/rotate | `200` новый токен; старый → `401` на desired; новый → `200`; в `node_credentials` `rotated_from` = id первого; вторая ротация ссылается на второй токен |
 | rotate при втором живом токене того же сервера | отзыв касается только предъявленного: чужой процесс продолжает получать `200`, живых токенов остаётся два (подмена отзыва на «по server_id» обязана упасть здесь) |
