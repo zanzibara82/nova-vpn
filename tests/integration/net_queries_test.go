@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/netip"
 	"strconv"
@@ -660,5 +661,94 @@ func TestAuditActionNewValuesExist(t *testing.T) {
 		TargetID: uuid.New().String(), Reason: "нк", RequestID: "req-short",
 	}); err == nil {
 		t.Error("аудит с причиной из двух символов принят")
+	}
+}
+
+// explainNetPlan снимает план с настоящими параметрами: EXPLAIN в расширенном
+// протоколе видит значения $n, поэтому проверяется тот запрос, что уходит из кода,
+// а не его литеральная копия.
+func explainNetPlan(t *testing.T, ctx context.Context, query string, args ...any) string {
+	t.Helper()
+	var plan []byte
+	if err := pool(t).QueryRow(ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "+query, args...).Scan(&plan); err != nil {
+		t.Fatalf("EXPLAIN: %v", err)
+	}
+	return string(plan)
+}
+
+// TestNetQueriesUseIndexes — два запроса горячего пути узла обязаны идти по индексу,
+// а не читать таблицу целиком: телеметрия ищет устройства по ключам из пачки, а
+// desired set — профили одного сервера. Уникальность в схеме есть только по
+// (user_id, public_key), а частичный profiles_one_active_per_device_server EXISTS без
+// фильтра статуса не покрывает, поэтому индексы нужны явные.
+func TestNetQueriesUseIndexes(t *testing.T) {
+	ctx := context.Background()
+	q := db.New(pool(t))
+	user := seedUser(t, ctx, q, true)
+	// Bulk-сервер получает 20000 профилей: на меньшем объёме планировщик выбирает
+	// последовательное чтение независимо от индексов. Target — 50 профилей, чтобы
+	// запрос desired был селективным и выбор индекса не зависел от доли таблицы.
+	bulk := seedServer(t, ctx, q, "10.80.0.0/16")
+	target := seedServer(t, ctx, q, "10.81.0.0/24")
+
+	if _, err := pool(t).Exec(ctx, `
+		INSERT INTO devices (id, user_id, public_key, platform, name)
+		SELECT gen_random_uuid(), $1, lpad(i::text, 43, '0') || '=', 'linux', 'bulk'
+		FROM generate_series(1, 20000) AS i`, user); err != nil {
+		t.Fatalf("вставка устройств: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool(t).Exec(context.Background(),
+			`DELETE FROM devices WHERE user_id = $1`, user); err != nil {
+			t.Errorf("очистка устройств: %v", err)
+		}
+	})
+	if _, err := pool(t).Exec(ctx, `
+		INSERT INTO vpn_profiles (id, device_id, server_id, address_v4, expires_at)
+		SELECT gen_random_uuid(), d.id, $1,
+		       ('10.80.' || ((i - 1) / 250) || '.' || ((i - 1) % 250 + 1))::inet,
+		       now() + interval '30 days'
+		FROM generate_series(1, 20000) AS i
+		JOIN devices d ON d.public_key = lpad(i::text, 43, '0') || '='`, bulk.ID); err != nil {
+		t.Fatalf("вставка профилей bulk: %v", err)
+	}
+	if _, err := pool(t).Exec(ctx, `
+		INSERT INTO vpn_profiles (id, device_id, server_id, address_v4, expires_at)
+		SELECT gen_random_uuid(), d.id, $1, ('10.81.0.' || i)::inet, now() + interval '30 days'
+		FROM generate_series(1, 50) AS i
+		JOIN devices d ON d.public_key = lpad(i::text, 43, '0') || '='`, target.ID); err != nil {
+		t.Fatalf("вставка профилей target: %v", err)
+	}
+	for _, table := range []string{"devices", "vpn_profiles"} {
+		if _, err := pool(t).Exec(ctx, "ANALYZE "+table); err != nil {
+			t.Fatalf("ANALYZE %s: %v", table, err)
+		}
+	}
+
+	keys := make([]string, 0, 5)
+	for i := 1; i <= 5; i++ {
+		keys = append(keys, fmt.Sprintf("%043d=", i))
+	}
+	observed := explainNetPlan(t, ctx, `
+		SELECT d.id, d.user_id, d.public_key FROM devices d
+		WHERE d.public_key = ANY($1::text[])
+		  AND EXISTS (SELECT 1 FROM vpn_profiles p WHERE p.device_id = d.id AND p.server_id = $2)`,
+		keys, target.ID)
+	for _, index := range []string{"devices_public_key", "profiles_device_server"} {
+		if !strings.Contains(observed, index) {
+			t.Errorf("поиск устройств по ключам не использует %s: %s", index, observed)
+		}
+	}
+
+	desired := explainNetPlan(t, ctx, `
+		SELECT p.id, p.device_id, p.server_id, p.address_v4, p.status, p.expires_at,
+		       p.overlap_valid_until, p.peer_state, p.rotate_from,
+		       d.public_key, d.revoked_at AS device_revoked_at
+		FROM vpn_profiles p
+		JOIN devices d ON d.id = p.device_id
+		WHERE p.server_id = $1 AND p.status IN ('active', 'superseded')
+		ORDER BY p.address_v4`, target.ID)
+	if !strings.Contains(desired, "profiles_server_address") {
+		t.Errorf("desired set читает профили сервера без profiles_server_address: %s", desired)
 	}
 }
