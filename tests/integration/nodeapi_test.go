@@ -25,6 +25,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/novavpn/novavpn/internal/db"
+	"github.com/novavpn/novavpn/internal/devices"
+	"github.com/novavpn/novavpn/internal/entitlements"
 	"github.com/novavpn/novavpn/internal/httpx"
 	"github.com/novavpn/novavpn/internal/nodeapi"
 	"github.com/novavpn/novavpn/internal/telemetry"
@@ -677,6 +679,66 @@ func TestNodeDesiredETagAndFieldNames(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("несовпавший If-None-Match = %d, want 200", resp.StatusCode)
 	}
+}
+
+// TestNodeDesiredETagChangesWhenHandshakeClosesOverlap — ETag обязан зависеть от
+// содержимого набора: закрытие overlap-окна handshake'ем не поднимает
+// config_version, и с версионным ETag узел получал бы 304 и держал старый ключ
+// вопреки §7.3 («как только агент наблюдал handshake от нового ключа, старый
+// снимается немедленно»).
+func TestNodeDesiredETagChangesWhenHandshakeClosesOverlap(t *testing.T) {
+	f := newNodeFixture(t)
+	srv := f.secondServer(t)
+	user := seedUser(t, f.ctx, f.q, true)
+	parent := seedDevice(t, f.ctx, f.q, user, 0)
+	seedProfile(t, f.ctx, f.q, parent.ID, srv.ID, "10.98.21.2", time.Hour)
+	svc := devices.NewService(pool(t), entitlements.New(f.q))
+	child, err := svc.RotateKey(f.ctx, user, parent.ID, keyFromSeed("etag-"+parent.ID.String()))
+	if err != nil {
+		t.Fatalf("RotateKey: %v", err)
+	}
+	raw, _ := insertBootstrap(t, f.ctx, f.q, srv.ID)
+	token := f.enrollOK(t, raw, srv.PublicKey)
+
+	resp, set := nodeCall(t, http.MethodGet, f.nodeURL(srv.ID, "/desired"), "", token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("desired = %d %v, want 200", resp.StatusCode, set)
+	}
+	etag := resp.Header.Get("ETag")
+	if !hasPeerState(set, "rotating_old_key") {
+		t.Fatalf("в наборе нет старого ключа: %v", set["peers"])
+	}
+
+	if _, err := pool(t).Exec(f.ctx,
+		`INSERT INTO connection_events (user_id, device_id, server_id, event)
+		 VALUES ($1, $2, $3, 'handshake_observed')`, user, child.ID, srv.ID); err != nil {
+		t.Fatalf("событие handshake: %v", err)
+	}
+
+	resp2, set2 := nodeCall(t, http.MethodGet, f.nodeURL(srv.ID, "/desired"), "", token,
+		map[string]string{"If-None-Match": etag})
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("If-None-Match после handshake = %d %v, want 200: набор изменился, версия — нет",
+			resp2.StatusCode, set2)
+	}
+	if got := resp2.Header.Get("ETag"); got == etag {
+		t.Errorf("ETag не изменился после снятия старого ключа: %q", got)
+	}
+	if hasPeerState(set2, "rotating_old_key") {
+		t.Errorf("старый ключ остался в наборе после handshake: %v", set2["peers"])
+	}
+}
+
+// hasPeerState — есть ли в ответе desired пиер с состоянием state.
+func hasPeerState(set map[string]any, state string) bool {
+	peers, _ := set["peers"].([]any)
+	for _, raw := range peers {
+		peer, _ := raw.(map[string]any)
+		if peer["state"] == state {
+			return true
+		}
+	}
+	return false
 }
 
 func TestNodeDesiredGrowsWithIssuedProfile(t *testing.T) {

@@ -5,11 +5,13 @@
 package nodeapi
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -85,11 +87,12 @@ func (h *Handler) pathServer(w http.ResponseWriter, r *http.Request) (credential
 
 // desired отдаёт набор пиеров узла.
 //
-// ETag строится из config_version: версия живёт в той же строке сервера, что и всё
-// остальное, поэтому «изменилось» и «изменилась версия» — одно и то же событие.
-// Полный набор при совпадении всё равно считается, и это осознанно: отдельный путь
-// «только заголовок» дал бы вторую реализацию того же правила отсечения ради
-// экономии одной сериализации.
+// ETag — сильный валидатор от содержимого набора, а не от config_version. Версия
+// поднимается явными действиями (выдача, отзыв, ротация), но набор меняется ещё и
+// сам: overlap-окно закрывается по времени, а старый ключ снимается сразу после
+// handshake нового (§7.3). С версионным ETag узел получал бы 304 и держал снятый
+// ключ до следующего явного изменения. measured_at из хэша исключён: это время
+// ответа, а не содержимое, и с ним 304 не случился бы никогда.
 func (h *Handler) desired(w http.ResponseWriter, r *http.Request) {
 	cred, ok := h.pathServer(w, r)
 	if !ok {
@@ -104,7 +107,11 @@ func (h *Handler) desired(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, err, "desired set compute")
 		return
 	}
-	etag := fmt.Sprintf("%q", "v"+strconv.FormatInt(set.ConfigVersion, 10))
+	etag, err := desiredETag(set)
+	if err != nil {
+		h.internal(w, r, err, "desired set etag")
+		return
+	}
 	w.Header().Set("ETag", etag)
 	// Сравнение строгое: слабый валидатор (W/) и префиксы поддержкой не считаются,
 	// а «примерно совпало» для узла означает пропущенное отсечение пиера.
@@ -113,6 +120,18 @@ func (h *Handler) desired(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = httpx.WriteJSON(w, http.StatusOK, set)
+}
+
+// desiredETag — хэш содержимого набора. Поля DesiredSet и Peer имеют фиксированный
+// порядок, пиры отсортированы, поэтому один и тот же набор даёт один и тот же хэш.
+func desiredETag(set servers.DesiredSet) (string, error) {
+	set.MeasuredAt = time.Time{}
+	body, err := json.Marshal(set)
+	if err != nil {
+		return "", fmt.Errorf("nodeapi: сериализация desired set: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	return `"` + hex.EncodeToString(sum[:]) + `"`, nil
 }
 
 func (h *Handler) observed(w http.ResponseWriter, r *http.Request) {
