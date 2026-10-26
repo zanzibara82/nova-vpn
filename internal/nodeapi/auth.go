@@ -72,12 +72,6 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			a.internal(w, r, err, "node credential lookup")
 			return
 		}
-		// Одна запись на запрос: last_used_at — доказательство жизни, без него
-		// отзыв «неиспользуемого» токена слеп.
-		if err := a.q.TouchNodeCredential(r.Context(), cred.ID); err != nil {
-			a.internal(w, r, err, "node credential touch")
-			return
-		}
 		ctx := httpx.WithServerID(r.Context(), cred.ServerID)
 		ctx = contextWithCredential(ctx, credential{id: cred.ID, serverID: cred.ServerID})
 		next.ServeHTTP(w, r.WithContext(ctx))

@@ -618,6 +618,11 @@ func TestAdminBootstrapTokens(t *testing.T) {
 	if !nodeTokenShape.MatchString(raw) {
 		t.Errorf("токен %q не соответствует форме узлового секрета", raw)
 	}
+	// Токен в теле — секрет доступа узла: кэш посредника не имеет права сохранить
+	// ответ, иначе после отзыва из кэша вернулся бы рабочий стартовый токен.
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control у выдачи bootstrap-токена = %q, want no-store", cc)
+	}
 	tokID, _ := body["id"].(string)
 	expires, _ := body["expires_at"].(string)
 	at, err := time.Parse(time.RFC3339, expires)

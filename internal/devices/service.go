@@ -31,6 +31,10 @@ var (
 	// ErrDeviceRevoked из пути выдачи: HTTP-слой обязан ответить 409 с причиной,
 	// потому что «повтори запрос» тут бесполезно — нужно новое устройство.
 	ErrNotLiveDevice = errors.New("device is not live")
+	// ErrProfileChanged — профиль перестал быть активным между чтением и переходом в
+	// overlap: параллельный отзыв выиграл. Это гонка, а не поломка: HTTP-слой
+	// отвечает 409, потому что предка уже нельзя перевести в overlap.
+	ErrProfileChanged = errors.New("profile changed concurrently")
 )
 
 type RegisterInput struct {
@@ -324,6 +328,11 @@ func (s *Service) RotateKey(ctx context.Context, userID, parentID uuid.UUID, new
 			superseded, err := q.SupersedeProfile(ctx, db.SupersedeProfileParams{
 				ID: row.ID, OverlapValidUntil: &overlap,
 			})
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Условие status = 'active' в UPDATE: между чтением списка и записью
+				// профиль отозвали, и переводить в overlap уже нечего.
+				return ErrProfileChanged
+			}
 			if err != nil {
 				return fmt.Errorf("supersede profile %v: %w", row.ID, err)
 			}

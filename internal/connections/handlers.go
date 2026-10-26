@@ -254,8 +254,14 @@ func (h *Handler) revoke(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.svc.Revoke(r.Context(), userID, deviceID, serverID); err != nil {
 		switch {
 		case errors.Is(err, ErrNotActive):
+			// status прочитан до отзыва и к этому моменту уже неверен: строку
+			// отозвали параллельно. Наружу уходит настоящее состояние из базы.
+			actual, ok := h.stateOf(w, r, userID, deviceID, serverID)
+			if !ok {
+				return
+			}
 			httpx.WriteError(w, r, http.StatusConflict, httpx.ErrConflict,
-				"профиль не активен", map[string]any{"status": string(status)})
+				"профиль не активен", map[string]any{"status": string(actual)})
 		case errors.Is(err, ErrForbiddenDevice):
 			notFound(w, r)
 		default:
@@ -300,7 +306,9 @@ func (h *Handler) config(w http.ResponseWriter, r *http.Request) {
 	// text/plain, а не JSON: клиент сохраняет ответ как файл и отдаёт его
 	// утилитам wireguard. Оборачивание в JSON вынудило бы разворачивать строку с
 	// экранированными переводами строк — то есть терять ровно то, ради чего конфиг
-	// и передаётся целиком.
+	// и передаётся целиком. Кэшировать его нельзя: конфиг — доступ, который
+	// отзывают, и ответ из кэша после отзыва означал бы рабочий доступ.
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(text))
 }

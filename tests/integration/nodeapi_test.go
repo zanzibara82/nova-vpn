@@ -459,6 +459,158 @@ func TestNodeEnrollRollsBackTokenWhenCredentialInsertFails(t *testing.T) {
 	}
 }
 
+// TestNodeEnrollTokenOfMissingServerIsRefused — токен, чей сервер удалён, отвечает
+// тем же 401, что и неизвестный: узлу нечего с этим делать, кроме повторной
+// регистрации. В обычной работе строки не бывает (FK с ON DELETE CASCADE), поэтому
+// ветка достижима только гонкой «токен прочитан, сервер удалён»: внешний ключ
+// снимается на время теста, чтобы воспроизвести именно её.
+func TestNodeEnrollTokenOfMissingServerIsRefused(t *testing.T) {
+	f := newNodeFixture(t)
+	if _, err := pool(t).Exec(f.ctx,
+		`ALTER TABLE bootstrap_tokens DROP CONSTRAINT bootstrap_tokens_server_id_fkey`); err != nil {
+		t.Fatalf("снятие внешнего ключа: %v", err)
+	}
+
+	raw := secretB64(t)
+	sum := sha256.Sum256([]byte(raw))
+	orphanID := uuid.New()
+	if _, err := pool(t).Exec(f.ctx, `
+		INSERT INTO bootstrap_tokens (id, token_hash, server_id, expires_at)
+		VALUES ($1, $2, $3, now() + interval '1 hour')`,
+		orphanID, sum[:], uuid.New()); err != nil {
+		t.Fatalf("осиротевший токен: %v", err)
+	}
+	t.Cleanup(func() {
+		bg := context.Background()
+		if _, err := pool(t).Exec(bg, `DELETE FROM bootstrap_tokens WHERE id = $1`, orphanID); err != nil {
+			t.Errorf("удаление осиротевшего токена: %v", err)
+		}
+		if _, err := pool(t).Exec(bg, `
+			ALTER TABLE bootstrap_tokens ADD CONSTRAINT bootstrap_tokens_server_id_fkey
+			FOREIGN KEY (server_id) REFERENCES vpn_servers(id) ON DELETE CASCADE`); err != nil {
+			t.Errorf("возврат внешнего ключа: %v", err)
+		}
+	})
+
+	resp, body := f.enroll(t, raw, keyFromSeed("orphan-node"))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("enroll токеном удалённого сервера = %d %v, want 401", resp.StatusCode, body)
+	}
+	respUnknown, bodyUnknown := f.enroll(t, secretB64(t), keyFromSeed("orphan-node"))
+	if respUnknown.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("проверочный enroll неизвестным токеном = %d %v", respUnknown.StatusCode, bodyUnknown)
+	}
+	if got, want := envelopePair(body), envelopePair(bodyUnknown); got != want {
+		t.Errorf("осиротевший токен отличается от неизвестного: %q против %q", got, want)
+	}
+	if !strings.Contains(f.logs.String(), `"reason":"server_missing"`) {
+		t.Errorf("в журнале нет причины server_missing: %s", f.logs.String())
+	}
+}
+
+// TestNodeTouchFailureDoesNotRefuseRequest — last_used_at это учёт, а не право.
+// Отказ единственного UPDATE не имеет права превращать уже принятый токен в 500:
+// иначе сбой одной колонки выключает узел целиком.
+func TestNodeTouchFailureDoesNotRefuseRequest(t *testing.T) {
+	f := newNodeFixture(t)
+	raw, _ := f.seedBootstrap(t)
+	token := f.enrollOK(t, raw, f.server.PublicKey)
+
+	if _, err := pool(t).Exec(f.ctx, `
+		CREATE OR REPLACE FUNCTION test_fail_node_touch() RETURNS trigger
+		LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced touch failure'; END $$`); err != nil {
+		t.Fatalf("функция-сбой: %v", err)
+	}
+	if _, err := pool(t).Exec(f.ctx, `
+		CREATE TRIGGER test_fail_node_touch BEFORE UPDATE ON node_credentials
+		FOR EACH ROW EXECUTE FUNCTION test_fail_node_touch()`); err != nil {
+		t.Fatalf("триггер-сбой: %v", err)
+	}
+	t.Cleanup(func() {
+		bg := context.Background()
+		if _, err := pool(t).Exec(bg,
+			`DROP TRIGGER IF EXISTS test_fail_node_touch ON node_credentials`); err != nil {
+			t.Errorf("снятие триггера: %v", err)
+		}
+		if _, err := pool(t).Exec(bg,
+			`DROP FUNCTION IF EXISTS test_fail_node_touch()`); err != nil {
+			t.Errorf("снятие функции-сбоя: %v", err)
+		}
+	})
+
+	resp, body := nodeCall(t, http.MethodGet, f.nodeURL(f.server.ID, "/desired"), "", token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("desired при отказе last_used_at = %d %v, want 200", resp.StatusCode, body)
+	}
+}
+
+// TestNodeRateLimitedRequestDoesNotTouchCredential — порядок сборщика внутри узловой
+// ветки: проверка токена, лимитер, затем запись last_used_at. Отклонённый лимитером
+// запрос не имеет права оставлять след в БД, иначе флуд продолжает писать при
+// каждом отказе.
+func TestNodeRateLimitedRequestDoesNotTouchCredential(t *testing.T) {
+	f := newNodeFixture(t)
+	raw, _ := f.seedBootstrap(t)
+	token := f.enrollOK(t, raw, f.server.PublicKey)
+
+	logs := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	node := nodeapi.NewHandler(pool(t), telemetry.NewService(pool(t), redisClient(t), logs), logs)
+	passthrough := func(next http.Handler) http.Handler { return next }
+	reject := func(http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			httpx.WriteError(w, r, http.StatusTooManyRequests, httpx.ErrRateLimited,
+				"слишком много запросов", nil)
+		})
+	}
+	mux := http.NewServeMux()
+	node.RegisterRoutes(mux, httpx.Decorators{
+		Auth: passthrough, Anonymous: passthrough,
+		Node: func(next http.Handler) http.Handler { return node.NodeMiddleware()(reject(next)) },
+	})
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/internal/v1/nodes/"+f.server.ID.String()+"/desired", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("запрос через отклоняющий лимитер = %d %s, want 429", w.Code, w.Body)
+	}
+	var touched int
+	if err := pool(t).QueryRow(f.ctx,
+		"SELECT count(*) FROM node_credentials WHERE server_id = $1 AND last_used_at IS NOT NULL",
+		f.server.ID).Scan(&touched); err != nil {
+		t.Fatalf("подсчёт last_used_at: %v", err)
+	}
+	if touched != 0 {
+		t.Fatalf("отклонённый лимитером запрос записал last_used_at у %d токенов, want 0", touched)
+	}
+}
+
+// TestNodeSecretResponsesAreNotCached — enroll и rotate возвращают node_token, а он
+// даёт доступ ко всем маршрутам узла. Кэш посредника не имеет права сохранить ответ:
+// повторная выдача из кэша после отзыва вернула бы рабочий секрет.
+func TestNodeSecretResponsesAreNotCached(t *testing.T) {
+	f := newNodeFixture(t)
+	raw, _ := f.seedBootstrap(t)
+	resp, body := f.enroll(t, raw, f.server.PublicKey)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("enroll = %d %v, want 200", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control у enroll = %q, want no-store", got)
+	}
+	token, _ := body["node_token"].(string)
+
+	resp, body = nodeCall(t, http.MethodPost, f.nodeURL(f.server.ID, "/token/rotate"), "", token, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("rotate = %d %v, want 200", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control у rotate = %q, want no-store", got)
+	}
+}
+
 func TestNodeEnrollValidatesPublicKeyShapeAndOwnership(t *testing.T) {
 	f := newNodeFixture(t)
 	pub := f.server.PublicKey
@@ -527,59 +679,46 @@ func TestNodeEnrollKeyMismatchLeavesTokenUnspent(t *testing.T) {
 	// второй ответ — ConsumeBootstrapToken требует used_at IS NULL.
 }
 
-// nodeStandalone — тот же модуль без сборщика: обёртки «passthrough», чтобы
-// одновременно пришедшие enroll'ы не упирались в бакет по IP, а споралась только
-// одноразовость токена в БД.
-func nodeStandalone(t *testing.T, logs *slog.Logger) http.Handler {
-	t.Helper()
-	mux := http.NewServeMux()
-	passthrough := func(next http.Handler) http.Handler { return next }
-	dec := httpx.Decorators{Auth: passthrough, Anonymous: passthrough, Node: passthrough}
-	tel := telemetry.NewService(pool(t), redisClient(t), logs)
-	nodeapi.NewHandler(pool(t), tel, logs).RegisterRoutes(mux, dec)
-	return mux
-}
-
+// TestNodeEnrollRaceHasOneWinner — одновременные enroll одним стартовым токеном идут
+// через настоящий сборщик. Число попыток равно burst анонимного лимитера (5): больше
+// означало бы проверку лимитера, а не одноразовости токена.
 func TestNodeEnrollRaceHasOneWinner(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	t.Cleanup(cancel)
-	q := db.New(pool(t))
-	user := seedUser(t, ctx, q, true)
-	server := seedServer(t, ctx, q, "10.98.22.0/24")
-	setServerOnline(t, ctx, q, server.ID)
-	seedProfile(t, ctx, q, seedDevice(t, ctx, q, user, 0).ID, server.ID, "10.98.22.2", time.Hour)
-	h := nodeStandalone(t, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	f := newNodeFixture(t)
+	raw, _ := f.seedBootstrap(t)
+	body := mustJSON(t, map[string]string{"bootstrap_token": raw, "public_key": f.server.PublicKey})
 
-	raw, _ := insertBootstrap(t, ctx, q, server.ID)
-	body := mustJSON(t, map[string]string{"bootstrap_token": raw, "public_key": server.PublicKey})
-
+	const attempts = 5
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	codes := map[int]int{}
-	for i := 0; i < 10; i++ {
+	for i := 0; i < attempts; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := httptest.NewRequest(http.MethodPost, "/internal/v1/nodes/enroll", strings.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
-			h.ServeHTTP(w, req)
+			resp, err := http.Post(f.base+"/internal/v1/nodes/enroll", "application/json", strings.NewReader(body))
+			if err != nil {
+				mu.Lock()
+				codes[-1]++
+				mu.Unlock()
+				return
+			}
+			_ = resp.Body.Close()
 			mu.Lock()
-			codes[w.Code]++
+			codes[resp.StatusCode]++
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
 	if codes[http.StatusOK] != 1 {
-		t.Fatalf("успешных enroll из десяти: %d (все коды %v), want ровно 1", codes[http.StatusOK], codes)
+		t.Fatalf("успешных enroll из пяти: %d (все коды %v), want ровно 1", codes[http.StatusOK], codes)
 	}
 	for code, n := range codes {
 		if n > 0 && code != http.StatusOK && code != http.StatusUnauthorized {
 			t.Errorf("код %d x%d: отказ обязан быть 401, все коды %v", code, n, codes)
 		}
 	}
-	if n := liveCredentialCount(t, ctx, server.ID); n != 1 {
+	if n := liveCredentialCount(t, f.ctx, f.server.ID); n != 1 {
 		t.Fatalf("живых токенов узла после гонки %d, want 1", n)
 	}
 }
@@ -589,7 +728,7 @@ func TestNodeRoutesRequireNodeToken(t *testing.T) {
 	raw, _ := f.seedBootstrap(t)
 	token := f.enrollOK(t, raw, f.server.PublicKey)
 	load := 1.2
-	report := telemetry.ObservedReport{ConfigVersion: 1, AppliedAt: time.Now().UTC(),
+	report := telemetry.ObservedReport{ConfigVersion: 1,
 		Peers: []telemetry.PeerStat{{PublicKey: f.device.PublicKey, RxBytes: 10, TxBytes: 5}}}
 	heartbeat := telemetry.Heartbeat{AgentVersion: "0.9.1", AgentUptimeSec: 42, AppliedConfigVersion: 1, Load1: &load}
 
@@ -657,7 +796,7 @@ func TestNodeRoutesRejectForeignServerID(t *testing.T) {
 
 	routes := []struct{ method, suffix, body string }{
 		{http.MethodGet, "/desired", ""},
-		{http.MethodPost, "/observed", mustJSON(t, telemetry.ObservedReport{ConfigVersion: 1, AppliedAt: time.Now().UTC()})},
+		{http.MethodPost, "/observed", mustJSON(t, telemetry.ObservedReport{ConfigVersion: 1})},
 		{http.MethodPost, "/heartbeat", mustJSON(t, telemetry.Heartbeat{AgentVersion: "0.9.1", AgentUptimeSec: 1})},
 		{http.MethodPost, "/token/rotate", ""},
 	}
@@ -856,7 +995,7 @@ func TestNodeObservedAndHeartbeatFillHealth(t *testing.T) {
 	handshaked := time.Now().UTC().Add(-time.Second)
 	report := telemetry.ObservedReport{
 		ConfigVersion: 3, InterfaceRxBytes: 1000, InterfaceTxBytes: 500,
-		AppliedAt: time.Now().UTC(), Peers: []telemetry.PeerStat{
+		Peers: []telemetry.PeerStat{
 			{PublicKey: f.device.PublicKey, LatestHandshake: &handshaked, RxBytes: 1000, TxBytes: 500}}}
 	resp, body := nodeCall(t, http.MethodPost, f.nodeURL(f.server.ID, "/observed"), mustJSON(t, report), token, nil)
 	if resp.StatusCode != http.StatusNoContent {
@@ -915,10 +1054,10 @@ func TestNodeObservedAndHeartbeatRejectBadPayloads(t *testing.T) {
 	refs := []struct{ name, method, url, body string }{
 		{"неразбираемый JSON", http.MethodPost, observed, "{не json"},
 		{"отрицательный rx_bytes", http.MethodPost, observed, mustJSON(t, telemetry.ObservedReport{
-			ConfigVersion: 1, AppliedAt: time.Now().UTC(),
-			Peers: []telemetry.PeerStat{{PublicKey: f.device.PublicKey, RxBytes: -1}}})},
+			ConfigVersion: 1,
+			Peers:         []telemetry.PeerStat{{PublicKey: f.device.PublicKey, RxBytes: -1}}})},
 		{"пиеров больше потолка", http.MethodPost, observed, mustJSON(t, telemetry.ObservedReport{
-			ConfigVersion: 1, AppliedAt: time.Now().UTC(), Peers: peerStats(telemetry.MaxReportPeers + 1)})},
+			ConfigVersion: 1, Peers: peerStats(telemetry.MaxReportPeers + 1)})},
 		{"неизвестное поле в теле", http.MethodPost, observed, mustJSON(t, map[string]any{
 			"config_version": 1, "peers": []any{}, "server_id": f.server.ID.String()})},
 		{"пустой agent_version", http.MethodPost, f.nodeURL(f.server.ID, "/heartbeat"),
@@ -941,7 +1080,7 @@ func TestNodeObservedAndHeartbeatRejectBadPayloads(t *testing.T) {
 	}
 	// Битое тело — это 400, а не 500: отказ разбора не обязан превращаться во внутреннюю ошибку.
 	resp, body := nodeCall(t, http.MethodPost, observed, mustJSON(t, telemetry.ObservedReport{
-		ConfigVersion: 1, AppliedAt: time.Now().UTC()}), token, nil)
+		ConfigVersion: 1}), token, nil)
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("пустой отчёт = %d %v, want 204", resp.StatusCode, body)
 	}

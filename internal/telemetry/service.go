@@ -50,7 +50,6 @@ type ObservedReport struct {
 	InterfaceRxBytes int64      `json:"interface_rx_bytes"`
 	InterfaceTxBytes int64      `json:"interface_tx_bytes"`
 	Peers            []PeerStat `json:"peers"`
-	AppliedAt        time.Time  `json:"applied_at"`
 }
 
 type Heartbeat struct {

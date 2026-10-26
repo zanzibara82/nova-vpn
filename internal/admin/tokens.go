@@ -94,6 +94,9 @@ func (h *Handler) issueBootstrapToken(w http.ResponseWriter, r *http.Request) {
 		h.refuse(w, r, err)
 		return
 	}
+	// Секрет показывается ровно один раз, и кэш посредника не имеет права его
+	// сохранить: ответ из кэша вернул бы рабочий токен после отзыва.
+	w.Header().Set("Cache-Control", "no-store")
 	h.write(w, r, http.StatusCreated, issuedToken{
 		bootstrapRow: bootstrapRow{ID: row.ID, ServerID: row.ServerID,
 			CreatedAt: row.CreatedAt, ExpiresAt: row.ExpiresAt},

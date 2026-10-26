@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -231,6 +232,11 @@ func TestProfilesHTTPReadConfigAndRevoke(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "text/plain; charset=utf-8" {
 		t.Errorf("Content-Type конфига = %q, want text/plain; charset=utf-8", ct)
 	}
+	// Конфиг — доступ, который отзывают. Кэш посредника не имеет права вернуть его
+	// после отзыва, поэтому ответ не кэшируется ни при каких условиях.
+	if cc := w.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control конфига = %q, want no-store", cc)
+	}
 	text := w.Body.String()
 	for _, want := range []string{"[Interface]", "[Peer]", "PrivateKey"} {
 		// Проверка разная для каждого токена: приватного ключа в тексте быть не
@@ -275,6 +281,71 @@ func TestProfilesHTTPReadConfigAndRevoke(t *testing.T) {
 		"/api/v1/devices/"+device.String()+"/profiles/"+srv.ID.String(), "", "")
 	if w.Code != http.StatusOK || decodeProfile(t, w)["status"] != "revoked" {
 		t.Fatalf("чтение отозванного профиля: %d %s", w.Code, w.Body)
+	}
+}
+
+// TestProfilesHTTPRevokeRaceReportsActualStatus — статус, прочитанный до отзыва, к
+// моменту отказа уже неверен. Гонку воспроизводит блокировка строки: обработчик
+// успевает прочитать active и встать на UPDATE, а строка к его пробуждению уже
+// revoked. Ответ обязан назвать настоящее состояние, а не сохранённую копию.
+func TestProfilesHTTPRevokeRaceReportsActualStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	q := db.New(pool(t))
+	srv := seedServer(t, ctx, q, "10.96.55.0/29")
+	setServerOnline(t, ctx, q, srv.ID)
+	user := seedUserWithPlan(t, ctx, q, "internal-default")
+	device := seedDevice(t, ctx, q, user, 0).ID
+	h := profilesHTTP(t, httpx.NewIdempotency(httpx.NewPGIdempotency(pool(t))), nil)
+
+	w := issueViaHTTP(t, h, user, device, srv.ID, uuid.NewString())
+	if w.Code != http.StatusCreated {
+		t.Fatalf("выдача профиля: %d %s", w.Code, w.Body)
+	}
+	prof := decodeProfile(t, w)
+	profileID := uuid.MustParse(prof["id"].(string))
+
+	tx, err := pool(t).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM vpn_profiles WHERE id = $1 FOR UPDATE`, profileID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("блокировка профиля: %v", err)
+	}
+
+	path := "/api/v1/devices/" + device.String() + "/profiles/" + srv.ID.String()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- call(h, user, http.MethodDelete, path, "", "")
+	}()
+	select {
+	case got := <-done:
+		_ = tx.Rollback(ctx)
+		t.Fatalf("отзыв не ждал строку профиля: %d %s", got.Code, got.Body)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE vpn_profiles SET status = 'revoked', revoked_at = now() WHERE id = $1`, profileID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("отзыв профиля: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	select {
+	case got := <-done:
+		e := decodeErr(t, got)
+		if got.Code != http.StatusConflict || e.Error.Code != "conflict" {
+			t.Fatalf("отзыв отозванного на лету профиля = %d %s, want 409 conflict", got.Code, got.Body)
+		}
+		if e.Error.Details["status"] != "revoked" {
+			t.Errorf("details.status = %v, want revoked: статус до гонки не должен уходить наружу",
+				e.Error.Details["status"])
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("отзыв не завершился после снятия блокировки")
 	}
 }
 

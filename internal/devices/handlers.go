@@ -106,6 +106,12 @@ func (h *Handler) rotateInner(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrConflict,
 			"устройство отозвано, ротация невозможна",
 			map[string]any{"reason": "device_revoked"})
+	case errors.Is(err, ErrProfileChanged):
+		// Профиль отозвали между чтением и переводом в overlap: предок уже не
+		// активен, и повтор той же ротации не поможет — нужен новый профиль.
+		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrConflict,
+			"профиль устройства изменился во время ротации",
+			map[string]any{"reason": "profile_changed"})
 	case errors.Is(err, ErrDuplicateKey):
 		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrDuplicateDevice,
 			"устройство с таким публичным ключом уже существует", nil)
@@ -157,7 +163,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	}
 	var wrapped http.Handler = http.HandlerFunc(h.registerInner)
 	if h.idem != nil {
-		wrapped = h.idem.Middleware("device_create")(http.HandlerFunc(h.registerInner))
+		wrapped = h.idem.Middleware("device_create")(wrapped)
 	}
 	wrapped.ServeHTTP(w, r)
 }

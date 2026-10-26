@@ -133,10 +133,10 @@ func (h *Handler) enroll(w http.ResponseWriter, r *http.Request) {
 	// Расход, отзыв прежних и вставка нового — одна транзакция. По отдельности отказ
 	// вставки оставлял бы сожжённый стартовый токен и уже отозванный рабочий:
 	// перерегистрация невозможна ни старым токеном, ни новым.
-	var owner uuid.UUID
+	var serverID uuid.UUID
 	err = db.RunInTx(r.Context(), h.pool, func(q *db.Queries) error {
 		var err error
-		owner, err = q.ConsumeBootstrapToken(r.Context(), bt.ID)
+		serverID, err = q.ConsumeBootstrapToken(r.Context(), bt.ID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return errEnrollRace
 		}
@@ -145,11 +145,11 @@ func (h *Handler) enroll(w http.ResponseWriter, r *http.Request) {
 		}
 		// Прежние токены гасятся до вставки: украденный старый не имеет права жить
 		// рядом с новым, а узел в этом месте всё равно перерегистрируется.
-		if _, err := q.RevokeNodeCredentialsForServer(r.Context(), owner); err != nil {
+		if _, err := q.RevokeNodeCredentialsForServer(r.Context(), serverID); err != nil {
 			return err
 		}
 		_, err = q.InsertNodeCredential(r.Context(), db.InsertNodeCredentialParams{
-			ID: uuid.New(), ServerID: owner, TokenHash: hashToken(token),
+			ID: uuid.New(), ServerID: serverID, TokenHash: hashToken(token),
 		})
 		return err
 	})
@@ -162,8 +162,10 @@ func (h *Handler) enroll(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, err, "enroll transaction")
 		return
 	}
-	h.log.Info("node enrolled", "server_id", owner)
+	h.log.Info("node enrolled", "server_id", serverID)
 	// 200, а не 201: узел не создаёт объект от имени пользователя, он получает
-	// пропуск к уже зарегистрированной за собой строке.
-	_ = httpx.WriteJSON(w, http.StatusOK, NodeTokenResponse{ServerID: owner.String(), NodeToken: token})
+	// пропуск к уже зарегистрированной за собой строке. Токен в теле — доступ ко всем
+	// маршрутам узла, поэтому кэш посредника не имеет права сохранить ответ.
+	w.Header().Set("Cache-Control", "no-store")
+	_ = httpx.WriteJSON(w, http.StatusOK, NodeTokenResponse{ServerID: serverID.String(), NodeToken: token})
 }

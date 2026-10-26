@@ -55,7 +55,7 @@ func newTelemetryFixture(t *testing.T) telemetryFixture {
 func (f telemetryFixture) report(rx, tx int64) telemetry.ObservedReport {
 	hs := f.now.Add(-time.Second)
 	return telemetry.ObservedReport{ConfigVersion: 7, InterfaceRxBytes: rx, InterfaceTxBytes: tx,
-		AppliedAt: f.now, Peers: []telemetry.PeerStat{{PublicKey: f.device.PublicKey, LatestHandshake: &hs, RxBytes: rx, TxBytes: tx}}}
+		Peers: []telemetry.PeerStat{{PublicKey: f.device.PublicKey, LatestHandshake: &hs, RxBytes: rx, TxBytes: tx}}}
 }
 
 func (f telemetryFixture) ingest(t *testing.T, rep telemetry.ObservedReport) {

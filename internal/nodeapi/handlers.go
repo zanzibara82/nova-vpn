@@ -61,10 +61,25 @@ func (h *Handler) NodeMiddleware() func(http.Handler) http.Handler {
 // по IP), потому что ключ бакета «на узел» для него взять неоткуда.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux, dec httpx.Decorators) {
 	mux.Handle("POST /internal/v1/nodes/enroll", dec.Anonymous(http.HandlerFunc(h.enroll)))
-	mux.Handle("GET /internal/v1/nodes/{server_id}/desired", dec.Node(http.HandlerFunc(h.desired)))
-	mux.Handle("POST /internal/v1/nodes/{server_id}/observed", dec.Node(http.HandlerFunc(h.observed)))
-	mux.Handle("POST /internal/v1/nodes/{server_id}/heartbeat", dec.Node(http.HandlerFunc(h.heartbeat)))
-	mux.Handle("POST /internal/v1/nodes/{server_id}/token/rotate", dec.Node(http.HandlerFunc(h.rotate)))
+	mux.Handle("GET /internal/v1/nodes/{server_id}/desired", dec.Node(h.touch(http.HandlerFunc(h.desired))))
+	mux.Handle("POST /internal/v1/nodes/{server_id}/observed", dec.Node(h.touch(http.HandlerFunc(h.observed))))
+	mux.Handle("POST /internal/v1/nodes/{server_id}/heartbeat", dec.Node(h.touch(http.HandlerFunc(h.heartbeat))))
+	mux.Handle("POST /internal/v1/nodes/{server_id}/token/rotate", dec.Node(h.touch(http.HandlerFunc(h.rotate))))
+}
+
+// touch отмечает последнее использование токена. Место в цепочке — внутри dec.Node,
+// то есть после лимитера: отклонённый им запрос не имеет права писать в БД, иначе
+// флуд продолжает нагружать базу при каждом отказе. Отказ самого UPDATE — учёт, а не
+// право: токен уже принят, поэтому сбой колонки пишется в журнал, а не превращает
+// запрос в 500 и не выключает узел целиком.
+func (h *Handler) touch(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cred, _ := credentialFromContext(r.Context())
+		if err := h.q.TouchNodeCredential(r.Context(), cred.id); err != nil {
+			h.log.Warn("node credential touch failed", "error", err, "server_id", cred.serverID)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // pathServer сверяет id узла из пути с id, который дал токен, и возвращает
@@ -199,6 +214,9 @@ func (h *Handler) rotate(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("node credential already revoked", "server_id", cred.serverID)
 	}
 	h.log.Info("node token rotated", "server_id", cred.serverID)
+	// Токен в теле — доступ ко всем маршрутам узла: кэш посредника не имеет права
+	// сохранить ответ, иначе после отзыва из кэша вернулся бы рабочий секрет.
+	w.Header().Set("Cache-Control", "no-store")
 	_ = httpx.WriteJSON(w, http.StatusOK, NodeTokenResponse{ServerID: cred.serverID.String(), NodeToken: token})
 }
 

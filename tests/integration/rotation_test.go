@@ -289,6 +289,66 @@ func TestRotateKeyWaitsForUserDeviceLock(t *testing.T) {
 	}
 }
 
+// TestRotateKeyProfileRevokedConcurrentlyIsConflict — между чтением активных профилей
+// и SupersedeProfile строку успевают отозвать. Это гонка состояний, а не поломка
+// сервера: 500 заставлял бы клиента повторять запрос, 409 говорит «перечитай».
+func TestRotateKeyProfileRevokedConcurrentlyIsConflict(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	q := db.New(pool(t))
+	h, _ := rotationHTTP(t)
+
+	user := seedUserWithPlan(t, ctx, q, "internal-default")
+	parent := seedDevice(t, ctx, q, user, 0)
+	srv := seedServer(t, ctx, q, "10.96.73.0/29")
+	setServerOnline(t, ctx, q, srv.ID)
+	prof := profileOf(t, user, parent.ID, srv.ID)
+
+	tx, err := pool(t).Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM vpn_profiles WHERE id = $1 FOR UPDATE`, prof.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("блокировка профиля: %v", err)
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- rotateReq(h, user, parent.ID, keyFromSeed("race-"+parent.ID.String()), uuid.NewString())
+	}()
+	select {
+	case w := <-done:
+		_ = tx.Rollback(ctx)
+		t.Fatalf("ротация не ждала строку профиля: %d %s", w.Code, w.Body)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE vpn_profiles SET status = 'revoked', revoked_at = now() WHERE id = $1`, prof.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("отзыв профиля: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	select {
+	case w := <-done:
+		if w.Code != http.StatusConflict {
+			t.Fatalf("ротация отозванного на лету профиля = %d %s, want 409", w.Code, w.Body)
+		}
+		var env errEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("тело не конверт: %v — %s", err, w.Body)
+		}
+		if env.Error.Code != "conflict" || env.Error.Details["reason"] != "profile_changed" {
+			t.Errorf("отказ = %q %v, want conflict/profile_changed", env.Error.Code, env.Error.Details)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("ротация не завершилась после снятия блокировки")
+	}
+}
+
 func TestRotateKeyWithoutProfiles(t *testing.T) {
 	ctx := context.Background()
 	q := db.New(pool(t))
