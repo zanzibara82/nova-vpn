@@ -1837,9 +1837,11 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   идемпотентности: порядок важен, потому что `429` обязан возникать до записи слота
   идемпотентности, иначе отклонённый запрос оставил бы занятой ключ.
 - Ответ конфига — `text/plain`, а не JSON: клиент сохраняет
-  его как файл профиля и отдёт напрямую утилитам `
-  `wg-quick` и `wg showconf`; оборачивание в JSON вынудило бы клиента развернуть
-  строку с экранированием переводов строк. Контракт (задача 14) описывает это явно.
+  его как файл профиля и отдаёт напрямую утилитам `wg-quick` и `wg showconf`;
+  оборачивание в JSON вынудило бы клиента развернуть строку с экранированием переводов
+  строк. Контракт (задача 14) описывает это явно. Ответ несёт `Cache-Control: no-store`:
+  конфиг — доступ, который отзывают, и ответ из кэша после отзыва вернул бы рабочий
+  профиль.
 - Проверка права на объект — в сервисе (`DeviceByID` + сравнение владельца), не в
   middleware (спецификация §5.2).
 - Русские сообщения: `"требуется аутентификация"`, `"сервер недоступен для выдачи"`,
@@ -1899,6 +1901,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   отказом конфига читается последний профиль пары (`stateOf`): нет строки — `404`, есть, но
   не годен — `409` с настоящим `status` в details. Это второй запрос на случай отказа, а не
   на успех: успешный отзыв и успешный конфиг остаются одним вызовом;
+- статус, прочитанный до `Revoke`, к моменту `ErrNotActive` уже неверен: строку могли
+  отозвать параллельно, и `details.status` из сохранённой копии назвал бы `active` для
+  отозванного профиля. В ветке `ErrNotActive` статус перечитывается тем же `stateOf`;
 - случай «без `Idempotency-Key`» требует, чтобы тестовый хелпер не подставлял ключ, когда
   его не передали: первая версия подставляла, и проверка проходила как успешная выдача.
   Теперь пустой ключ означает «заголовка нет», и вместе с кодом проверяется сообщение —
@@ -2144,6 +2149,9 @@ UPDATE tunnel_addresses SET allocated_to = sqlc.arg(new_profile_id)
       `SupersedeProfile(old.ID, now.Add(connections.RotationOverlap))` → `InsertProfile` потомка (тот же
       `server_id`, тот же `address_v4`, `expires_at` — **тот же**, что у предка: ротация
       ключа не продлевает доступ) → `LinkRotatedProfile(child.ID, old.ID)` → `ReassignAddress`.
+      `pgx.ErrNoRows` от `SupersedeProfile` (условие `status = 'active'` не нашло строку:
+      профиль отозвали между чтением списка и UPDATE) → `ErrProfileChanged`, а не `500`:
+      это гонка, а не поломка, и повторять ту же ротацию не нужно — нужен новый профиль.
       Поле `rotate_from` ставится отдельным запросом: `InsertProfile` задачи 1 описывает
       выдачу, где предка нет, а переписывать его под ротацию значило бы менять проверенный
       контракт (находка 27);
@@ -2161,7 +2169,9 @@ idem-обёртки; ответ `200 deviceView` (не `201`: создаётся
 пользователя, а новое состояние того же устройства — и это надо записать в контракте
 задачи 14, чтобы клиент не ждал `201`); `400 invalid_request` + details `{"field":
 "public_key"}`; `409 duplicate_device`; `409 conflict` (`device_revoked` — details
-`{"reason":"device_revoked"}`); `404 not_found` на чужой `id`.
+`{"reason":"device_revoked"}`); `409 conflict` (`profile_changed` — details
+`{"reason":"profile_changed"}`, профиль отозвали между чтением и переводом в overlap);
+`404 not_found` на чужой `id`.
 
 - [ ] **Step 4: Интеграционный тест — `tests/integration/rotation_test.go`**
 
@@ -2172,6 +2182,7 @@ idem-обёртки; ответ `200 deviceView` (не `201`: создаётся
 | advisory lock пользователя занят чужой транзакцией | `RotateKey` ждёт её завершения и не создаёт ребёнка до снятия блокировки: без lock две параллельные ротации одного предка оставили бы двух живых детей |
 | ротация устройства без профилей | `200`, профилей не появилось, `config_version` не изменился |
 | ротация отозванного устройства | `409 conflict` + `device_revoked` |
+| ротацию ждут на заблокированной строке профиля, строку отзывают и отпускают | `409 conflict` + `{"reason":"profile_changed"}`, а не `500`: `SupersedeProfile` с условием `status='active'` вернул `ErrNoRows` |
 | тот же публичный ключ, что у другого живого устройства | `409 duplicate_device`, и **не** создан потомок (проверка SELECT) |
 | неканонический ключ (spare-биты nonzero) | `400 invalid_request`. Фикстура правкой байтов **не** строится: base64, собранный из любых 32 байт, каноничен по построению, и первая версия теста получила бы 200 вместо отказа. Значит поднимается младший spare-бит последнего символа самой строки |
 | повтор с тем же `Idempotency-Key` | тот же ответ + `Idempotency-Replayed: true`; потомок **один** (второй ротацией был бы другой id) |
@@ -2539,7 +2550,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   - `type PeerStat struct { PublicKey string; LatestHandshake *time.Time; RxBytes, TxBytes int64 }`
     (JSON-имена: `public_key`, `latest_handshake`, `rx_bytes`, `tx_bytes`);
   - `type ObservedReport struct` — `config_version`, `interface_rx_bytes`,
-    `interface_tx_bytes`, `peers []PeerStat`, `applied_at` (JSON: `config_version`, …);
+    `interface_tx_bytes`, `peers []PeerStat` (JSON-имена совпадают с тегами полей);
   - `type Heartbeat struct` — `agent_version`, `agent_uptime_sec`, `load1 *float64`,
     `cpu_pct *float64`, `applied_config_version`;
   - `func NewService(pool *pgxpool.Pool, rdb *redis.Client, log *slog.Logger) *Service`;
@@ -2964,7 +2975,12 @@ id в пути — `DELETE /api/v1/devices/{id}`, `…/profiles/{server_id}`, в
    зарегистрирован (§2, строка «Узел-самозванец»).
 3. `TouchNodeCredential(id)` — одна запись на запрос, без кэша: `last_used_at` нужен
    отзыву «неиспользуемого» токена (задача 12), и «примерно последний раз» для этого не
-   годится.
+   годится. Пишется она **не** в `Authenticator`, а отдельной обёрткой маршрута внутри
+   `dec.Node`, то есть после лимитера: отклонённый лимитером запрос не имеет права
+   писать в БД, иначе флуд продолжает нагружать базу при каждом отказе. Отказ самого
+   UPDATE — учёт, а не право: токен уже принят, поэтому он пишется в журнал
+   (`log.Warn`), а запрос продолжает путь; `500` здесь выключал бы узел из-за сбоя
+   одной колонки.
 4. `httpx.WithServerID(r.Context(), cred.ServerID)` → дальше в `r.WithContext`. Тот же
    вызов дописывает субъекта и в аккумулятор журнала (`noteServerID` по образцу
    `noteUserID`), иначе строка запроса от узла не отвечает на «кто стучался».
@@ -3019,7 +3035,8 @@ id в пути — `DELETE /api/v1/devices/{id}`, `…/profiles/{server_id}`, в
    узлу остаться без действующего токена при откате.
 7. Ответ содержит сам токен **один раз** и больше нигде его не возвращает: это секрет
    доступа узла, и recover его из журнала или из повтора ответа был бы способом
-   переписать чужой узел.
+   переписать чужой узел. Поэтому ответ несёт `Cache-Control: no-store` — и на enroll,
+   и на rotate: кэш посредника, вернувший ответ после отзыва, вернул бы рабочий секрет.
 8. Ответ — `200`, а не `201`: узел не создаёт объект от имени пользователя, он получает
    пропуск к уже зарегистрированной за собой строке.
 9. Событие соединения на enroll не пишется: enroll — не событие туннеля, а
@@ -3067,15 +3084,19 @@ telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)`, конструируетс�
 Стенд: `newRouter(t)` из задачи 18 — настоящий `api.NewRouter` за `httptest.NewServer`
 и чистый Redis (база 9, `FlushDB` на тест), чтобы проверка 404/405, конверт, журнал и
 оба лимитера были те же, что в проде. Fake-узел = последовательность HTTP-вызовов из
-теста. Отдельная ветка без сборщика (`nodeStandalone`, обёртки = passthrough) нужна
-только гонке enroll'ов: десять горутин сквозь `dec.Anonymous` упёрлись бы в бакет по IP
-и проверяли бы не одноразовость токена.
+теста. Отдельного стенда без сборщика нет: гонка enroll'ов идёт тем же путём, а число
+попыток равно burst анонимного лимитера (5) — больше означало бы проверку лимитера,
+а не одноразовости токена.
 
 | случай | ожидание |
 |---|---|
 | enroll битым bootstrap | `401`, тело-конверт, в журнале причина `unknown`; второй enroll с просроченным токеном даёт **такой же** ответ (проверка по телу, а не по журналу) |
 | enroll валидным токеном | `200`, `node_token` совпадает с `^[A-Za-z0-9_-]{43}$` (32 байта в base64url без дополнений), `server_id` = сервер токена; в `node_credentials` — только `sha256` от него, а не сам токен; повторный enroll тем же токеном → `401`, в журнале причина `used` |
-| два параллельных enroll одним токеном (10 горутин) | ровно один `200`, остальные `401`; в `node_credentials` одна активная строка на сервер |
+| два параллельных enroll одним токеном (5 горутин) | ровно один `200`, остальные `401`; в `node_credentials` одна активная строка на сервер |
+| enroll токеном, чей сервер удалён (внешний ключ снят на время теста) | тот же `401`, что и неизвестным токеном; в журнале причина `server_missing` |
+| отказ `last_used_at` (триггер `BEFORE UPDATE` на `node_credentials`) | desired — `200`, сбой записи только в журнале: учёт не имеет права выключать узел |
+| запрос, отклонённый лимитером | `429`, и `last_used_at` не записан: touch стоит после лимитера |
+| enroll и token/rotate | `Cache-Control: no-store` в обоих ответах: в теле секрет |
 | enroll при отказе вставки токена (триггер-сбой на `node_credentials`) | `500`; `bootstrap_tokens.used_at` нового токена остался `NULL`, прежний рабочий токен не отозван, `desired` с ним по-прежнему `200`: расход, отзыв и вставка откатились вместе |
 | desired с чужим токеном (`server_id` в пути ≠ токену) | `403 forbidden` |
 | desired с не-UUID в пути | `400 invalid_request`, поле в `details.field = server_id`; это НЕ 401 и НЕ 404: маршрут существует, токен принят, сломан путь |
@@ -3549,7 +3570,7 @@ Expected: PASS. В `internal/db/admin.sql.go` типы `peers_active`/`days` —
 
 | маршрут | поведение |
 |---|---|
-| `POST …/servers/{id}/bootstrap-tokens` | `{ttl_sec?}` (60..86400, по умолчанию 3600) → `32` байта `crypto/rand` → `base64.RawURLEncoding`, `sha256` в `token_hash`, `expires_at = now.Add(ttl)` (не `now() + $5::interval`: override'а на `interval` в sqlc.yaml нет, и параметром стал бы `pgtype.Interval` — см. правку задачи 1), `created_by = admin_id`. Ответ содержит сам токен один раз; `audit.Do(bootstrap_token_issued)` с `target_type="bootstrap_token"`. Сервера нет → `404`; сервер в `retired` → `409 conflict` («сервер выведен, выдавать ему токен бессмысленно») |
+| `POST …/servers/{id}/bootstrap-tokens` | `{ttl_sec?}` (60..86400, по умолчанию 3600) → `32` байта `crypto/rand` → `base64.RawURLEncoding`, `sha256` в `token_hash`, `expires_at = now.Add(ttl)` (не `now() + $5::interval`: override'а на `interval` в sqlc.yaml нет, и параметром стал бы `pgtype.Interval` — см. правку задачи 1), `created_by = admin_id`. Ответ содержит сам токен один раз и несёт `Cache-Control: no-store`: кэш посредника вернул бы рабочий секрет после отзыва. `audit.Do(bootstrap_token_issued)` с `target_type="bootstrap_token"`. Сервера нет → `404`; сервер в `retired` → `409 conflict` («сервер выведен, выдавать ему токен бессмысленно») |
 | `GET …/servers/{id}/bootstrap-tokens` | `LiveBootstrapTokensOfServer`: `id`, `created_at`, `expires_at`. Ни `token_hash`, ни, тем более, секрета — восстановить выданный токен нельзя по построению, и список обязан это показывать отсутствием поля |
 | `DELETE /api/v1/admin/bootstrap-tokens/{id}` | `RevokeBootstrapToken` (ноль строк = уже использован или отозван) → `409 conflict` (`ErrTokenNotLive`): «токен уже сожжён» и «токена нет» для админа — разные ситуации, и первая требует не повторного отзыва, а поиска узла, который его использовал. `audit.Do(bootstrap_token_revoked)` |
 | `POST …/servers/{id}/node-token/revoke` | `RevokeNodeCredentialsForServer` (`:execrows`, ноль — не ошибка: у ещё не зарегистрированного сервера отзывов нет) + `BumpServerConfigVersion` + `SetServerMaintenance(draining)` и `audit.Do(node_token_revoked)`; если сервер был `online`, второй записью того же `audit.Do` идёт `server_drained` — «узел отрезан» и «набор пиеров снят» должны читаться из журнала как одно решение, а не как два разных действия, разнесённых по времени |
@@ -3599,7 +3620,7 @@ password) string` — вход через настоящий маршрут (н�
 | `POST …/maintenance` `retired → online` | `409 conflict` |
 | `DELETE …/servers/{id}` при активном профиле | `409 conflict`, details `{"peers_active":1}`, сервер жив, профиль жив |
 | `DELETE …/servers/{id}` после отзыва профиля | `204`; сервера, его `tunnel_addresses`, `server_health`, `node_credentials`, остатков `vpn_profiles` — нет; `connection_events` его сервера остались с `server_id = null`; в аудите `server_deleted` с причиной |
-| `POST …/bootstrap-tokens` | `201`, токен `^[A-Za-z0-9_-]{43}$`, `expires_at ≈ now+3600s`; в `bootstrap_tokens` — только sha256; enroll этим токеном (маршрут задачи 11) даёт `200` |
+| `POST …/bootstrap-tokens` | `201`, токен `^[A-Za-z0-9_-]{43}$`, `Cache-Control: no-store`, `expires_at ≈ now+3600s`; в `bootstrap_tokens` — только sha256; enroll этим токеном (маршрут задачи 11) даёт `200` |
 | `ttl_sec = 30` и `ttl_sec = 100000` | `400 invalid_request` |
 | `DELETE /bootstrap-tokens/{id}` дважды | первый `204`, второй `409` |
 | `POST …/node-token/revoke` на `online`-сервере | `204`; предъявленный узлом токен → `401` на desired; сервер в `draining`; в аудите две записи — `node_token_revoked` и `server_drained`, один и тот же `request_id` |
@@ -4088,7 +4109,7 @@ peers[], measured_at}`, `Peer{public_key, allowed_ips[], expires_at, state}` —
 `listen_port`, а адрес наружной стороны знает админ (задача 12), и `servers.Peer` задачи 9
 никогда не имел полей `endpoint_hint`, `presplit`, `persistent_keepalive`, `comment`;
 `NodeEnrollRequest{bootstrap_token, public_key}`, `NodeToken{server_id, node_token}`,
-`ObservedReport{config_version, applied_at, interface_rx_bytes, interface_tx_bytes,
+`ObservedReport{config_version, interface_rx_bytes, interface_tx_bytes,
 peers[{public_key, latest_handshake, rx_bytes, tx_bytes}]}`,
 `Heartbeat{agent_version, agent_uptime_sec, load1?, cpu_pct?, applied_config_version}` —
 имена берутся из json-тегов `telemetry.ObservedReport`, `telemetry.PeerStat` и
