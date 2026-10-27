@@ -21,10 +21,14 @@ const routeUnmatched = "unmatched"
 // после next.ServeHTTP: иначе user id, который появляется только после проверки
 // JWT, в журнал не попал бы никогда.
 type journal struct {
-	mu      sync.Mutex
-	route   string
-	userID  uuid.UUID
-	hasUser bool
+	mu        sync.Mutex
+	route     string
+	userID    uuid.UUID
+	hasUser   bool
+	serverID  uuid.UUID
+	hasServer bool
+	adminID   uuid.UUID
+	hasAdmin  bool
 }
 
 type journalKey struct{}
@@ -54,6 +58,28 @@ func noteUserID(ctx context.Context, id uuid.UUID) {
 	}
 }
 
+// noteServerID — то же для узла. Вызывается из WithServerID (задача 11) и тоже
+// обязан быть безопасен без журнала.
+func noteServerID(ctx context.Context, id uuid.UUID) {
+	if j, ok := ctx.Value(journalKey{}).(*journal); ok {
+		j.mu.Lock()
+		j.serverID, j.hasServer = id, true
+		j.mu.Unlock()
+	}
+}
+
+// noteAdminID — то же для администратора. Вызывается из WithAdminID (задача 12) и
+// обязан быть безопасен без журнала. Email в журнал не кладётся: §10 и §15 запрещают
+// личности там, где есть id, а admin_id достаточно, чтобы сопоставить строку с
+// записью аудита.
+func noteAdminID(ctx context.Context, id uuid.UUID) {
+	if j, ok := ctx.Value(journalKey{}).(*journal); ok {
+		j.mu.Lock()
+		j.adminID, j.hasAdmin = id, true
+		j.mu.Unlock()
+	}
+}
+
 func (j *journal) attrs() []any {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -64,6 +90,12 @@ func (j *journal) attrs() []any {
 	attrs := []any{"route", route}
 	if j.hasUser {
 		attrs = append(attrs, "user_id", j.userID.String())
+	}
+	if j.hasServer {
+		attrs = append(attrs, "server_id", j.serverID.String())
+	}
+	if j.hasAdmin {
+		attrs = append(attrs, "admin_id", j.adminID.String())
 	}
 	return attrs
 }

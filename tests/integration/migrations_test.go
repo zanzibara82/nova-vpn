@@ -35,6 +35,28 @@ func TestMigrationsUpToDownToUp(t *testing.T) {
 		}
 	})
 
+	// Откат 0006 намеренно не умеет вычёркивать значения enum, добавленные A-2:
+	// он падает, а не теряет записи аудита. В общем прогоне admin-тесты успевают
+	// записать такие значения раньше этой проверки, и откат схемы спотыкался бы
+	// о фикстуры тестовой БД. Проверка up→down→up — про схему, поэтому фикстуры
+	// аудита убираются до отката.
+	preDown, err := pgx.Connect(ctx, databaseURL(t))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	if _, err := preDown.Exec(ctx, `DO $$ BEGIN
+		IF EXISTS (SELECT 1 FROM information_schema.tables
+		            WHERE table_schema='public' AND table_name='admin_audit_logs') THEN
+			TRUNCATE admin_audit_logs;
+		END IF;
+	END $$`); err != nil {
+		_ = preDown.Close(ctx)
+		t.Fatalf("truncate audit fixtures: %v", err)
+	}
+	if err := preDown.Close(ctx); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
 	if _, err := migrate.Steps(ctx, databaseURL(t), -1<<31); err != nil {
 		t.Fatalf("migrate down all: %v", err)
 	}

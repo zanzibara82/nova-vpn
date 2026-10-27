@@ -6,39 +6,208 @@ package db
 
 import (
 	"context"
+	"net/netip"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 type Querier interface {
+	ActiveProfileByDeviceServer(ctx context.Context, arg ActiveProfileByDeviceServerParams) (VpnProfile, error)
+	AddressOfProfile(ctx context.Context, allocatedTo *uuid.UUID) (netip.Addr, error)
+	AdminByEmail(ctx context.Context, email string) (AdminUser, error)
+	AdminByID(ctx context.Context, id uuid.UUID) (AdminByIDRow, error)
+	// Не UserByID: тот выбирает password_hash, а админ-просмотр не имеет права его
+	// даже читать. Отдельный запрос — способ «не создать возможность», а не «не забыть
+	// не показывать».
+	AdminUserView(ctx context.Context, id uuid.UUID) (AdminUserViewRow, error)
+	// Здесь нет `revoked_at IS NULL` и `expires_at > now()`: различить «нет такого токена»,
+	// «просрочен» и «израсходован» должен сервис, чтобы в журнал попали разные причины,
+	// а наружу уйти один отказ (задача 11).
+	BootstrapTokenByHash(ctx context.Context, tokenHash []byte) (BootstrapTokenByHashRow, error)
+	// Каждая смена набора пиеров поднимает версию: узел по ней отличает «ничего нового»
+	// от «надо перечитать» и по ней же работает If-None-Match (§4.1).
+	BumpServerConfigVersion(ctx context.Context, id uuid.UUID) (int64, error)
+	// Занято = «назначено сейчас» ИЛИ «освобождено, но окно переиспользования (§7.2)
+	// ещё не истекло». Окно считается по часам сервера, а не по переданному now():
+	// Go-выборка и DB-защита должны судить об одном и том же моменте.
+	BusyAddresses(ctx context.Context, serverID uuid.UUID) ([]netip.Addr, error)
+	// Каталог: только выведенные в online. health берётся LEFT JOIN'ом — узел может ещё
+	// ни разу не прислать heartbeat, и «неизвестно» здесь честнее, чем «ошибка».
+	// status идёт без каста в text: LEFT JOIN делает его nullable-enum, и `h.status::text`
+	// объявил бы колонку обязательной — Scan падал бы ровно там, где health ещё нет.
+	// NullHealthStatus слой каталога (задача 2) разворачивает в *string одним явным
+	// преобразованием, и «значения нет» остаётся отличием от «значение ok».
+	CatalogServers(ctx context.Context) ([]CatalogServersRow, error)
+	// INSERT..ON CONFLICT DO UPDATE с условием: если адрес успели занять между выборкой
+	// в Go и этим запросом, строка не возвращается, и аллокатор отказывается, а не
+	// перетирает чужое назначение. Это второй слой защиты поверх LockServerRow.
+	// Условие — ровно дополнение BusyAddresses: адрес свободен, только если он никому
+	// не назначен И окно переиспользования (§7.2) закрыто. Раздельные «ИЛИ» здесь
+	// означали бы, что освобождённый адрес можно взять мгновенно, а проверка Go-выборки
+	// обходилась бы на каждом конкурентном заходе.
+	ClaimAddress(ctx context.Context, arg ClaimAddressParams) (netip.Addr, error)
 	// ON CONFLICT DO NOTHING вместо SELECT-then-INSERT: два одновременных повтора
 	// одного ключа не должны оба дойти до бизнес-логики.
 	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (int64, error)
+	// Квитанция живёт дольше неподтверждённого пакета в Redis (48 часов).
+	ClaimTelemetryPacket(ctx context.Context, arg ClaimTelemetryPacketParams) (int64, error)
 	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) error
+	// Одноразовость на уровне БД: UPDATE с условием used_at IS NULL отдаёт строку ровно
+	// одному из двух параллельных enroll.
+	ConsumeBootstrapToken(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
+	CountActiveProfilesByDevice(ctx context.Context, deviceID uuid.UUID) (int64, error)
+	// §7.6: «удаление сервера возможно только при peers_active = 0».
+	CountActiveProfilesOnServer(ctx context.Context, serverID uuid.UUID) (int64, error)
 	CountLiveDevices(ctx context.Context, userID uuid.UUID) (int64, error)
 	DeleteIdempotencyKey(ctx context.Context, arg DeleteIdempotencyKeyParams) error
+	// Retention 90 дней (§6).
+	DeleteOldConnectionEvents(ctx context.Context) (int64, error)
+	// Остатки superseded/revoked/expired мешают удалению по FK RESTRICT; до этой точки
+	// активных уже нет (проверка выше), поэтому здесь удаляется всё, что осталось.
+	DeleteProfilesByServer(ctx context.Context, serverID uuid.UUID) ([]uuid.UUID, error)
+	DeleteServer(ctx context.Context, id uuid.UUID) error
+	// Всё, что узел может иметь право увидеть: активные и superseded профили сервера
+	// вместе с ключом устройства. Правила отсечения (окно overlap, преемник, handshake)
+	// живут в servers.Compute (задача 9), потому что проверять их хочется чистой
+	// функцией на случайных данных, а не через БД (§9.1).
+	DesiredCandidates(ctx context.Context, serverID uuid.UUID) ([]DesiredCandidatesRow, error)
 	DeviceByID(ctx context.Context, id uuid.UUID) (Device, error)
 	DeviceByUserAndKey(ctx context.Context, arg DeviceByUserAndKeyParams) (Device, error)
+	// Узел называет пиеров публичным ключом; пользователь и устройство — то, чем
+	// этот ключ был выдан. Ключи, которых нет в базе (снятый, но ещё видимый на узле),
+	// просто не возвращаются.
+	DevicesByPublicKeys(ctx context.Context, dollar_1 []string) ([]DevicesByPublicKeysRow, error)
+	// Порог приходит timestamptz'ом, вычисленным в Go (now.Add(-DormantAfter)), а не
+	// interval-параметром: override'а на interval в sqlc.yaml нет, и $1::interval стал бы
+	// pgtype.Interval — тот же сюрприз, что с InsertBootstrapToken в задаче 1.
+	// Окно привязано к issued_at, а не к порогу: профиль, выданный вчера, обязан иметь
+	// право быть новым, а handshake полгода назад для недельного dormancy — не доказательство.
+	DormantActiveProfiles(ctx context.Context, issuedAt time.Time) ([]DormantActiveProfilesRow, error)
+	// Профиль, у которого expires_at прошёл, но статус ещё 'active', — дыра: desired
+	// обязан его не отдавать (условие по времени в задаче 9), а «просрочено» как факт
+	// появляется только здесь (§6: событие profile_expired).
+	// d.user_id нужен sweeper'у (задача 13): событие без пользователя рвёт выборку
+	// «мои соединения» в §6, а доставать user_id отдельным запросом на профиль —
+	// способ видеть между двумя запросами чужое изменение.
+	ExpiredActiveProfiles(ctx context.Context) ([]ExpiredActiveProfilesRow, error)
+	// «Старый ключ снимается, как только наблюдался handshake нового» (§7.3).
+	// Источник истины — событие, а не Redis: при недоступном Redis снятие предка
+	// не должно откладываться до закрытия окна.
+	HandshakedDevicesAfter(ctx context.Context, arg HandshakedDevicesAfterParams) ([]*uuid.UUID, error)
+	// reason и request_id NOT NULL уже в схеме: аудит без причины — не аудит (ТЗ §9).
+	InsertAdminAudit(ctx context.Context, arg InsertAdminAuditParams) error
+	InsertAdminUser(ctx context.Context, arg InsertAdminUserParams) (InsertAdminUserRow, error)
+	// Срок жизни считается в Go (now.Add(ttl)), а не в SQL: в sqlc.yaml нет override на
+	// interval, и `now() + $5::interval` породил бы аргумент pgtype.Interval — тип, которого
+	// рукописные слои этого плана не видят (см. проверку задачи 1 на grep по pgtype).
+	InsertBootstrapToken(ctx context.Context, arg InsertBootstrapTokenParams) (InsertBootstrapTokenRow, error)
+	// detail — jsonb из «только коды и версии»: содержимое трафика сюда не кладёт
+	// ни один путь этого плана (ТЗ §11).
+	InsertConnectionEvent(ctx context.Context, arg InsertConnectionEventParams) error
 	InsertDevice(ctx context.Context, arg InsertDeviceParams) (Device, error)
+	InsertNodeCredential(ctx context.Context, arg InsertNodeCredentialParams) (InsertNodeCredentialRow, error)
 	InsertPlan(ctx context.Context, arg InsertPlanParams) (uuid.UUID, error)
+	// Статус и peer_state фиксированы 'active': другой вариант здесь был бы
+	// догадкой о том, что делает вызывающий код.
+	InsertProfile(ctx context.Context, arg InsertProfileParams) (VpnProfile, error)
 	InsertRefreshFamily(ctx context.Context, arg InsertRefreshFamilyParams) (uuid.UUID, error)
+	InsertServer(ctx context.Context, arg InsertServerParams) (VpnServer, error)
+	InsertServerLocation(ctx context.Context, arg InsertServerLocationParams) (ServerLocation, error)
 	InsertSubscription(ctx context.Context, arg InsertSubscriptionParams) (uuid.UUID, error)
 	InsertUser(ctx context.Context, arg InsertUserParams) (User, error)
+	// GET …/profiles/{server_id} обязан показать и отозванный профиль: человек имеет
+	// право видеть, что с его доступом случилось.
+	LatestProfileByDeviceServer(ctx context.Context, arg LatestProfileByDeviceServerParams) (VpnProfile, error)
+	// Вставить профиль сразу с rotate_from существующим InsertProfile не может: он описывает
+	// выдачу, где предка нет, а переписывать запрос задачи 1 под ротацию значило бы менять
+	// проверенный контракт. Отдельный запрос ставит то же поле в той же транзакции.
+	LinkRotatedProfile(ctx context.Context, arg LinkRotatedProfileParams) error
+	// Админский список серверов: то же, что каталог (§7 задачи 2), плюс служебное —
+	// maintenance_status, config_version и число активных профилей («сколько пиеров
+	// сорвётся при удалении», §7.6).
+	ListAllServers(ctx context.Context) ([]ListAllServersRow, error)
+	LiveBootstrapTokensOfServer(ctx context.Context, serverID uuid.UUID) ([]LiveBootstrapTokensOfServerRow, error)
 	LiveDevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error)
 	LiveSubscriptionByUser(ctx context.Context, userID uuid.UUID) (LiveSubscriptionByUserRow, error)
 	LoadIdempotencyKey(ctx context.Context, arg LoadIdempotencyKeyParams) (IdempotencyKey, error)
+	LocationByKey(ctx context.Context, arg LocationByKeyParams) (ServerLocation, error)
+	// Advisory lock на строку сервера: аллокация адреса обязана быть сериализованной
+	// по серверу, иначе две горутины выберут один свободный адрес (§6, §9.1).
+	LockServerRow(ctx context.Context, dollar_1 string) error
 	LockUser(ctx context.Context, arg LockUserParams) error
 	// hashtextextended даёт bigint-ключ из uuid; lock держится до конца транзакции.
 	LockUserForDeviceCount(ctx context.Context, dollar_1 string) error
 	MarkDeviceSeen(ctx context.Context, id uuid.UUID) error
+	MarkObservedHealth(ctx context.Context, arg MarkObservedHealthParams) error
+	// Просроченный профиль становится 'expired' отдельной операцией (sweeper, задача 13),
+	// а не «тихо не отдаётся»: событие profile_expired обязано существовать (§6).
+	MarkProfileExpired(ctx context.Context, id uuid.UUID) (MarkProfileExpiredRow, error)
+	MarkServerHealth(ctx context.Context, arg MarkServerHealthParams) error
+	// «Узел не присылал heartbeat 3 интервала» (3 × 30 с = 90 с, §4.3). Возвращает
+	// server_id, чтобы на каждый переход записать событие node_stale.
+	MarkStaleHealth(ctx context.Context) ([]uuid.UUID, error)
+	NodeCredentialByHash(ctx context.Context, tokenHash []byte) (NodeCredentialByHashRow, error)
+	// Анти-фрод-столбец живёт 90 дней, сама семья при этом остаётся (§6).
+	NullOldRefreshIPs(ctx context.Context) (int64, error)
+	ObservedDevicesByPublicKeys(ctx context.Context, arg ObservedDevicesByPublicKeysParams) ([]ObservedDevicesByPublicKeysRow, error)
 	PlanBySlug(ctx context.Context, slug string) (PlanBySlugRow, error)
 	PlanIDBySlug(ctx context.Context, slug string) (uuid.UUID, error)
+	// Нужен после отзыва: RevokeProfile возвращает четыре колонки, а выдаче обязано
+	// верить прочитанному состоянию, а не предположению о том, каким стал профиль.
+	// Правка существующего запроса вместо этого изменила бы контракт задачи 1, а он
+	// проверен её тестом.
+	ProfileByID(ctx context.Context, id uuid.UUID) (VpnProfile, error)
+	ProfilesByDevice(ctx context.Context, deviceID uuid.UUID) ([]VpnProfile, error)
+	// GET /me и админ-просмотр: список профилей всех устройств пользователя.
+	ProfilesByUser(ctx context.Context, userID uuid.UUID) ([]ProfilesByUserRow, error)
 	PurgeExpiredIdempotencyKeys(ctx context.Context) error
+	// Завершённые ключи хранятся сутки — окно, в котором разумен повтор запроса
+	// клиентом; незавершённые (abandoned) удаляются через неделю, потому что слот
+	// незавершённого ключа и так освобождается Abandon'ом (задача 9 A-1).
+	PurgeOldIdempotencyKeys(ctx context.Context) (int64, error)
+	// §7.3: смена ключа не меняет IP клиента, поэтому профиль потомка получает тот же
+	// address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
+	// (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
+	// следующий клиент получил бы адрес живого соединения.
+	//
+	// Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+	// одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+	// вызов, где их переставили, читается как правильный.
+	ReassignAddress(ctx context.Context, arg ReassignAddressParams) error
+	// Поклаговая разбивка (limit/offset) — то, ради чего §5.1 обещает «аудит»: список
+	// длиннее одного экрана, а фильтра по админу в A-2 нет намеренно (задача 12).
+	RecentAdminAudit(ctx context.Context, arg RecentAdminAuditParams) ([]AdminAuditLog, error)
+	// Блокировка сервера в вызывающей транзакции сериализует проверку и вставку события.
+	RecordHandshake(ctx context.Context, arg RecordHandshakeParams) error
 	// Ротация ищет семью по идентификатору из токена, а не по хэшу: именно это даёт
 	// детект переиспользования (секрет есть, но он не текущий → семья предательски отзывается).
 	RefreshByID(ctx context.Context, id uuid.UUID) (RefreshTokenFamily, error)
+	ReleaseAddressByProfile(ctx context.Context, allocatedTo *uuid.UUID) error
+	ReleaseAddressesByProfiles(ctx context.Context, dollar_1 []uuid.UUID) error
+	// Ротация переносит профили предка на потомка; список нужен сразу, потому что
+	// перенос обязан быть атомарным по всем серверам, где устройство сидит.
+	RevokeAllActiveByDeviceServer(ctx context.Context, deviceID uuid.UUID) ([]RevokeAllActiveByDeviceServerRow, error)
 	RevokeAllFamiliesForUser(ctx context.Context, userID uuid.UUID) error
+	// Все профили пользователя, включая устройства, отозванные раньше: у предка из цепочки
+	// ротации мог остаться незакрытым overlap-окно, и «заблокировали — а пиер живёт» для
+	// заблокированного аккаунта недопустимо.
+	RevokeAllProfilesOfUser(ctx context.Context, userID uuid.UUID) ([]RevokeAllProfilesOfUserRow, error)
+	RevokeBootstrapToken(ctx context.Context, id uuid.UUID) (RevokeBootstrapTokenRow, error)
 	RevokeDevice(ctx context.Context, id uuid.UUID) error
+	// revoked_at IS NULL: повторный отзыв не должен двигать отметку времени — по ней судят,
+	// когда доступ действительно перестал существовать.
+	RevokeDevices(ctx context.Context, dollar_1 []uuid.UUID) error
+	// Ротация гасит ровно предъявленный токен, а не «самый свежий токен узла»: у узла
+	// может быть два процесса, и отзыв по server_id лишил бы доступа тот, который
+	// ничего не просил.
+	RevokeNodeCredential(ctx context.Context, id uuid.UUID) (int64, error)
+	RevokeNodeCredentialsForServer(ctx context.Context, serverID uuid.UUID) (int64, error)
+	// overlap_valid_until не обнуляется: констрейнт profiles_peer_state требует
+	// ненулевого окна при peer_state='rotating_old_key', а тихое «починить» констрейнт
+	// правкой данных — это способ потерять настоящее состояние.
+	RevokeProfile(ctx context.Context, id uuid.UUID) (RevokeProfileRow, error)
+	RevokeProfilesForDevices(ctx context.Context, dollar_1 []uuid.UUID) ([]RevokeProfilesForDevicesRow, error)
 	RevokeRefreshFamily(ctx context.Context, arg RevokeRefreshFamilyParams) error
 	// Условие по старому хэшу — это и детект переиспользования, и атомарность ротации:
 	// второй запрос того же токена не найдёт семью как активную.
@@ -46,7 +215,43 @@ type Querier interface {
 	// (current_token_hash), и sqlc выдал бы два одинаковых имени поля. Через @name
 	// имена задаёт автор запроса.
 	RotateRefresh(ctx context.Context, arg RotateRefreshParams) (RotateRefreshRow, error)
+	// Цепочка ротации в обе стороны — два запроса, а не одно UNION-выражение: отзыв
+	// потомка обязан закрыть overlap предка (§7.3), а отзыв родителя обязан погасить
+	// потомка (для пользователя это то же устройство с новым ключом), и множества нужно
+	// объединить. Вариант «один CTE, объединяющий up и down» PostgreSQL принимает, а
+	// sqlc 1.27.0 — нет («column reference \"id\" is ambiguous»); вариант «два рекурсивных
+	// рекурсивных ветвей в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
+	// этого генератор теряется в тех же CTE.
+	RotationAncestorIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
+	// Нижний ход той же цепочки (см. комментарий у RotationAncestorIDs).
+	RotationDescendantIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error)
+	ServerByID(ctx context.Context, id uuid.UUID) (VpnServer, error)
+	ServerConfigVersion(ctx context.Context, id uuid.UUID) (int64, error)
+	ServerHealthOf(ctx context.Context, serverID uuid.UUID) (ServerHealth, error)
+	// Порядок задаёт админ, а не планировщик: advisory-блокировки серверов в задаче 8
+	// берутся ровно в этом порядке, и у двух параллельных блокировок разных пользователей
+	// не будет способа зайти в клинч.
+	ServersOfUserProfiles(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error)
+	SetServerMaintenance(ctx context.Context, arg SetServerMaintenanceParams) (SetServerMaintenanceRow, error)
+	SupersedeProfile(ctx context.Context, arg SupersedeProfileParams) (VpnProfile, error)
+	// last_used_at — доказательство жизни токена: отзыв «неиспользуемого» без этого поля
+	// был бы слепым.
+	TouchNodeCredential(ctx context.Context, id uuid.UUID) error
+	// Суммарный объём на устройство за окно (окно передаёт хендлер: 30 суток по умолчанию).
+	// Абсолюты за произвольное окно, а не «весь срок»: весь срок — это device_day_traffic
+	// без границы, и он растёт быстрее, чем экран админа.
+	TrafficByUserSince(ctx context.Context, arg TrafficByUserSinceParams) ([]TrafficByUserSinceRow, error)
 	UnlockUser(ctx context.Context, id uuid.UUID) error
+	// Не COALESCE по каждому полю: `capacity_mbps = null` означает «заявленная ёмкость
+	// снята», а не «не присылали». Обновление приходит полным набором (задача 12),
+	// поэтому явный набор полей честнее, чем различие «пропуск / null».
+	UpdateServerFields(ctx context.Context, arg UpdateServerFieldsParams) (VpnServer, error)
+	// Прирост, а не абсолют: узел репортирует счётчики, дельту считает telemetry.Delta
+	// (задача 10), а здесь она складывается в агрегат устройство-сутки (ADR-006).
+	UpsertDeviceDayTraffic(ctx context.Context, arg UpsertDeviceDayTrafficParams) error
+	// Один узел = одна строка наблюдаемого состояния; heartbeat и observed пишут её
+	// одними руками, поэтому наивный INSERT убивал бы второй отчёт того же узла.
+	UpsertServerHealth(ctx context.Context, arg UpsertServerHealthParams) error
 	UserByEmail(ctx context.Context, email string) (User, error)
 	UserByID(ctx context.Context, id uuid.UUID) (User, error)
 }

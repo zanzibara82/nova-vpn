@@ -5,10 +5,15 @@ import (
 	"strings"
 )
 
-// PatternResolver — то, что умеет сказать, каким шаблоном будет обслужен запрос.
-// *http.ServeMux удовлетворяет ему методом Handler(r); matching делает сам mux, и
-// снаружи его восстановить нечем.
+// PatternResolver — то, что умеет сказать, каким шаблоном будет обслужен запрос,
+// и обслужить его. *http.ServeMux удовлетворяет первому методом Handler(r), а
+// второму — ServeHTTP.
+//
+// ServeHTTP в интерфейсе обязателен, а не удобен: значения сегментов пути
+// ({id}, {server_id}) проставляет в запрос только ServeMux.ServeHTTP. Диспетчер
+// «по возвращённому handler'у» оставлял бы каждый маршрут с id в пути без id.
 type PatternResolver interface {
+	http.Handler
 	Handler(*http.Request) (http.Handler, string)
 }
 
@@ -31,9 +36,9 @@ var probeMethods = []string{
 // Имя маршрута в журнал здесь не пишется — это делает Logging (правило 3 выше).
 func Envelope(routes PatternResolver) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handler, pattern := routes.Handler(r)
-		if pattern != "" {
-			handler.ServeHTTP(w, r)
+		if _, pattern := routes.Handler(r); pattern != "" {
+			// Диспетчер — сам routes, а не вернувшийся handler: см. PatternResolver.
+			routes.ServeHTTP(w, r)
 			return
 		}
 		// Ветка «метод не тот» обязана проверяться до 404: у ServeMux оба случая

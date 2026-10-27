@@ -198,11 +198,25 @@ WireGuard-устройство создаётся через rtnetlink (`ip link
 | GET | `/devices/{id}/profiles` | список с `status`, `expires_at` |
 | DELETE | `/devices/{id}/profiles/{server_id}` | отзыв |
 | GET | `/devices/{id}/profiles/{server_id}/config` | готовый `[Interface]`/`[Peer]` текст |
-| POST | `/api/v1/admin/…` | серверы, отзыв токена узла, блокировка пользователя с причиной, аудит |
+| POST | `/api/v1/admin/login` | вход администратора: отдельный `iss` токена и отдельный лимитер |
+| GET/POST | `/api/v1/admin/servers` | список с `peers_active`; создание узла вместе с локацией |
+| GET/PATCH/DELETE | `/api/v1/admin/servers/{id}` | карточка с health; правка с bump `config_version`; удаление только при `peers_active = 0` |
+| POST | `/api/v1/admin/servers/{id}/maintenance` | `online\|draining\|maintenance\|retired`; `retired → online` → `409` |
+| POST/GET | `/api/v1/admin/servers/{id}/bootstrap-tokens` | выдача одного bootstrap-секрета и список живых без секретов |
+| DELETE | `/api/v1/admin/bootstrap-tokens/{id}` | отзыв неиспользованного bootstrap-токена |
+| POST | `/api/v1/admin/servers/{id}/node-token/revoke` | отзыв узлового токена, перевод в `draining`, bump |
+| POST | `/api/v1/admin/users/{id}/lock\|unlock` | блокировка с причиной: профили отозваны, адреса освобождены |
+| GET | `/api/v1/admin/users/{id}` | статус, устройства, объём за окно |
+| POST | `/api/v1/admin/admins` | создание администратора; первый заводится CLI, не API |
+| GET | `/api/v1/admin/audit` | журнал с причиной и `request_id`, `limit`/`offset` |
+
+Входа администратора в исходном ТЗ нет; маршрут добавлен планом A-2, потому что без него admin-токен неоткуда взять.
+
+Полный контракт цикла A — `api-spec/openapi.yaml`: публичные маршруты `/api/v1/*`, операционный API администратора и внутренний контракт узла `/internal/v1/*` перечислены там вместе со схемами тел, кодами ответов и схемами безопасности. Внутренний контракт узла: `POST /internal/v1/nodes/enroll` (анонимно, по стартовому токену), `GET /internal/v1/nodes/{server_id}/desired`, `POST /internal/v1/nodes/{server_id}/observed`, `POST /internal/v1/nodes/{server_id}/heartbeat`, `POST /internal/v1/nodes/{server_id}/token/rotate` — остальные четыре требуют узловой токен и сверяют `server_id` из пути с владельцем токена. `/internal/v1` не является частью публичного API.
 
 ### 5.2 Сквозные требования ТЗ §10
 
-- **Единый формат ошибки:** `{"error":{"code":"device_limit_reached","message":"…","details":{…},"request_id":"…"}}`. Коды стабильны и документированы в OpenAPI; `request_id` совпадает с journal entry.
+- **Единый формат ошибки:** `{"error":{"code":"device_limit_reached","message":"…","details":{…},"request_id":"…"}}`. Коды стабильны и документированы в OpenAPI; `request_id` совпадает с journal entry. Перечень включает `server_not_available` (409): «сервера нет в вашем плане» и «сервер не online» при выдаче профиля — это отдельный код, а не `conflict`, потому что клиенту нужно выбрать другой сервер, а не повторять тот же запрос; `503` здесь не используется намеренно — он обещал бы «повтори позже», которого администратор не выполнял.
 - **Язык сообщений:** продукт русскоязычный (решение 2026-10-22) — сообщения прикладного HTTP-слоя (регистрация, вход, устройства) пишутся по-русски; инфраструктурные строки middleware (идемпотентность, лимиты) остаются английскими, клиенты ориентируются на стабильные коды; `locale` по умолчанию — `ru` (раздел 6).
 - **Идемпотентность критических операций:** `Idempotency-Key` обязателен на `POST /devices`, `POST …/profiles`, `…/keys/rotate`. Повтор с тем же ключом возвращает первый результат; конфликт тела с сохранённым — `409 idempotency_key_conflict`; повтор с тем же ключом, пока первый запрос не завершён, — `409 idempotency_key_in_progress`.
 - **Авторизация** на всех маршрутах, кроме register/login/refresh/logout; проверка права на объект, а не только факта аутентификации (матрица «роль × маршрут» как тест — ТЗ §10 и ТЗ §14). Logout в исключениях, потому что отзыв обязан сработать и когда access уже истёк (иначе украденный refresh нельзя погасить постфактум); доказательство владения сессией — refresh-токен в теле, а не заголовок. Анонимность маршрута не означает «без лимита»: token bucket по IP на все четыре публичных маршрута навешивает сборщик, и перебор семей или отзыв чужих сессий на скорость не бесплатны.
@@ -232,7 +246,7 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 | `tunnel_addresses` | `primary key (server_id, address)`; аллокация под блокировкой строки сервера → коллизия адреса невозможна конструктивно |
 | `subscription_plans` | `slug`, `device_limit`, `server_selector`, `traffic_quota_bytes null = безлимит`, `trial_days` — в A один план `internal-default` |
 | `subscriptions` | `user_id`, `plan_id`, `status`, `starts_at`, `ends_at`, `source enum('manual','trial','billing')` — `billing` появится в D |
-| `server_health` | `server_id`, `observed_at`, `peers_configured`, `peers_handshaked`, `interface_rx/tx_bytes`, `load1`, `cpu_pct`, `applied_config_version`, `status enum('ok','stale','error')` |
+| `server_health` | `server_id`, `observed_at`, `peers_configured`, `peers_handshaked`, `interface_rx/tx_bytes`, `load1`, `cpu_pct`, `applied_config_version`, `status enum('ok','stale','error')`, `agent_version`, `agent_uptime_sec` — последние два приходят heartbeat'ом (§4.1) и добавлены миграцией 0006 цикла A-2 |
 | `connection_events` | `event enum('profile_issued','profile_revoked','profile_expired','peer_applied','peer_removed','handshake_observed','handshake_failed','node_stale','connection_error')`, `detail jsonb` — **только коды ошибок и версии, не содержимое трафика** |
 | `device_day_traffic` | `pk(user_id, device_id, day)`, `rx_bytes`, `tx_bytes` — единственный персистентный след объёмов (решение: агрегат на устройство-сутки) |
 | `admin_users`, `admin_audit_logs` | `admin_audit_logs(admin_id, action, target_type, target_id, reason not null, created_at)` |
@@ -271,7 +285,7 @@ Access — короткоживущий JWT (TTL 10 мин, `jti`), refresh — 
 
 ### 7.6 Вывод узла из эксплуатации
 
-`draining` → desired пуст → узел снимает всех; при вытеснении сервера админ видит число активных пиеров до подтверждения. Удаление сервера из каталога возможно только при `peers_active = 0`.
+`draining` → desired пуст → узел снимает всех; при вытеснении сервера админ видит число активных пиеров до подтверждения. Удаление сервера из каталога возможно только при `peers_active = 0`; остаточные профили в терминальных статусах удаляются вместе с сервером, узловой токен и bootstrap-токены гасятся каскадом, `connection_events` сохраняются с `server_id = null`.
 
 ---
 
@@ -390,7 +404,9 @@ apps/                            # появляется в C/E: web, admin, desk
 8. **MTU по умолчанию 1420** — консервативно; на пути с меньшим PMTU наблюдаются чёрные дыры, лечится `probe`-тестом и понижением значения на сервере.
 9. **Denylist access-токенов живёт в Redis и при недоступном Redis работает по fail-open:** отозванный logout-ом access доживает свой TTL (не больше 10 минут). Отзыв refresh и снятие пиера на узле от Redis не зависят, поэтому «забрать доступ к трафику» fail-open не отменяет.
 10. **Ответ на вход при неизвестном email и при неверном пароле одинаков по телу, но не по времени:** проверка argon2id выполняется только для существующего аккаунта. Добавочная задержка (`LoginGuard`) начинается с 250 мс, поэтому тайминг-канал полностью не закрывается; он ограничивается rate limit по IP и аккаунту. Искусственная фиктивная проверка не введена: 64 MiB памяти и ~100 мс CPU на любой запрос были бы хуже, чем утечка перечисления.
-11. **Блокировка аккаунта не обслуживает мгновенно уже выданный токен:** middleware проверяет подпись, срок и denylist, но `users.status` на каждый запрос не перечитывает — access, выданный до блокировки, живёт до истечения TTL (не больше 10 минут). Новые выдачи и ротацию refresh блокировка останавливает сразу, а «забрать доступ к трафику» делает снятие пиера на узле (§7.4), а не токен. Матрица задачи 19 фиксирует это как замеренное ограничение (`200` на `GET /devices` токеном, выданным до блокировки), а не как обещание мгновенного отзыва.
+11. **Блокировка аккаунта не обслуживает мгновенно уже выданный токен:** middleware проверяет подпись, срок и denylist, но `users.status` на каждый запрос не перечитывает — access, выданный до блокировки, живёт до истечения TTL (не больше 10 минут). Новые выдачи и ротацию refresh блокировка останавливает сразу, а «забрать доступ к трафику» делает снятие пиера на узле (§7.4), а не токен. Матрица задачи 19 фиксирует это как замеренное ограничение (`200` на `GET /devices` токеном, выданным до блокировки), а не как обещание мгновенного отзыва. Блокировка через админ-маршрут A-2 работает по той же схеме: `AccessTTL` — верхняя граница жизни уже выданного access-токена.
+12. **Отзыва администраторов в A-2 нет:** у `admin_users` нет `revoked_at`, а `DELETE` каскадом `SET NULL` обезличил бы прошлые записи аудита. Админ-токен живёт `AccessTTL` (не больше 30 минут); разделение прав внутри роли и отзыв — цикл C.
+13. **Создание администратора через CLI не оставляет записи в аудите:** `admin_audit_logs.admin_id` — внешний ключ на `admin_users`, и «создал сам себя» нечем записать до появления строки. След — строка stdout (`id`, `email`) и `created_at` в самой строке администратора.
 
 ---
 

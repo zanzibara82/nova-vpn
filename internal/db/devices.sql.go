@@ -9,7 +9,6 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countLiveDevices = `-- name: CountLiveDevices :one
@@ -84,7 +83,7 @@ type InsertDeviceParams struct {
 	PublicKey  string
 	Platform   DevicePlatform
 	Name       string
-	RotationOf pgtype.UUID
+	RotationOf *uuid.UUID
 }
 
 func (q *Queries) InsertDevice(ctx context.Context, arg InsertDeviceParams) (Device, error) {
@@ -164,4 +163,82 @@ UPDATE devices SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL
 func (q *Queries) RevokeDevice(ctx context.Context, id uuid.UUID) error {
 	_, err := q.db.Exec(ctx, revokeDevice, id)
 	return err
+}
+
+const revokeDevices = `-- name: RevokeDevices :exec
+UPDATE devices SET revoked_at = now()
+ WHERE id = ANY($1::uuid[]) AND revoked_at IS NULL
+`
+
+// revoked_at IS NULL: повторный отзыв не должен двигать отметку времени — по ней судят,
+// когда доступ действительно перестал существовать.
+func (q *Queries) RevokeDevices(ctx context.Context, dollar_1 []uuid.UUID) error {
+	_, err := q.db.Exec(ctx, revokeDevices, dollar_1)
+	return err
+}
+
+const rotationAncestorIDs = `-- name: RotationAncestorIDs :many
+WITH RECURSIVE up AS (
+    SELECT devices.id, devices.rotation_of FROM devices WHERE devices.id = $1
+  UNION ALL
+    SELECT d.id, d.rotation_of FROM devices AS d JOIN up ON d.id = up.rotation_of
+)
+SELECT up.id FROM up
+`
+
+// Цепочка ротации в обе стороны — два запроса, а не одно UNION-выражение: отзыв
+// потомка обязан закрыть overlap предка (§7.3), а отзыв родителя обязан погасить
+// потомка (для пользователя это то же устройство с новым ключом), и множества нужно
+// объединить. Вариант «один CTE, объединяющий up и down» PostgreSQL принимает, а
+// sqlc 1.27.0 — нет («column reference \"id\" is ambiguous»); вариант «два рекурсивных
+// рекурсивных ветвей в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
+// этого генератор теряется в тех же CTE.
+func (q *Queries) RotationAncestorIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, rotationAncestorIDs, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const rotationDescendantIDs = `-- name: RotationDescendantIDs :many
+WITH RECURSIVE down AS (
+    SELECT devices.id, devices.rotation_of FROM devices WHERE devices.id = $1
+  UNION ALL
+    SELECT d.id, d.rotation_of FROM devices AS d JOIN down ON d.rotation_of = down.id
+)
+SELECT down.id FROM down
+`
+
+// Нижний ход той же цепочки (см. комментарий у RotationAncestorIDs).
+func (q *Queries) RotationDescendantIDs(ctx context.Context, id uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, rotationDescendantIDs, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

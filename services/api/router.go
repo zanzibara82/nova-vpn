@@ -10,12 +10,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/novavpn/novavpn/internal/admin"
 	"github.com/novavpn/novavpn/internal/auth"
 	"github.com/novavpn/novavpn/internal/config"
+	"github.com/novavpn/novavpn/internal/connections"
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/devices"
 	"github.com/novavpn/novavpn/internal/entitlements"
 	"github.com/novavpn/novavpn/internal/httpx"
+	"github.com/novavpn/novavpn/internal/nodeapi"
+	"github.com/novavpn/novavpn/internal/servers"
+	"github.com/novavpn/novavpn/internal/telemetry"
 )
 
 // Окна лимитов. Спецификация §5.2 требует «register/login — по IP и по аккаунту»,
@@ -36,6 +41,19 @@ const (
 	// Закрытые маршруты: bucket на пользователя.
 	userPerMin = 600.0
 	userBurst  = 50
+	// Выдача профиля — отдельный бакет, а не часть общего бюджета закрытых
+	// маршрутов: при общем лимите один пользователь мог бы удерживать 30 выдач в
+	// минуту и одновременно делать 600 списаний, то есть платить за право
+	// заблокировать сервер чужим трафиком из своего же бюджета. Число и окно — §5.2,
+	// окно на пользователя (ключ тот же userKey, что у dec.Auth).
+	profileIssuePerMin = 30.0
+	profileIssueBurst  = 5
+	// Узловые маршруты: bucket на сервер (§4.1). 120 в минуту — это polling desired
+	// раз в секунду с запасом на отчёты, а burst 10 держит «узёл стартовал и навалил
+	// десять вызовов сразу». Числа — решение цикла A-2: спецификация просит
+	// «отдельный лимит для узла», не называя их.
+	nodePerMin = 120.0
+	nodeBurst  = 10
 )
 
 // planSlug — единственный план A-1; он же seed из миграции 0003 (задача 4).
@@ -54,11 +72,21 @@ func NewRouter(d Deps) http.Handler {
 	lim := httpx.NewLimiter(d.RDB, d.Log)
 	deny := auth.NewRedisDenylist(d.RDB, d.Log)
 	iss := auth.NewIssuer(d.Cfg.JWTSecret, d.Cfg.AccessTTL)
+	// Второй Issuer на том же секрете: различить id участника и id администратора
+	// по форме нельзя (оба uuid), поэтому роль держится в claim'е iss, а не в догадке
+	// вызывающей стороны. Отдельного env-параметра для срока админ-токена нет: второе
+	// число, которое никто не просил, обязано когда-нибудь разойтись с первым.
+	issAdmin := auth.NewAdminIssuer(d.Cfg.JWTSecret, d.Cfg.AccessTTL)
 	sess := auth.NewSessionService(q, iss, deny, d.Cfg.RefreshTTL, d.Log)
 	guard := auth.NewLoginGuard(d.RDB, d.Log)
 
 	// "/" здесь нет намеренно: с catch-all'ом Envelope теряет отличие 404 от 405.
 	mux := http.NewServeMux()
+
+	// Контракт узла строится до decorators: обёртка dec.Node берётся у самого
+	// модуля, чтобы проверка токена и маршруты опирались на один экземпляр
+	// Authenticator, иначе «кто этот узел» решалось бы в двух местах.
+	node := nodeapi.NewHandler(d.Pool, telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)
 
 	dec := httpx.Decorators{
 		// Закрытый маршрут: сначала проверка access JWT и denylist, потом bucket
@@ -69,6 +97,24 @@ func NewRouter(d Deps) http.Handler {
 				lim.Middleware("user", httpx.RatePerMinute(userPerMin), userBurst, userKey)(next))
 		},
 		Anonymous: lim.Middleware("anon", httpx.RatePerMinute(anonPerMin), anonBurst, routeIPKey(mux)),
+		// Узел — тот же порядок, что у Auth: nodeKey читает server_id из контекста,
+		// а появляется он только после проверки токена. Обратно (лимитер до
+		// аутентификации) означало бы общий бакет «unknown» для всех чужих токенов
+		// и отсутствие лимита у настоящего узла.
+		Node: func(next http.Handler) http.Handler {
+			return node.NodeMiddleware()(
+				lim.Middleware("node", httpx.RatePerMinute(nodePerMin), nodeBurst, nodeKey)(next))
+		},
+		// Админ — четвёртый класс доступа, а не «пользователь с другим id»: свой
+		// iss в токене, свой бакет лимитера и право на чужие данные. Порядок тот же,
+		// что у Auth и Node: adminKey читает admin_id из контекста, поэтому лимитер
+		// обязан идти после проверки токена. Числа окна совпадают с пользовательскими
+		// не потому, что это один бюджет, а потому что консоль оператора делает
+		// столько же кликов в минуту; бакеты при этом разные.
+		Admin: func(next http.Handler) http.Handler {
+			return admin.Middleware(issAdmin, d.Log)(
+				lim.Middleware("admin", httpx.RatePerMinute(userPerMin), userBurst, adminKey)(next))
+		},
 	}
 
 	mux.HandleFunc("GET /debug/health", health)
@@ -79,6 +125,25 @@ func NewRouter(d Deps) http.Handler {
 	auth.NewHandler(sess, d.Pool, d.Ent, guard, planSlug, d.Log).RegisterRoutes(mux, dec)
 	devices.NewHandler(devices.NewService(d.Pool, d.Ent),
 		httpx.NewIdempotency(httpx.NewPGIdempotency(d.Pool))).RegisterRoutes(mux, dec)
+	servers.NewHandler(servers.NewService(q)).RegisterRoutes(mux, dec)
+
+	// Профили: свой ограничитель поверх того же пользователя. Порядок обёрток
+	// (auth → лимит выдачи → идемпотентность → хендлер) задаёт модуль, здесь
+	// решается только из чего он собран: 429 обязан случиться до записи слота
+	// идемпотентности, иначе отклонённый запрос оставил бы занятой ключ.
+	profileIssue := lim.Middleware("profile_issue", httpx.RatePerMinute(profileIssuePerMin),
+		profileIssueBurst, userKey)
+	connections.NewHandler(connections.NewService(d.Pool, d.Ent),
+		httpx.NewIdempotency(httpx.NewPGIdempotency(d.Pool)), profileIssue).RegisterRoutes(mux, dec)
+
+	// Контракт узла монтируется здесь, а не выше: маршруты /internal/v1 не зависят
+	// от пользовательских, но собираются из того же пула и того же Redis.
+	node.RegisterRoutes(mux, dec)
+
+	// Админский контур — последний: он делит с остальными и пул, и LoginGuard, и
+	// журнал, но не делит бакеты лимитеров. Маршрут входа смонтирован под
+	// dec.Anonymous, поэтому он существует до того, как кто-то получил токен.
+	admin.NewHandler(d.Pool, q, issAdmin, guard, d.Log).RegisterRoutes(mux, dec)
 
 	// Порядок цепочки: request id (чтобы конверт 404 имел что поставить в
 	// request_id), журнал (видит и 429, и панику, и называет маршрут до диспетчера),
@@ -123,6 +188,31 @@ func userKey(r *http.Request) string {
 	id, ok := httpx.UserIDFromContext(r.Context())
 	if !ok {
 		return "anonymous"
+	}
+	return id.String()
+}
+
+// nodeKey — бакет на узел, а не на путь: один vpn-сервер, сломавший цикл desired,
+// не имеет права отъедать бюджет у остальных узлов, и тем более у чужих IP.
+// "unknown" — это запрос без принятого токена: у него нет субъекта, а отказ ему
+// всё равно вернётся до лимитера.
+func nodeKey(r *http.Request) string {
+	id, ok := httpx.ServerIDFromContext(r.Context())
+	if !ok {
+		return "unknown"
+	}
+	return id.String()
+}
+
+// adminKey — бакет на администратора, а не на IP: операторы сидят в одной сети, где
+// адрес один на всех, и общий по IP бакет означал бы, что один человек с открытой
+// консолью исчерпывает бюджет коллег. Без admin_id ключом становится IP — это ветка
+// для маршрута, смонтированного без dec.Admin (опечатка в сборке), а не для
+// отклонённого токена: отказ выдаёт сам Middleware и до лимитера не доходит.
+func adminKey(r *http.Request) string {
+	id, ok := httpx.AdminIDFromContext(r.Context())
+	if !ok {
+		return ipKey(r)
 	}
 	return id.String()
 }

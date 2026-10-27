@@ -24,6 +24,10 @@ type Entitlement struct {
 	DeviceLimit       int
 	ServerSelector    string
 	TrafficQuotaBytes *int64
+
+	// Когда подписка кончается. Профили выдаются ровно до этой отметки (задача 5):
+	// право не должно пережить источник права.
+	EndsAt *time.Time
 }
 
 func (e Entitlement) AllowsDevice(liveCount int) bool { return liveCount < e.DeviceLimit }
@@ -59,6 +63,7 @@ func (s *Service) ForUser(ctx context.Context, userID uuid.UUID) (Entitlement, e
 		DeviceLimit:       int(row.DeviceLimit),
 		ServerSelector:    row.ServerSelector,
 		TrafficQuotaBytes: row.TrafficQuotaBytes,
+		EndsAt:            row.EndsAt,
 	})
 }
 

@@ -195,11 +195,88 @@ docs/testing-status.md
     поэтому задача 14 начинается с правки этого теста, а не с правки YAML: иначе первое, что
     увидит исполнитель, — падение чужой проверки без объяснения.
 
+Находки задачи 1 — они же правки её же блоков, записаны здесь, чтобы не выглядеть тихими
+расхождениями плана с кодом:
+
+12. **`ANY($n)` без каста массива даёт скаляр.** sqlc 1.27.0 не выводит `[]uuid.UUID` из
+    `allocated_to = ANY($1)`: в сгенерированном `Params` поле становится `*uuid.UUID`, то есть
+    вызов уйдёт в PostgreSQL со скаляром вместо массива. Два запроса плана (`ReleaseAddressesByProfiles`,
+    `HandshakedDevicesAfter`) были в этом виде и сломались бы молча — сейчас каст `::uuid[]`
+    в них восстановлен, а тест `TestArrayParamsMatchRows` вызывает оба вживую. Плата за
+    корректный тип — безымянные поля `Column3` и `dollar_1`: генератор не может связать
+    параметр с колонкой, когда тот массив.
+13. **Ключ override'а для `numeric` — `pg_catalog.numeric`, а не `numeric`.** С просто
+    `numeric` override не применяется **молча**: ни ошибки, ни изменения типа, колонка
+    остаётся `pgtype.Numeric`. Проверено прогоном генератора на `numeric`, `numeric(9,6)`
+    и `numeric(6,3)`.
+14. **Для `date` тот же механизм ведёт себя наоборот: ключ — `date`.** С `pg_catalog.date`
+    override не применяется. Единственная date-колонка схемы — `device_day_traffic.day`, и в
+    исходном списке override'ов её не было вовсе, то есть задача 10 получила бы `pgtype.Date`
+    там, где план обещал отсутствие pgtype. Override добавлен, комментарий в `sqlc.yaml`
+    фиксирует оба асимметричных случая рядом.
+15. **Каст на колонке в SELECT объявляет её NOT NULL.** `p.rotate_from::text`,
+    `rotated_from::text`, `load1::text`, `status::text` заставляли генератор считать nullable-
+    колонку обязательной, и `Scan` падал бы на отсутствующем значении — ровно там, где «данных
+    нет» является рабочим состоянием (health ещё не прислан, ротации не было). Все эти касты
+    сняты: `rotate_from` приходит `*uuid.UUID` (благодаря override'у из задачи 1, а не pgtype),
+    `health_status` — честным `NullHealthStatus`, `load1`/`cpu_pct` — `*string`. Сняты и
+    `$n::numeric`/`$n::cidr` в позициях параметров, где тип берётся из колонки: они лишь
+    порождают `ColumnN` (см. находку 12).
+16. **Окно переиспользования адреса в `ClaimAddress` не работало.** Условие
+    `WHERE allocated_to IS NULL OR (reusable_at IS NOT NULL AND reusable_at <= now())`
+    соединяло «свободен» и «окно истекло» союзом «ИЛИ», поэтому только что освобождённый
+    адрес был доступен немедленно и защита Go-выборки обходилась на каждом конкурентном
+    заходе. `TestClaimAddressIsExclusive` поймал это на первом же прогоне; условие стало
+    дополнением `BusyAddresses` (см. шаг 5).
+17. **Проверка «рукописные слои не касаются pgtype» не может быть grep'ом по слову.** Слово
+    `pgtype` живёт в двух комментариях, объясняющих, почему срок жизни bootstrap-токена
+    считается в Go (находка 10), и grep по слову выдавал бы ложное совпадение в
+    сгенерированном коде. Обе проверки задачи 1 переведены на grep по import'у
+    `jackc/pgx/v5/pgtype` — он пуст, что и есть утверждение о типах.
+18. **Случай «серверов нет» из таблицы задачи 2 неисполним на живой dev-базе.** Каталог не
+    фильтруется по пользователю, база между прогонами одна и та же, а порядок запуска тестов
+    в пакете — не инструмент создания пустоты. Проверка перенесена на `emptyDBTX` (стаб
+    `db.DBTX`): утверждение этого случая говорит только о сериализации пустого среза, и
+    оставлять его `t.Skip`-ом «пока база непустая» значило бы держать непроверенный случай
+    контракта.
+19. **`null` и «ключа нет» различимы только до типизированного decode.** Проверка
+    `capacity_mbps`/`latency_ms`/`load` через `servers.Summary` не отличила бы отсутствие
+    поля от `null`, а это ровно та грань, на которой держится обещание ADR-006; ответ
+    разбирается в `[]map[string]json.RawMessage`. Тот же разбор показал, что координаты
+    обязаны выйти JSON-числом: после override'а задачи 1 `lat`/`lon` — строки, и прямая
+    подача их наружу была бы видна только такому тесту.
+
+20. **Аллокация не может быть одной функцией.** План задача 4 описывал `Allocate` как
+    «лок → занятые → выборка → занятие», а задача 5 ставила его перед `InsertProfile`. Так
+    не работает: `tunnel_addresses.allocated_to` ссылается на `vpn_profiles(id)`, и
+    PostgreSQL проверяет этот Foreign Key немедленно (проверено запросом на живой dev-базе,
+    а не чтением миграции). Проверка была бы тихим 23503 на каждой выдаче, и ловилась бы
+    только интеграционным тестом, если вообще бы до него дошло. Функции две: `Allocate`
+    выбирает, `Claim` занимает после вставки профиля. Внутренний ретрай занятия, который
+    план обещал в `Allocate`, при таком порядке некуда поместить — он перенесён на уровень
+    транзакции (задача 5) и обязан быть конечным.
+21. **Окно переиспользования закрывается только парой полей.** `addresses_window` из 0002
+    требует `reusable_at >= released_at`, поэтому тест, который «сдвигает окно в прошлое»
+    одним полем, падает на констрейнте, а не проверяет правило §7.2. Оба timestamps
+    сдвигаются вместе — и это же ограничение ляжет в sweeper задачи 13, где освобождение
+    адреса будет массовым.
+22. **Отзыв обязан перечитать профиль.** План обещал, что `Revoke` возвращает отозванный
+    профиль, но читается он до транзакции, где статус ещё активный, а `RevokeProfile` поднимает
+    только четыре колонки. Возвращать прочитанное до выдачи значило бы вернуть статус `active`
+    там, где человек ждёт подтверждения отзыва. Добавлен запрос `ProfileByID` (перечитывание
+    внутри той же транзакции), а не правка `RevokeProfile`: её контракт проверен тестом
+    задачи 1.
+23. **Таблица ответов не покрывала гонку занятия адреса.** В шаге 2 задачи 6 перечислены
+    `pool_exhausted`, `conflict` и `server_not_available`, но отказ `ErrAddressRace`
+    (кто-то обошёл блокировку) остался без строки, хотя сервис возвращает его с задачи 4.
+    Хендлер отдаёт `409 conflict` с `details.reason = "address_race"` — преходящий отказ,
+    который клиент вправе повторить; контракт задачи 14 обязан перечислить оба значения.
+
 ---
 
 ## Задачи
 
-### Task 1: sqlc-запросы сетевого слоя, миграция 0006 и два override'а генератора
+### Task 1: sqlc-запросы сетевого слоя, миграция 0006 и три override'а генератора
 
 **Files:**
 - Create: `migrations/0006_node_telemetry_admin.up.sql`, `migrations/0006_node_telemetry_admin.down.sql`,
@@ -216,10 +293,14 @@ docs/testing-status.md
   `BumpServerConfigVersion`, `BusyAddresses`, `ClaimAddress`, `ReleaseAddressByProfile`,
   `InsertProfile`, `DesiredCandidates`, `HandshakedDevicesAfter`, `SupersedeProfile`,
   `RevokeProfile`, `RevokeProfilesForDevices`, `NodeCredentialByHash`, `ConsumeBootstrapToken`,
+  `RevokeNodeCredential` (добавлена задачей 11: отзыв предъявленного токена при ротации),
   `UpsertServerHealth`, `UpsertDeviceDayTraffic`, `InsertConnectionEvent`, `AdminByEmail`,
   `InsertAdminAudit`, `ExpiredActiveProfiles`, `MarkStaleHealth`, …).
-- Типы после override'ов: `numeric` → `string` (nullable → `*string`), nullable `uuid` →
-  `*uuid.UUID`. Оба нужны, чтобы в задачах 9/10/12 не писать ручной мост через `pgtype`.
+- Типы после override'ов: `numeric` → `string` (nullable → `*string`), `date` → `time.Time`,
+  nullable `uuid` → `*uuid.UUID`. Все три нужны, чтобы в задачах 9/10/12 не писать ручной
+  мост через `pgtype`. Ключи поиска у sqlc 1.27.0 выдержаны непоследовательно: `numeric`
+  ищется с префиксом схемы (`pg_catalog.numeric`), а `date` — без него; оба проверены
+  прогоном, и в комментарии к каждому записано, какой именно вариант работает.
 
 - [ ] **Step 1: Миграция 0006 — дословный исходник `migrations/0006_node_telemetry_admin.up.sql`**
 
@@ -261,20 +342,33 @@ ALTER TYPE audit_action_old RENAME TO audit_action;
 
 - [ ] **Step 3: Override'ы генератора — дословная правка `sqlc.yaml`**
 
-В конец блока `overrides:` добавить два элемента (перед `cidr`), не трогая существующие:
+В конец блока `overrides:` добавить четыре элемента (три ключа `db_type`:
+`pg_catalog.numeric`, `pg_catalog.numeric` + `nullable`, `date`, `uuid` + `nullable`) —
+перед `cidr`, не трогая существующие:
 
 ```yaml
           # numeric(9,6) координат и numeric load1/cpu_pct: в задачах 2 и 10 значения
           # читаются и сравниваются, а pgtype.Numeric для этого — лишний слой. Строка
           # сохраняет ровно ту точность, которую даёт numeric в фикстуре, и честно
           # показывает «значения нет» указателем (emit_pointers_for_null_types).
-          - db_type: "numeric"
+          # Ключ — "pg_catalog.numeric": с просто "numeric" override молча не применяется
+          # (проверено прогоном sqlc 1.27.0 на numeric, numeric(9,6) и numeric(6,3)).
+          - db_type: "pg_catalog.numeric"
             go_type: "string"
-          - db_type: "numeric"
+          - db_type: "pg_catalog.numeric"
             nullable: true
             go_type:
               type: "string"
               pointer: true
+          # Единственная date-колонка схемы — device_day_traffic.day. Без override она
+          # приходит pgtype.Date, и задаче 10 пришлось бы руками собирать дату в
+          # pgtype-обёртку ради одного поля; pgx/v5 кодирует time.Time в date нативно.
+          # Ключ — "date": для date sqlc 1.27.0 имя ищет без схемы, и с "pg_catalog.date"
+          # колонка остаётся pgtype.Date (проверено тем же прогоном, что и numeric).
+          - db_type: "date"
+            go_type:
+              import: "time"
+              type: "Time"
           # NULL-uuid без этого остаётся pgtype.UUID, и каждую nullable-ссылку
           # (rotate_from, admin_id, user_id события) приходится оборачивать руками.
           # pgx/v5 кодирует *uuid.UUID нативно.
@@ -287,11 +381,14 @@ ALTER TYPE audit_action_old RENAME TO audit_action;
 ```
 
 Run: `make sqlc-generate && make unit && make vet`
-Expected: PASS. Единственный ожидаемый шум — `internal/db/models.go` и
-`internal/db/devices.sql.go`: `RotationOf pgtype.UUID` становится `*uuid.UUID`. Ни один
-рукописный файл на хосте `pgtype.UUID` не использует (проверить
-`grep -rn "pgtype.UUID" --include=*.go internal services tests | grep -v "^internal/db/"` —
-пусто); `devices.Register` поле `RotationOf` не заполняет, поэтому `nil` там и был.
+Expected: PASS. Ожидаемый шум — `internal/db/models.go`, `internal/db/devices.sql.go` и
+`internal/db/querier.go`: `RotationOf pgtype.UUID` становится `*uuid.UUID`, а в интерфейсе
+`Querier` добавляются методы новых файлов запросов. Ни один рукописный файл `pgtype` не
+использует, и после регенерации его не использует ни один сгенерированный: проверить
+`grep -rn "jackc/pgx/v5/pgtype" --include=*.go .` — пусто. (Слово `pgtype` остаётся в двух
+комментариях, объясняющих, почему срок жизни bootstrap-токена считается в Go, — это текст, а
+не тип, и grep по import'у потому и точнее grep по слову.) `devices.Register` поле `RotationOf`
+не заполняет, поэтому `nil` там и был.
 
 - [ ] **Step 4: `internal/db/query/servers.sql` — дословный исходник**
 
@@ -299,12 +396,14 @@ Expected: PASS. Единственный ожидаемый шум — `internal
 -- name: CatalogServers :many
 -- Каталог: только выведенные в online. health берётся LEFT JOIN'ом — узел может ещё
 -- ни разу не прислать heartbeat, и «неизвестно» здесь честнее, чем «ошибка».
--- status кастится в text, чтобы nullable-enum не превращался в NullHealthStatus:
--- слой каталога работает со строкой статуса.
+-- status идёт без каста в text: LEFT JOIN делает его nullable-enum, и `h.status::text`
+-- объявил бы колонку обязательной — Scan падал бы ровно там, где health ещё нет.
+-- NullHealthStatus слой каталога (задача 2) разворачивает в *string одним явным
+-- преобразованием, и «значения нет» остаётся отличием от «значение ok».
 SELECT s.id, s.name, s.advertised_host, s.listen_port, s.mtu, s.keepalive_sec,
        s.provider, s.region, s.capacity_mbps,
        l.country_code, l.city, l.lat, l.lon, l.timezone,
-       h.status::text   AS health_status,
+       h.status         AS health_status,
        h.observed_at    AS health_observed_at
 FROM vpn_servers s
 JOIN server_locations l ON l.id = s.location_id
@@ -339,18 +438,18 @@ RETURNING id, name, maintenance_status;
 -- name: LocationByKey :one
 SELECT id, country_code, city, lat, lon, timezone
 FROM server_locations
-WHERE country_code = $1 AND city = $2 AND lat = $3::numeric AND lon = $4::numeric;
+WHERE country_code = $1 AND city = $2 AND lat = $3 AND lon = $4;
 
 -- name: InsertServerLocation :one
 INSERT INTO server_locations (id, country_code, city, lat, lon, timezone)
-VALUES ($1, $2, $3, $4::numeric, $5::numeric, $6)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING id, country_code, city, lat, lon, timezone;
 
 -- name: InsertServer :one
 INSERT INTO vpn_servers (id, location_id, name, advertised_host, listen_port, public_key,
                          address_pool_v4, mtu, keepalive_sec, provider, region, capacity_mbps,
                          maintenance_status)
-VALUES ($1, $2, $3, $4, $5, $6, $7::cidr, $8, $9, $10, $11, $12, 'maintenance')
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'maintenance')
 RETURNING id, location_id, name, advertised_host, listen_port, public_key,
           address_pool_v4, mtu, dns_mode, keepalive_sec, config_version,
           maintenance_status, provider, region, capacity_mbps;
@@ -396,6 +495,10 @@ WHERE server_id = $1
 -- INSERT..ON CONFLICT DO UPDATE с условием: если адрес успели занять между выборкой
 -- в Go и этим запросом, строка не возвращается, и аллокатор отказывается, а не
 -- перетирает чужое назначение. Это второй слой защиты поверх LockServerRow.
+-- Условие — ровно дополнение BusyAddresses: адрес свободен, только если он никому
+-- не назначен И окно переиспользования (§7.2) закрыто. Раздельные «ИЛИ» здесь
+-- означали бы, что освобождённый адрес можно взять мгновенно, а проверка Go-выборки
+-- обходилась бы на каждом конкурентном заходе.
 INSERT INTO tunnel_addresses (server_id, address, allocated_to)
 VALUES ($1, $2, $3)
 ON CONFLICT (server_id, address) DO UPDATE
@@ -403,8 +506,8 @@ ON CONFLICT (server_id, address) DO UPDATE
         released_at  = NULL,
         reusable_at  = NULL
   WHERE tunnel_addresses.allocated_to IS NULL
-     OR (tunnel_addresses.reusable_at IS NOT NULL
-         AND tunnel_addresses.reusable_at <= now())
+    AND (tunnel_addresses.reusable_at IS NULL
+         OR tunnel_addresses.reusable_at <= now())
 RETURNING address;
 
 -- name: ReleaseAddressByProfile :exec
@@ -421,6 +524,19 @@ UPDATE tunnel_addresses
 
 -- name: AddressOfProfile :one
 SELECT address FROM tunnel_addresses WHERE allocated_to = $1;
+
+-- name: ReassignAddress :exec
+-- §7.3: смена ключа не меняет IP клиента, поэтому профиль потомка получает тот же
+-- address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
+-- (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
+-- следующий клиент получил бы адрес живого соединения.
+--
+-- Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+-- одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+-- вызов, где их переставили, читается как правильный.
+UPDATE tunnel_addresses SET allocated_to = sqlc.arg(new_profile_id)
+ WHERE server_id = sqlc.arg(server_id) AND address = sqlc.arg(address)
+   AND allocated_to = sqlc.arg(old_profile_id);
 ```
 
 - [ ] **Step 6: `internal/db/query/profiles.sql` — дословный исходник**
@@ -468,9 +584,8 @@ ORDER BY p.issued_at;
 -- вместе с ключом устройства. Правила отсечения (окно overlap, преемник, handshake)
 -- живут в servers.Compute (задача 9), потому что проверять их хочется чистой
 -- функцией на случайных данных, а не через БД (§9.1).
--- rotate_from::text — чтобы nullable-ссылка осталась строкой, а не pgtype.UUID.
 SELECT p.id, p.device_id, p.server_id, p.address_v4, p.status, p.expires_at,
-       p.overlap_valid_until, p.peer_state, p.rotate_from::text AS rotate_from,
+       p.overlap_valid_until, p.peer_state, p.rotate_from,
        d.public_key, d.revoked_at AS device_revoked_at
 FROM vpn_profiles p
 JOIN devices d ON d.id = p.device_id
@@ -502,14 +617,13 @@ UPDATE vpn_profiles
  RETURNING id, server_id, address_v4, device_id;
 
 -- name: RevokeProfilesForDevices :many
--- Отзыв устройства = отзыв всех его профилей (§5.1). Возвращает server_id, потому
--- что именно по нему вызывающий код поднимает config_version: забыть сервер —
--- значит оставить пиера в desired set живым.
-UPDATE vpn_profiles
+UPDATE vpn_profiles p
    SET status = 'revoked', revoked_at = now()
- WHERE device_id = ANY($1::uuid[]) AND status IN ('active', 'superseded')
- RETURNING id, server_id, device_id;
-
+  FROM devices d
+ WHERE p.id IN (SELECT id FROM vpn_profiles
+                 WHERE device_id = ANY($1::uuid[]) AND status IN ('active','superseded'))
+   AND p.device_id = d.id
+ RETURNING p.id, p.server_id, p.device_id, d.user_id;
 -- name: CountActiveProfilesByDevice :one
 SELECT count(*) FROM vpn_profiles WHERE device_id = $1 AND status = 'active';
 
@@ -525,6 +639,21 @@ UPDATE vpn_profiles SET status = 'expired'
 -- перенос обязан быть атомарным по всем серверам, где устройство сидит.
 SELECT id, server_id, address_v4, expires_at FROM vpn_profiles
 WHERE device_id = $1 AND status = 'active';
+
+-- name: ProfileByID :one
+-- Нужен после отзыва: RevokeProfile возвращает четыре колонки, а выдаче обязано
+-- верить прочитанному состоянию, а не предположению о том, каким стал профиль.
+-- Правка существующего запроса вместо этого изменила бы контракт задачи 1, а он
+-- проверен её тестом.
+SELECT id, device_id, server_id, address_v4, status, issued_at, expires_at,
+       overlap_valid_until, revoked_at, rotate_from, peer_state
+FROM vpn_profiles WHERE id = $1;
+
+-- name: LinkRotatedProfile :exec
+-- Вставить профиль сразу с rotate_from существующим InsertProfile не может: он описывает
+-- выдачу, где предка нет, а переписывать запрос задачи 1 под ротацию значило бы менять
+-- проверенный контракт. Отдельный запрос ставит то же поле в той же транзакции.
+UPDATE vpn_profiles SET rotate_from = $2 WHERE id = $1;
 ```
 
 - [ ] **Step 7: `internal/db/query/nodeapi.sql` — дословный исходник**
@@ -532,7 +661,7 @@ WHERE device_id = $1 AND status = 'active';
 ```sql
 -- name: NodeCredentialByHash :one
 SELECT id, server_id, issued_at, last_used_at, revoked_at,
-       rotated_from::text AS rotated_from
+       rotated_from
 FROM node_credentials WHERE token_hash = $1 AND revoked_at IS NULL;
 
 -- name: TouchNodeCredential :exec
@@ -548,6 +677,13 @@ RETURNING id, server_id, issued_at;
 -- name: RevokeNodeCredentialsForServer :execrows
 UPDATE node_credentials SET revoked_at = now()
  WHERE server_id = $1 AND revoked_at IS NULL;
+
+-- name: RevokeNodeCredential :execrows
+-- Ротация гасит ровно предъявленный токен, а не «самый свежий токен узла»: у узла
+-- может быть два процесса, и отзыв по server_id лишил бы доступа тот, который
+-- ничего не просил.
+UPDATE node_credentials SET revoked_at = now()
+ WHERE id = $1 AND revoked_at IS NULL;
 
 -- name: BootstrapTokenByHash :one
 -- Здесь нет `revoked_at IS NULL` и `expires_at > now()`: различить «нет такого токена»,
@@ -592,7 +728,7 @@ ORDER BY created_at;
 INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
                            interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
                            applied_config_version, status, agent_version, agent_uptime_sec)
-VALUES ($1, $2, $3, $4, $5, $6, $7::numeric, $8::numeric, $9, $10, $11, $12)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (server_id) DO UPDATE SET
     observed_at            = EXCLUDED.observed_at,
     peers_configured       = EXCLUDED.peers_configured,
@@ -629,11 +765,76 @@ SELECT id, user_id, public_key FROM devices WHERE public_key = ANY($1::text[]);
 
 -- name: ServerHealthOf :one
 SELECT server_id, observed_at, peers_configured, peers_handshaked,
-       interface_rx_bytes, interface_tx_bytes, load1::text AS load1,
-       cpu_pct::text AS cpu_pct, applied_config_version, status::text AS status,
+       interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
+       applied_config_version, status,
        agent_version, agent_uptime_sec
 FROM server_health WHERE server_id = $1;
+
+-- name: MarkObservedHealth :exec
+INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
+                           interface_rx_bytes, interface_tx_bytes, applied_config_version, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'ok')
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    peers_configured = EXCLUDED.peers_configured,
+    peers_handshaked = EXCLUDED.peers_handshaked,
+    interface_rx_bytes = EXCLUDED.interface_rx_bytes,
+    interface_tx_bytes = EXCLUDED.interface_tx_bytes,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok';
+
+-- name: MarkServerHealth :exec
+INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,
+                           applied_config_version, status, agent_version, agent_uptime_sec)
+VALUES ($1, $2, $3, $4, $5, 'ok', $6, $7)
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    load1 = EXCLUDED.load1,
+    cpu_pct = EXCLUDED.cpu_pct,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok',
+    agent_version = EXCLUDED.agent_version,
+    agent_uptime_sec = EXCLUDED.agent_uptime_sec;
+
+-- name: ObservedDevicesByPublicKeys :many
+SELECT d.id, d.user_id, d.public_key FROM devices d
+WHERE d.public_key = ANY(sqlc.arg(public_keys)::text[])
+  AND EXISTS (SELECT 1 FROM vpn_profiles p WHERE p.device_id = d.id AND p.server_id = sqlc.arg(server_id));
+
+-- name: RecordHandshake :exec
+-- Блокировка сервера в вызывающей транзакции сериализует проверку и вставку события.
+WITH inserted AS (
+    INSERT INTO connection_events (user_id, device_id, server_id, event, detail)
+    SELECT d.user_id, d.id, sqlc.arg(server_id)::uuid, 'handshake_observed',
+           jsonb_build_object('handshake_at', sqlc.arg(handshake_at)::timestamptz,
+                              'config_version', sqlc.arg(config_version)::bigint)
+    FROM devices d
+    WHERE d.id = sqlc.arg(device_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM connection_events e
+          WHERE e.server_id = sqlc.arg(server_id)::uuid AND e.device_id = d.id
+            AND e.event = 'handshake_observed'
+            AND (e.detail->>'handshake_at')::timestamptz >= sqlc.arg(handshake_at)::timestamptz
+      )
+    RETURNING device_id
+)
+UPDATE devices SET last_seen_at = GREATEST(last_seen_at, sqlc.arg(handshake_at)::timestamptz)
+WHERE id IN (SELECT device_id FROM inserted);
+
+-- name: ClaimTelemetryPacket :execrows
+-- Квитанция живёт дольше неподтверждённого пакета в Redis (48 часов).
+WITH expired AS (
+    DELETE FROM telemetry_receipts
+    WHERE server_id = $2 AND processed_at < now() - interval '49 hours'
+)
+INSERT INTO telemetry_receipts (id, server_id) VALUES ($1, $2)
+ON CONFLICT (id) DO NOTHING;
 ```
+
+Этот блок — итоговое состояние файла, а не снимок момента задачи 1: запросы
+`MarkObservedHealth`, `MarkServerHealth`, `ObservedDevicesByPublicKeys`,
+`RecordHandshake` и `ClaimTelemetryPacket` появляются вместе с телеметрией в задаче 10,
+и сверка `.scratch/plan_blocks.py` сравнивает с файлом оба блока.
 
 - [ ] **Step 9: `internal/db/query/admin.sql` — дословный исходник**
 
@@ -707,7 +908,7 @@ DELETE FROM idempotency_keys
 - [ ] **Step 11: Убедиться, что запросы генерируются и компилируются**
 
 Run: `make sqlc-generate && make vet`
-Expected: PASS. Проверить, что появились `internal/db/{servers,addresses,profiles,nodeapi,telemetry,admin,maintenance}.sql.go`, а в `models.go` все nullable-uuid стали `*uuid.UUID` и ни одного `pgtype.UUID` не осталось (`grep -c pgtype.UUID internal/db/models.go` → `0`).
+Expected: PASS. Проверить, что появились `internal/db/{servers,addresses,profiles,nodeapi,telemetry,admin,maintenance}.sql.go`, а в `models.go` все nullable-uuid стали `*uuid.UUID` и ни одного `pgtype.UUID` не осталось (`grep -c pgtype.UUID internal/db/models.go` → `0`). Отдельно — что `pgtype` не импортируется вообще (`grep -rn "jackc/pgx/v5/pgtype" --include=*.go .` → пусто): именно это, а не совпадение имён полей, означает, что рукописные слои задач 2–13 не касаются pgtype. И ещё одно, что видно только по сгенерированным сигнатурам: массивный параметр обязан остаться массивом (`ReleaseAddressesByProfiles(ctx, []uuid.UUID)`), см. находку 12 в конце раздела «Что план нашёл».
 
 - [ ] **Step 12: Интеграционный тест запросов — `tests/integration/net_queries_test.go`**
 
@@ -718,35 +919,61 @@ Expected: PASS. Проверить, что появились `internal/db/{serv
 |---|---|---|
 | `TestClaimAddressIsExclusive` | `ClaimAddress` не отдаёт занятый адрес и не перетирает чужой | занять адрес за профилем P1, тот же адрес попробовать за P2 → ноль строк; после `ReleaseAddressByProfile(P1)` сразу → по-прежнему занят (окно 5 мин), `reusable_at` задвинуть UPDATE'ом в прошлое → теперь берётся |
 | `TestBusyAddressesCoversBothKinds` | заняты и `allocated_to IS NOT NULL`, и неистёкшее `reusable_at` | три строки: назначен, освобождён с будущим окном, освобождён с прошлым окном → `BusyAddresses` вернул 2 |
+| `TestArrayParamsMatchRows` | массивные параметры доживают до вызова массивами, а не скалярами | `DevicesByPublicKeys` (два известных ключа + один несуществующий → ровно 2 строки), `ReleaseAddressesByProfiles` одним вызовом на два профиля, `HandshakedDevicesAfter` с окном и чужим устройством в списке |
 | `TestConsumeBootstrapTokenIsOnce` | одноразовость под конкурентным вызовом | два `ConsumeBootstrapToken` одного id → второй `pgx.ErrNoRows` |
 | `TestDesiredCandidatesOnlyActiveSuperseded` | в выборку не попадают revoked/expired | по одному профилю каждого статуса → ровно 2 строки |
 | `TestRevokeProfilesForDevicesReturnsServers` | отзыв возвращает `server_id` для bump | два профиля на разных серверах → 2 строки с разными `server_id` |
 | `TestUpsertServerHealthReplaces` | повторный heartbeat не создаёт вторую строку | два upsert → `count(*)=1`, поля второго |
+| `TestNumericFieldsReadAsStrings` | override numeric работает в обе стороны, а не только на запись | upsert с `load1="1.250"`, `cpu_pct="12.50"` → `ServerHealthOf` отдал те же строки с той же точностью (numeric(6,3) и numeric(5,2)) |
 | `TestUpsertDeviceDayTrafficSums` | агрегат складывает приросты | два upsert на одну пару/сутки → rx=сумма |
 | `TestMarkStaleHealthReturnsServer` | переход ok→stale отдаёт id для события | upsert со `observed_at` = now−200s → ровно 1 id, повторный вызов → 0 |
 | `TestAuditActionNewValuesExist` | значения enum из 0006 реально работают | `InsertAdminAudit` с `server_deleted`, `bootstrap_token_issued` |
-| `TestMaintenanceUpDownUp` | 0006 откатывается и применяется снова | тот же путь, что `migrations_test.go` (задача 5 A-1) |
+| `TestMigration0006UpDownUp` | 0006 откатывается и применяется снова | тот же путь, что `migrations_test.go` (задача 5 A-1) |
 
 Компоненты фикстур — хелперы этой же задачи из `helpers_test.go` (шаг 13).
+
+Две вещи, которые стали ясны только на прогоне и без них тест был бы самообманом:
+
+- Освобождение адреса нельзя моделировать одной строкой `released_at = now(),
+  `reusable_at = <прошлое>`: CHECK `addresses_window` требует `reusable_at >= released_at`,
+  и вставка падает с 23514. Окно «истекло» моделируют сдвигом **обеих** границ
+  (`released_at = now() − 10 min`, `reusable_at = now() − 5 min`) — иначе первый же прогон
+  превращается в отладку фикстуры вместо проверки инварианта.
+- `connection_events.device_id` nullable, поэтому `HandshakedDevicesAfter` приходит как
+  `[]*uuid.UUID`. Задача 9 обязана отбрасывать nil-элементы, а не считать их устройствами:
+  событие без устройства — это событие о сервере, и в выборку «снять предка» оно не входит.
 
 - [ ] **Step 13: Хелперы узлов и серверов — правка `tests/integration/helpers_test.go`**
 
 Схема, не исходник. Добавить (используются задачами 2, 4, 5, 7, 8, 9, 11, 12, 15):
 
 ```go
+// keyFromSeed собирает канонический публичный ключ из произвольной строки: sha256
+// от сида, младшие два бита последнего байта обнулены (spare-биты), иначе ключ
+// упрётся в CHECK формы из 0001 ровно тем вариантом, из-за которого существует
+// devices.ValidateKey. Глобальный UNIQUE на devices.public_key делает «i-й по счёту»
+// ключ столкновением между прогонами, поэтому сид — строка, а не счётчик.
+func keyFromSeed(seed string) string
+
 func seedLocation(t *testing.T, ctx context.Context, q *db.Queries) uuid.UUID
-// lat/lon строками ("55.7558", "37.6176") — тип после override'а numeric.
+// lat/lon строками ("52.5200", "13.4050") — тип после override'а numeric. Город
+// несёт суффикс id: UNIQUE (country_code, city, lat, lon) из 0002, а dev-база между
+// прогонами одна и та же.
 
 // seedServer создаёт сервер с maintenance_status='maintenance' (дефолт схемы):
 // «зарегистрирован» ≠ «работает», и перевод в online — отдельный явный шаг теста.
 func seedServer(t *testing.T, ctx context.Context, q *db.Queries, poolV4 string) db.VpnServer
-// poolV4 вида "10.99.1.0/24"; public_key строится как в devices_test.keyAt — из
-// 32 raw-байт, иначе неканонический ключ упрётся в CHECK формы.
+// poolV4 вида "10.99.1.0/24"; advertised_host — из TEST-NET-3 (203.0.113.0/24),
+// чтобы в базе никогда не оказался адрес реального хоста.
 
 func setServerOnline(t *testing.T, ctx context.Context, q *db.Queries, id uuid.UUID)
 func seedProfile(t *testing.T, ctx context.Context, q *db.Queries, deviceID, serverID uuid.UUID,
                  addr string, expiresIn time.Duration) db.VpnProfile
 func seedDevice(t *testing.T, ctx context.Context, q *db.Queries, user uuid.UUID, i int) db.Device
+
+// seededKey отдаёт публичный ключ устройства по id — нужен там, где запрос принимает
+// массив ключей (DevicesByPublicKeys), а фикстура знает только id.
+func seededKey(t *testing.T, ctx context.Context, q *db.Queries, id uuid.UUID) string
 ```
 
 - [ ] **Step 14: Правка спецификации §6**
@@ -782,6 +1009,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Interfaces:**
 - Consumes: `CatalogServers` (задача 1), `db.VpnServer`, `httpx.Decorators`, `httpx.WriteJSON`.
+  Поле `CatalogServersRow.HealthStatus` — не `*string`, а `db.NullHealthStatus`: LEFT JOIN
+  над nullable-enum генератор покрывает своим null-врапером enum'а, и «значения нет»
+  там живёт в `Valid`, а не в указателе. `HealthObservedAt` — `*time.Time` как и задумано.
 - Produces:
   - `servers.Availability` (`"available" | "unknown"`), `servers.Available(status *string, observedAt *time.Time, now time.Time) Availability`;
   - `servers.NewService(q *db.Queries) *Service`, `(s *Service) Catalog(ctx) ([]Summary, error)`;
@@ -814,10 +1044,10 @@ func TestAvailableRequiresFreshOK(t *testing.T) {
 	staleStatus := "stale"
 
 	cases := []struct {
-		name    string
-		status  *string
-		at      *time.Time
-		want    Availability
+		name   string
+		status *string
+		at     *time.Time
+		want   Availability
 	}{
 		{"нет строки health вообще", nil, nil, AvailabilityUnknown},
 		{"health есть, но статус не пришёл", nil, &fresh, AvailabilityUnknown},
@@ -866,6 +1096,11 @@ Expected: FAIL — `undefined: Available`, `undefined: Summary`.
 - `CapacityMbps` отдаётся как есть (`*int32`): заявленная ёмкость, не измеренная (ADR-006).
 - `Region` — `string` (пусто, если NULL): `*string` в ответе дал бы `null` там, где у нас
   «не заполнено оператором», и клиент не отличил бы это от «поле не попросили».
+- `Available` остаётся чистой функцией над `*string`, поэтому преобразование
+  `db.NullHealthStatus → *string` делает `Catalog` одним явным шагом
+  (`if row.HealthStatus.Valid { status = &value }`): расчёт «значение или нет»
+  живёт в одном месте, а смена сигнатуры ради типа генератора лишила бы unit-тест
+  шага 1 возможности вызывать функцию без БД.
 
 - [ ] **Step 3: Handler — `internal/servers/handlers.go`**
 
@@ -907,9 +1142,31 @@ Expected: PASS.
 | `online` + health `ok`, `observed_at` свежий | `availability == "available"` |
 | `online` + health `ok`, `observed_at` = now−200s | `availability == "unknown"` |
 | `online` + health `error` | `availability == "unknown"` |
+| `online` + health `stale` | `availability == "unknown"` (значение enum'а из 0003; sweeper задачи 13 выставляет его по тому же окну) |
 | `capacity_mbps` не задан | в JSON ровно `"capacity_mbps":null`, а не `0` (проверка по `map[string]any`, не по struct) |
 | `draining`/`retired` | отсутствуют в каталоге (выведенный узел не должен светиться как выбор) |
 | анонимный запрос через `e.Anonymous == nil`-сценарий | не тестируется здесь: закрытость маршрута доказывает матрица задачи 15 |
+
+Две вещи, которые план не учитывал и которые пришлось зафиксировать при исполнении:
+
+- «серверов нет» нельзя проверить на живом пуле: dev-база между прогонами одна и
+  та же, а каталог не фильтруется по пользователю, поэтому «пусто» означало бы
+  «весь стек пуст» и зависело бы от порядка запуска тестов. Случай закрыт
+  `emptyDBTX` — стабом `db.DBTX` с нулём строк: проверяемое свойство (пустой срез
+  сериализуется в `[]`, статус `200`, а не `null` и не `404`) лежит в слое выдачи,
+  и запрос к БД в этом утверждении не участвует.
+- Все остальные утверждения идут по `id` конкретных фикстур, а не по длине ответа:
+  в каталоге чужие серверы прошлых прогонов. Разбор ответа — в
+  `[]map[string]json.RawMessage`, потому что decode в `Summary` не отличает
+  отсутствующий ключ от `null`, а именно это различие и есть обещание контракта.
+- `seedHealth(t, ctx, q, serverID, status, observedAt)` появляется в этом файле и
+  переиспользуется задачей 10: `UpsertServerHealth` требует полный набор полей
+  heartbeat'а, и писать его заново в каждом тесте — способ разойтись с реальной
+  формой сообщения.
+
+Проверка, что тест живой (а не проходит молча): `DefaultStaleAfter` временно поднят
+до `300 * time.Second` — случай `now−200s` обязан был стать `"available"` и упасть.
+Упал ровно на фикстуре с индексом 3, после правки константы обратно — зелёный.
 
 Run: `make up-dev && make integration`
 Expected: PASS.
@@ -940,10 +1197,16 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     строки `PrivateKey`**;
   - `Parse(text string) (Config, error)`;
   - `(Config) SerializeNoPrivateKey() (string, error)` — каноническая пересборка (именно она
-    идёт наружу после round-trip в тестах) и она же отказывается от невалидных значений.
+    идёт наружу после round-trip в тестах) и она же отказывается от невалидных значений;
+  - `NodeTunnelAddress(pool netip.Prefix) netip.Addr` — база пула + 1. План относил её к
+    задаче 4, но `Render` нуждается в ней уже здесь (DNS-рекурсор клиента), поэтому
+    определена в этой задаче, а задача 4 только потребляет (см.Interfaces задачи 4).
 - Ни `net/http`, ни БД: модуль чистый, чтобы инъекционные тесты (шаг 3) не зависели от стека.
 
 - [ ] **Step 1: Тест round-trip — `internal/connections/wgconfig_test.go`, дословный исходник**
+
+Это начало файла; его продолжение даёт блок шага 3. Сворачивающий чекер сравнивает
+блок с соответствующей половиной файла по маркеру `// Таблица гостевых значений`.
 
 ```go
 package connections
@@ -1067,16 +1330,16 @@ PersistentKeepalive = 25
 
 - [ ] **Step 3: Инъекционная стойкость — добавить в `wgconfig_test.go`**
 
-Дословный исходник:
+Дословный исходник. Это хвост того же файла: строка `package connections` в него не
+переносится, блок пристыковывается после шага 1 (пустая строка на стыке в сравнение
+не входит).
 
 ```go
-package connections
-
 // Таблица гостевых значений, каждое из которых должно быть отвергнуто. Это проверка
 // модели угроз (спецификация §2, строка «скомпрометированный ответ API»): серверные
 // строки не имеют права попасть ни в shell, ни в чужую секцию конфига.
 var hostile = []struct {
-	name string
+	name   string
 	mutate func(*Config)
 }{
 	{"CRLF в host", func(c *Config) { c.PeerHost = "ok.example.com\r\nPrivateKey = SKA=" }},
@@ -1087,7 +1350,7 @@ var hostile = []struct {
 	{"unicode-обфускация host", func(c *Config) { c.PeerHost = "арьтм.-com" }},
 	{"порт вне диапазона", func(c *Config) { c.PeerPort = 70000 }},
 	{"порт нулевой", func(c *Config) { c.PeerPort = 0 }},
-	{"маска не /32", func(c *Config) { c.Address = netip.MustParseAddr("10.99.7.0") }},
+	{"маска не /32", func(c *Config) { c.Address = netip.MustParsePrefix("10.99.7.0/24") }},
 	{"IPv6 allow-all без адреса", func(c *Config) {
 		c.AllowedIPs = []netip.Prefix{netip.MustParsePrefix("::/0")}
 	}},
@@ -1111,6 +1374,32 @@ func TestSerializeRefusesHostileValues(t *testing.T) {
 		})
 	}
 }
+
+func TestParseSeparatesForbiddenFromUnknownKey(t *testing.T) {
+	// Разница между «ключ неизвестен» и «ключ запрещён» — не косметика: первое
+	// означает непривычный нам конфиг, второе — что API прислал приватный ключ или
+	// параметр, меняющий поведение ядра. Без отдельной ветки запрещённые ключи
+	// отсекались бы общим «неизвестный ключ», и таблица forbidden стала бы мёртвым
+	// кодом, который никто не проверяет.
+	text, err := serverRow().SerializeNoPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	banned := strings.Replace(text, "[Interface]\n", "[Interface]\nPresharedKey = SKM= \n", 1)
+	if _, err := Parse(banned); err == nil {
+		t.Fatal("PresharedKey принят")
+	} else if !strings.Contains(err.Error(), "запрещ") {
+		t.Errorf("сообщение об отказе = %q, want указание на запрещённый ключ", err)
+	}
+
+	unknown := strings.Replace(text, "[Interface]\n", "[Interface]\nListenPort = 51820\n", 1)
+	if _, err := Parse(unknown); err == nil {
+		t.Fatal("ListenPort принят")
+	} else if strings.Contains(err.Error(), "запрещ") {
+		t.Errorf("неизвестный ключ назван запрещённым: %q", err)
+	}
+}
 ```
 
 Замечания по двум случаям, чтобы их не «починили» ослаблением:
@@ -1119,6 +1408,21 @@ func TestSerializeRefusesHostileValues(t *testing.T) {
   — это тихий blackhole, а не нейтральное значение.
 - `маска не /32` отвергается и сериализатором, и парсером: адрес клиента в туннеле — ровно
   один `/32`, любое другое значение означает, что конфигурацию собрали не мы.
+
+Что в блоке было не так и что к нему добавлено при исполнении:
+
+- случай `маска не /32` был написан как `c.Address = netip.MustParseAddr("10.99.7.0")`, и
+  файл с этим не компилируется: `MustParseAddr` даёт `netip.Addr`, а поле — `netip.Prefix`
+  (`cannot use ... as netip.Prefix value`). В блоке стоит `MustParsePrefix("10.99.7.0/24")` —
+  это ровно тот же смысл (маска не /32), но годный к сборке;
+- таблица гостевых значений проверяет `err != nil || Parse(text) != nil`, то есть есть
+  вариант пройти её, ничего не отвергнув на сборке. Отдельной проверкой установлено, что
+  сериализатор отказывает сам: с усиленным утверждением (`if err == nil { t.Fatalf }`) все
+  12 случаев упали на отказе `SerializeNoPrivateKey`, а не на отказе парсера;
+- добавлен `TestParseSeparatesForbiddenFromUnknownKey`. Без него таблица `forbidden` была бы
+  мёртвым кодом: неизвестный ключ и запрещённый отсекались бы одной общей веткой, а
+  различие важно — «ключ неизвестен» это непривычный конфиг, «ключ запрещён» это
+  приватный ключ или параметр ядра, пришедший из API.
 
 - [ ] **Step 4: Прогон и коммит**
 
@@ -1142,14 +1446,21 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   читается из того же запроса, что и права)
 
 **Interfaces:**
-- Consumes: `LockServerRow`, `BusyAddresses`, `ClaimAddress`, `db.VpnServer.AddressPoolV4`.
+- Consumes: `LockServerRow`, `BusyAddresses`, `ClaimAddress`, `db.VpnServer.AddressPoolV4`,
+  `connections.NodeTunnelAddress` (определён задачей 3 — `Render` не может без DNS-адреса).
 - Produces:
-  - `connections.NodeTunnelAddress(pool netip.Prefix) netip.Addr` — база пула + 1; это адрес
-    `wg0` узла и он же recursor в туннеле (спецификация §8, пример `10.99.0.1` в §4.1 —
-    это ровно база пула `10.99.0.0/24`);
   - `connections.PickAddress(pool netip.Prefix, busy map[netip.Addr]bool) (netip.Addr, error)`
     и `ErrPoolExhausted`;
-  - `connections.Allocate(ctx context.Context, q *db.Queries, srv db.VpnServer, profileID uuid.UUID) (netip.Addr, error)`;
+  - - `connections.Allocate(ctx context.Context, q *db.Queries, srv db.VpnServer) (netip.Addr,
+    error)` — блокировка, занятые и выборка, но БЕЗ занятия адреса;
+  - - `connections.Claim(ctx context.Context, q *db.Queries, srv db.VpnServer, addr netip.Addr,
+    profileID uuid.UUID) error` — занятие адреса; `ErrAddressRace`, если адрес успели занять.
+    План собирал лок, выборку и занятие в одну функцию, и так не выходит: `allocated_to`
+    ссылается на `vpn_profiles(id)`, а PostgreSQL проверяет этот Foreign Key немедленно на
+    вставке (найдено живым запросом, а не чтением миграции). Значит строка профиля обязана
+    появиться раньше занятия, а профиль вставляется только вместе со своим адресом — между
+    выборкой и занятием стоит `InsertProfile`, и объединить эти три шага в одну функцию, не
+    соврав про порядок, нельзя (находка 20).
   - `entitlements.Entitlement.EndsAt *time.Time` (nil — бессрочная подписка).
 
 - [ ] **Step 1: Падающий unit-тест на `PickAddress` — `internal/connections/address_test.go`, дословный исходник**
@@ -1213,29 +1524,40 @@ func TestPickAddressRejectsNonIPv4Prefix(t *testing.T) {
 ```
 
 Run: `make unit`
-Expected: FAIL — `undefined: PickAddress`.
+Expected: FAIL — `undefined: PickAddress`. `TestNodeTunnelAddressIsFirstUsable` из этого же
+файла падать не будет: функция определена задачей 3, и RED шага обеспечивается остальными
+тестами. Оставлять её нельзя: это проверка, что адрес узла и DNS-адрес из `Render` считаются
+одной формулой.
 
 - [ ] **Step 2: Реализовать `internal/connections/address.go`**
 
 Схема, не исходник. Правила:
 
-- Пул обязан быть IPv4 и `/29…/24` (проверка маски даёт внятную ошибку вместо «пула нет»:
-  `/31` и `/32` не содержат клиентских адресов, `/8` — 16 млн адресов и маскирует ошибку
-  конфигурации).
+- Пул обязан быть IPv4 и `/24…/30`. Нижняя граница — не /29, как было в этом плане: при
+  /30 остаётся ровно один клиентский адрес, и тест шага 1 построен на таком пуле, чтобы
+  отсечение сети и broadcast было видно на минимальном размере. `/31` и `/32` клиентских
+  адресов не содержат вовсе. Верхняя граница ограничивает выборку: пул крупнее /24 почти
+  всегда означает ошибку конфигурации, а молчаливый обход 16 млн адресов спрятал бы её за
+  первой выдачей.
 - Диапазон кандидатов: `base+2 … last-1` (сеть, адрес узла, broadcast). Это и есть
-  обоснование теста `/30`.
-- `busy` включает адрес узла принудительно (`NodeTunnelAddress`), даже если в `busy` его
-  нет: узел не может получить клиентский адрес, и наоборот — иначе `DNS = 10.99.7.42`
-  означал бы, что рекурсор живёт у клиента.
-- `PickAddress` детерминирован: обход по числовому порядку (`Addr.As4()` → `binary.BigEndian`),
-  а не по итератору `netip.Prefix.Range` в случайном порядке.
-- `Allocate(ctx, q, srv, profileID)` вызывается **внутри транзакции вызывающего** (задача 5):
-  `LockServerRow(srv.ID)` → `BusyAddresses(srv.ID)` → `PickAddress` → `ClaimAddress`.
-  Если `ClaimAddress` вернул `pgx.ErrNoRows` — это гонка с параллельной выдачей: вернуть
-  `ErrAddressRace`, чтобы вызывающий ретраил выборку (не весь запрос) до 3 раз.
-  Комментарий обязан объяснять, зачем ретрай, если уже стоит advisory lock: lock сериализует
-  выдачу *этого* сервера, а `ClaimAddress` — последняя линия, если кто-то обошёл lock
-  (будущий скрипт, прямой вызов).
+  обоснование теста `/30`. Адрес узла исключён структурно — он вне диапазона, а не
+  «отфильтрован забытым условием». Поэтому правило «принудительно добавлять адрес узла в
+  `busy`» реализацией не стало: при старте кандидатов с `base+2` оно ничего не меняет, а
+  такой код ни один тест не отличит от мёртвого (ср. находку 19 про таблицу `forbidden`).
+- `PickAddress` детерминирован: обход по числовому порядку (`Addr.As4()` →
+  `binary.BigEndian`), а не итератором `netip.Prefix.Range`.
+- `Allocate(ctx, q, srv)` вызывается **внутри транзакции вызывающего** (задача 5) и делает
+  `LockServerRow(srv.ID)` → `BusyAddresses(srv.ID)` → `PickAddress` — именно в этом порядке,
+  потому что список занятых читается уже под блокировкой.
+- `Claim(ctx, q, srv, addr, profileID)` вызывается после `InsertProfile` в той же
+  транзакции. Внутреннего ретрая у него нет, и это не потерянное правило плана: между
+  выборкой и занятием вставлена строка профиля, поэтому «повторить только занятие» нельзя,
+  а откат вставки означал бы откат транзакции. На `pgx.ErrNoRows` он возвращает
+  `ErrAddressRace`, а повтор целиком делает вызывающий (задача 5), обязательно конечный:
+  бесконечный повтор превратил бы обход блокировки в вечно висящий запрос.
+- Комментарий обязан объяснять, зачем занятие вообще, если уже стоит advisory lock: lock
+  сериализует выдачу *этого* сервера только для тех, кто его берёт, а `ClaimAddress` —
+  последняя линия, если кто-то обошёл lock (будущий скрипт, прямой вызов).
 
 - [ ] **Step 3: `EndsAt` в entitlements — дословная правка `internal/entitlements/entitlements.go`**
 
@@ -1262,15 +1584,26 @@ Expected: FAIL — `undefined: PickAddress`.
 
 | случай | ожидание |
 |---|---|
-| 10 горутин на пул `/28` (11 клиентских адресов) с разными profile id | 10 успех, **все адреса различны**; `SELECT count(DISTINCT address)` = 10 |
-| 12 горутин на тот же пул | 2 отказа `ErrPoolExhausted` (или `ErrAddressRace`, исчерпавший ретраи), живых назначений ≤ 11 |
-| адрес только что освобождён | `Allocate` его **не** берёт (окно §7.2), после сдвига `reusable_at` в прошлое — берёт |
+| 10 горутин на пул `/28` | 10 успех, **все адреса различны**; `count(DISTINCT address)` = 10 и строк в `tunnel_addresses` ровно 10 |
+| ёмкость+2 горутин на тот же `/28` (15 на 13 адресов) | ровно 13 успешных, 2 отказа (`ErrPoolExhausted`, при обходе блокировки — `ErrAddressRace`); ни одна выдача не получила адрес узла |
+| адрес только что освобождён | следующая выдача берёт **не** его (окно §7.2), а после закрытия окна — именно его |
 | попытка взять адрес узла (`base+1`) | никогда не выдаётся; в `tunnel_addresses` строки с ним нет |
 | два разных сервера с одинаковым пулом | один и тот же адрес выдаётся обоим: PK — пара `(server_id, address)` (спецификация §6) |
 
-Хелпер `seedProfile` из задачи 1 здесь не нужен: `Allocate` принимает произвольный
-`profileID`, а существование строки профиля проверяет FK на пути задачи 5 — здесь важно
-именно конкурентное поведение аллокации.
+Ёмкость пула в тесте выводится из маски (`1<<(32-bits) - 3`: сеть, адрес узла и broadcast),
+а не берётся числом из этой таблицы. В плане было «11 клиентских адресов у /28» — это
+неверно, у /28 их 13, и проверять надо то, что следует из правила, а не то, что однажды
+посчитали в прозе.
+
+Выдача в тесте повторяет путь задачи 5 целиком: в одной транзакции `Allocate` →
+`InsertProfile` → `Claim`. Профили здесь нужны вопреки старому абзацу плана — без них не
+проходит Foreign Key на `allocated_to`, — но `seedProfile` из задачи 1 не годится: он
+вставляет профиль заранее и с заранее известным адресом, а здесь адрес становится известен
+только после выборки. Поэтому вставка профиля стоит прямо в хелпере выдачи.
+
+Окно переиспользования в тесте закрывается правкой `released_at` И `reusable_at` разом:
+констрейнт `addresses_window` требует `reusable_at >= released_at`, и сдвиг одного поля был
+бы отказом базы, а не проверкой (находка 21).
 
 Run: `make up-dev && make integration`
 Expected: PASS.
@@ -1341,10 +1674,11 @@ func ProfileExpiry(ent entitlements.Entitlement, now time.Time) time.Time {
 const RotationOverlap = 10 * time.Minute
 ```
 
-Unit-тест `TestProfileExpiry` (в `internal/connections/service_test.go`, дословный
-исходник — три случая): подписка бессрочная → `now+30d`; подписка кончается через 2 суток
-→ `EndsAt`; подписка кончается через 60 суток → всё равно `now+30d` (потолок плана, а не
-подписки).
+Unit-тест `TestProfileExpiry` в `internal/connections/service_test.go` — три случая:
+подписка бессрочная → `now+30d`; подписка кончается через 2 суток → `EndsAt`; подписка
+кончается через 60 суток → всё равно `now+30d` (потолок плана, а не подписки). Блока с
+исходником здесь нет, и метка «дословный исходник» убрана: тест пишется по перечислению, а
+сверка побайтово нечем.
 
 - [ ] **Step 2: `Issue` — схема, не исходник (порядок проверок = §7.1, менять нельзя)**
 
@@ -1355,7 +1689,7 @@ Unit-тест `TestProfileExpiry` (в `internal/connections/service_test.go`, д
 | 3 | `s.ent.ForUser(ctx, userID)` | `ErrNoSubscription` (обернуть `entitlements.ErrNoActiveSubscription`) |
 | 4 | `q.ServerByID(serverID)` | `ErrServerUnknown` |
 | 5 | `srv.MaintenanceStatus == db.MaintenanceStatusOnline` | `ErrServerNotAvailable` — §7.1 буквально: «сервер online». `draining` ещё работает, но новому клиенту туда идти нельзя: он получит туннель, который через минуту опустеет |
-| 6 | транзакция: `LockServerRow` → `Allocate` → `InsertProfile` → `BumpServerConfigVersion` → `InsertConnectionEvent(profile_issued)` | `ErrPoolExhausted`, `ErrAddressRace`, unique-violation → `ErrAlreadyActive` |
+| 6 | транзакция: `Allocate` (внутри него `LockServerRow`) → `InsertProfile` → `Claim` → `BumpServerConfigVersion` → `InsertConnectionEvent(profile_issued)`; при `ErrAddressRace` — откат и повтор всей выдачи, не больше трёх раз | `ErrPoolExhausted`, `ErrAddressRace`, unique-violation → `ErrAlreadyActive` |
 | 7 | вернуть вставленный профиль | — |
 
 Обязательные детали, каждая из которых без комментария выглядит избыточной:
@@ -1409,7 +1743,32 @@ Unit-тест `TestProfileExpiry` (в `internal/connections/service_test.go`, д
 | повтор отзыва | `ErrNotActive` |
 | конфиг | содержит `[Interface]`, `Address = <выданный>/32`, `Endpoint`, `PersistentKeepalive`, **не** содержит `PrivateKey` и `PresharedKey` |
 | два профиля на двух серверах одного пользователя | адреса из разных пулов, оба активны: лимит устройств не путается с числом серверов |
-|Параллельно — 10 горутин на выдачу одному устройству разных серверов | ровно 10 профилей, все `server_id` различны (проверяет, что lock берётся по серверу, а не глобально) |
+| Параллельно — 10 горутин на выдачу одному устройству разных серверов | ровно 10 профилей, все `server_id` различны (проверяет, что lock берётся по серверу, а не глобально) |
+
+Замечания по исполнению задачи 5:
+
+- `TestProfileExpiry` пишется по перечислению случаев, и в него добавлено то, чего в
+  перечислении не было: фиксированный `now` (сравнение с живым часовым тиком зависело бы от
+  скорости теста) и отдельное утверждение, что `DefaultProfileTTL` равняется ровно трём
+  десяткам суток. Без него три случая сверяются с самой константой, и подмена числа прошла
+  бы незамеченной;
+- `Revoke` не может вернуть строку, прочитанную до транзакции: в ней статус всё ещё активный,
+  и отдавать её значило бы врать про результат. `RevokeProfile` поднимает четыре колонки,
+  поэтому добавлен запрос `ProfileByID` — ровно та правка, которую шаг «Files» этой задачи
+  разрешал («если тесты вскроют недостающую выборку — только добавить запрос»);
+- интеграционный тест написан до реализации шагов 2–4, а не после. Иначе проверка «упал,
+  потому что функции нет» превращается в «работает, потому что я так написал». Это единственное
+  отступление от порядка шагов в задаче, и оно осознанное;
+- ошибки-стражи объявлены `errors.New` с русским текстом. Механизм план скопировал с
+  `devices/service.go` дословно, язык — нет: тот же пакет возвращает русские формулировки в
+  инвариантных ошибках задач 3 и 4, а клиент различает отказы по стабильному коду (задача 6),
+  а не по строке;
+- просроченный профиль в тесте делается просроченным правкой `issued_at` И `expires_at`
+  сразу: констрейнт `profiles_window` не даёт положить в прошлое один только срок. Тот же
+  класс ограничений, что и `addresses_window` в задаче 4 (находка 21);
+- `Profile` отвечает `ErrNotActive` и на «профиля не было никогда», и на «он не активен».
+  Различие не меняет ни одного доступного клиенту действия, а по разным ответам пары
+  (устройство, сервер) можно было бы перебирать, у кого из чужих устройств профиль существует.
 
 Run: `make up-dev && make integration`
 Expected: PASS.
@@ -1453,7 +1812,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 	// 409 server_not_available — §7.1 требует отказа «сервер не online» при выдаче, а
 	// §5.2 требует стабильного кода. Отдельный от `conflict`: клиент по коду понимает,
 	// что стоит выбрать другой сервер, а не повторять тот же запрос.
-	ErrServerNotAvailable ErrorCode = "server_not_available"
+	ErrServerNotAvailable     ErrorCode = "server_not_available"
 ```
 
 - [ ] **Step 2: Таблица маршрутов и ответов**
@@ -1478,9 +1837,11 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   идемпотентности: порядок важен, потому что `429` обязан возникать до записи слота
   идемпотентности, иначе отклонённый запрос оставил бы занятой ключ.
 - Ответ конфига — `text/plain`, а не JSON: клиент сохраняет
-  его как файл профиля и отдёт напрямую утилитам `
-  `wg-quick` и `wg showconf`; оборачивание в JSON вынудило бы клиента развернуть
-  строку с экранированием переводов строк. Контракт (задача 14) описывает это явно.
+  его как файл профиля и отдаёт напрямую утилитам `wg-quick` и `wg showconf`;
+  оборачивание в JSON вынудило бы клиента развернуть строку с экранированием переводов
+  строк. Контракт (задача 14) описывает это явно. Ответ несёт `Cache-Control: no-store`:
+  конфиг — доступ, который отзывают, и ответ из кэша после отзыва вернул бы рабочий
+  профиль.
 - Проверка права на объект — в сервисе (`DeviceByID` + сравнение владельца), не в
   middleware (спецификация §5.2).
 - Русские сообщения: `"требуется аутентификация"`, `"сервер недоступен для выдачи"`,
@@ -1523,6 +1884,68 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - Чужое устройство (токен пользователя B, `id` устройства A) → `404` на всех пяти маршрутах
   и **одинаковым** телом, чтобы по ответу нельзя было отличить «нет такого» от «не твоё».
 
+Замечания по исполнению задачи 6:
+
+- блок шага 1 после вставки переформатировал `gofmt`: константы выровнены по группе, и
+  комментарий её не разрывает, поэтому `ErrServerNotAvailable` получил отступ до общего
+  столбца. В блоке стоит уже отформатированный вариант — иначе сверка блоков падает на
+  каждом прогоне формата;
+- таблице не хватало строки для `ErrAddressRace` (выдача не состоялась, потому что адрес
+  успели занять в обход блокировки). Выбран `409 conflict` + details
+  `{"reason":"address_race"}`: отказ преходящий и повтор запроса имеет смысл, а `500`
+  соврал бы о поломке сервера там, где сервер честно не смог занять строку. Код тот же,
+  что у `pool_exhausted`, различие — в `reason`, и это не новый код контракта (задача 14
+  обязана перечислить оба значения `reason`);
+- `404` и `409` для «профиля нет» и «профиль не активен» нельзя различить по одному отказу
+  сервиса: `ErrNotActive` отвечает и на то, и на другое. Поэтому перед `DELETE` и перед
+  отказом конфига читается последний профиль пары (`stateOf`): нет строки — `404`, есть, но
+  не годен — `409` с настоящим `status` в details. Это второй запрос на случай отказа, а не
+  на успех: успешный отзыв и успешный конфиг остаются одним вызовом;
+- статус, прочитанный до `Revoke`, к моменту `ErrNotActive` уже неверен: строку могли
+  отозвать параллельно, и `details.status` из сохранённой копии назвал бы `active` для
+  отозванного профиля. В ветке `ErrNotActive` статус перечитывается тем же `stateOf`;
+- случай «без `Idempotency-Key`» требует, чтобы тестовый хелпер не подставлял ключ, когда
+  его не передали: первая версия подставляла, и проверка проходила как успешная выдача.
+  Теперь пустой ключ означает «заголовка нет», и вместе с кодом проверяется сообщение —
+  только так видно, что требование выставил модуль до обёртки, а не сама обёртка
+  идемпотентности своим английским текстом;
+- счётчик слотов идемпотентности скоупится по `user_id` и уникальному на прогон ключу:
+  dev-база между запусками одна, и постоянный ключ оставил бы строку от прошлого прогона.
+
+24. **Рекурсивный CTE «в обе стороны» одним запросом не проходит инструментам.** План
+    задача 7 давал `RotationChainIDs` как `up` и `down`, объединённые `UNION`; PostgreSQL
+    такой текст принимает, а sqlc 1.27.0 падает на разборе (`column reference "id" is
+    ambiguous`) — и падает на любом варианте, где колонки рекурсивного CTE не квалифицированы
+    явно. Вариант «одна CTE с двумя рекурсивными ветвями» отклоняет уже сам сервер
+    (`recursive reference to query "chain" must not appear within its non-recursive term`,
+    SQLSTATE 42P19). Оставлены два запроса, каждый в свою сторону, с явными aliases, и
+    слияние множеств в Go (`mergeUnique`): результат тот же, и он проверяем тестом.
+25. **Отзыв цепочки обязан проверить владельца каждого её узла.** `rotation_of` — ссылка на
+    строку `devices`, и цепочка по построению принадлежит одному пользователю, но ни
+    констрейнта, ни проверки в этом нет. Отзыв одного человека погасил бы профили чужого
+    устройства, если когда-нибудь появится перенос данных или правка в обход product-логики,
+    поэтому владелец каждого узла сверяется внутри той же транзакции.
+
+26. **Positional-аргументы одного и того же столбца получают нечитаемые имена.** В
+    `ReassignAddress` план писал `SET allocated_to = $4 … AND allocated_to = $3`, и
+    генератор выдал параметры `AllocatedTo` и `AllocatedTo_2` — вызов, где их переставили,
+    выглядит правильным и не читается. Аргументы названы через `sqlc.arg`: `old_profile_id`
+    и `new_profile_id`.
+27. **Профиль ротации не вставляется целиком одним запросом.** `InsertProfile` задачи 1
+    не имеет поля `rotate_from`: он описывает выдачу, где предка нет. Добавлен
+    `LinkRotatedProfile` (то же поле, та же транзакция), а существующий запрос не
+    переписан — его контракт проверен тестом задачи 1 и выдачей задачи 5.
+28. **«Отзыв среднего узла цепочки» недостижим через `DeleteDevice`.** После второй
+    ротации средний узел уже отозван (ротация отзывает предка), а отзыв отозванного
+    устройства — отказ по стражу задачи 7. Проверка цепочки поэтому делается отзывом
+    живого, последнего узла: гасятся все три, и это ровно то свойство, ради которого
+    цепочка берётся в обе стороны.
+
+Проверено мутациями: снятие проверки заголовка, перестановка ограничителя внутрь
+идемпотентности (отказ по лимиту записался слотом и выдал replay) и подмена `404` на `403`
+для чужого устройства — каждое изменение уронило ровно свой тест, остальные остались
+зелёными.
+
 Run: `make unit && make vet && make integration`
 Expected: PASS.
 
@@ -1553,7 +1976,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   - `(s *Service) DeleteDevice(ctx context.Context, userID, deviceID uuid.UUID) (int, error)`
     — число отозванных профилей;
   - маршрут `DELETE /api/v1/devices/{id}`;
-  - запрос `RotationChainIDs :many` (рекурсивный CTE в обе стороны) и
+  - запросы `RotationAncestorIDs :many` и `RotationDescendantIDs :many` (рекурсивный
+  CTE в каждую сторону) и `devices.mergeUnique` — объединение обходов в одно множество
+  цепочки; рекурсивный CTE «в обе стороны одним запросом» см. находку 24; и
     `RevokeDevices :exec` (`WHERE id = ANY($1::uuid[]) AND revoked_at IS NULL`).
 
 - [ ] **Step 1: Запросы — дословный исходник, добавить в `internal/db/query/devices.sql`**
@@ -1565,25 +1990,29 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 UPDATE devices SET revoked_at = now()
  WHERE id = ANY($1::uuid[]) AND revoked_at IS NULL;
 
--- name: RotationChainIDs :many
--- Цепочка ротации в обе стороны. Вверх — потому что отзыв потомка обязан закрыть
--- overlap предка (§7.3): иначе ключ, от которого человек уже отказался, останется в
--- desired set ещё на окно. Вниз — потому что потомок без предка для пользователя
--- «то же самое устройство с новым ключом», и отзыв родителя обязан гасить его тоже.
+-- name: RotationAncestorIDs :many
+-- Цепочка ротации в обе стороны — два запроса, а не одно UNION-выражение: отзыв
+-- потомка обязан закрыть overlap предка (§7.3), а отзыв родителя обязан погасить
+-- потомка (для пользователя это то же устройство с новым ключом), и множества нужно
+-- объединить. Вариант «один CTE, объединяющий up и down» PostgreSQL принимает, а
+-- sqlc 1.27.0 — нет («column reference \"id\" is ambiguous»); вариант «два рекурсивных
+-- рекурсивных ветвей в одном CTE» отклоняет сам сервер. Колонки в якоре квалифицированы явно — без
+-- этого генератор теряется в тех же CTE.
 WITH RECURSIVE up AS (
-    SELECT id, rotation_of FROM devices WHERE id = $1
+    SELECT devices.id, devices.rotation_of FROM devices WHERE devices.id = $1
   UNION ALL
-    SELECT d.id, d.rotation_of FROM devices d JOIN up ON d.id = up.rotation_of
-), down AS (
-    SELECT id, rotation_of FROM devices WHERE id = $1
-  UNION ALL
-    SELECT d.id, d.rotation_of FROM devices d JOIN down ON d.rotation_of = down.id
-), chain AS (
-    SELECT id FROM up
-  UNION
-    SELECT id FROM down
+    SELECT d.id, d.rotation_of FROM devices AS d JOIN up ON d.id = up.rotation_of
 )
-SELECT id FROM chain;
+SELECT up.id FROM up;
+
+-- name: RotationDescendantIDs :many
+-- Нижний ход той же цепочки (см. комментарий у RotationAncestorIDs).
+WITH RECURSIVE down AS (
+    SELECT devices.id, devices.rotation_of FROM devices WHERE devices.id = $1
+  UNION ALL
+    SELECT d.id, d.rotation_of FROM devices AS d JOIN down ON d.rotation_of = down.id
+)
+SELECT down.id FROM down;
 ```
 
 Правка `profiles.sql`: у `RevokeProfilesForDevices` (задача 1) возврата `user_id` нет —
@@ -1624,8 +2053,11 @@ UPDATE vpn_profiles p
 - [ ] **Step 3: Handler — схема, не исходник**
 
 `DELETE /api/v1/devices/{id}` под `dec.Auth`; `204` без тела; `400 invalid_request` на
-не-uuid в пути; `404 not_found` на чужое/несуществующее (сообщение `"устройство не
-найдено"`); `500` на прочее. Идемпотентность не требуется: `DELETE` по определению
+не-uuid в пути; `404 not_found` на чужое/несуществующее **и на уже отозванное** (сообщение
+`"устройство не найдено"`); `500` на прочее. Строка про отозванное добавлена при исполнении:
+таблица шага 4 требует `404` на повторный `DELETE`, а без отдельного стража
+`ErrDeviceRevoked` второй вызов дал бы `204` — молчаливый успех там, где человек должен
+увидеть, что отзыв уже был. Идемпотентность не требуется: `DELETE` по определению
 повторозащищён (второй вызов даёт `404`), а `§5.2` требует заголовок только на трёх POST.
 
 - [ ] **Step 4: Интеграционный тест — `tests/integration/device_delete_test.go`**
@@ -1685,8 +2117,13 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 -- address_v4. Строка аллокации обязана перейти к потомку: иначе отзыв предка
 -- (или закрытие overlap) освободил бы адрес, по которому клиент уже ходит, и
 -- следующий клиент получил бы адрес живого соединения.
-UPDATE tunnel_addresses SET allocated_to = $4
- WHERE server_id = $1 AND address = $2 AND allocated_to = $3;
+--
+-- Аргументы названы через sqlc.arg, а не оставлены positional: оба они упираются в
+-- одну колонку allocated_to, и генератор дал бы им имена AllocatedTo и AllocatedTo_2 —
+-- вызов, где их переставили, читается как правильный.
+UPDATE tunnel_addresses SET allocated_to = sqlc.arg(new_profile_id)
+ WHERE server_id = sqlc.arg(server_id) AND address = sqlc.arg(address)
+   AND allocated_to = sqlc.arg(old_profile_id);
 ```
 
 - [ ] **Step 2: `RotateKey` — схема, не исходник**
@@ -1696,7 +2133,10 @@ UPDATE tunnel_addresses SET allocated_to = $4
 2. Дубликат ключа: `DeviceByUserAndKey` — живое устройство с таким ключом → `ErrDuplicateKey`
    (проверка **до** лимита, как в `Register`, иначе повтор на исчерпанном лимите ответил бы
    `device_limit_reached`).
-3. Транзакция:
+3. Транзакция начинается с `LockUserForDeviceCount(userID)` — тем же advisory lock,
+   что и `Register`. Без него две параллельные ротации одного предка обе прочитают его
+   живым: первая отзовёт предка, вторая всё равно вставит ребёнка, и живых устройств
+   станет больше лимита. Дальше:
    a. `CountLiveDevices` и сравнение с лимитом **не** выполняется: предок отзывается в этой
       же транзакции, поэтому число живых устройств не растёт. Это и есть решение §4 из
       «Что план нашёл» — без него ротация на исчерпанном лимите была бы невозможна, а
@@ -1707,8 +2147,14 @@ UPDATE tunnel_addresses SET allocated_to = $4
       соврать про себя;
    c. для каждого профиля из `RevokeAllActiveByDeviceServer(parentID)`:
       `SupersedeProfile(old.ID, now.Add(connections.RotationOverlap))` → `InsertProfile` потомка (тот же
-      `server_id`, тот же `address_v4`, `rotate_from = old.ID`, `expires_at` — **тот же**,
-      что у предка: ротация ключа не продлевает доступ) → `ReassignAddress`;
+      `server_id`, тот же `address_v4`, `expires_at` — **тот же**, что у предка: ротация
+      ключа не продлевает доступ) → `LinkRotatedProfile(child.ID, old.ID)` → `ReassignAddress`.
+      `pgx.ErrNoRows` от `SupersedeProfile` (условие `status = 'active'` не нашло строку:
+      профиль отозвали между чтением списка и UPDATE) → `ErrProfileChanged`, а не `500`:
+      это гонка, а не поломка, и повторять ту же ротацию не нужно — нужен новый профиль.
+      Поле `rotate_from` ставится отдельным запросом: `InsertProfile` задачи 1 описывает
+      выдачу, где предка нет, а переписывать его под ротацию значило бы менять проверенный
+      контракт (находка 27);
    d. `RevokeDevice(parentID)`;
    e. по каждому затронутому серверу — `BumpServerConfigVersion`;
    f. событие `profile_issued` на каждый новый профиль, `detail {"rotated_from": old.ID}`;
@@ -1723,7 +2169,9 @@ idem-обёртки; ответ `200 deviceView` (не `201`: создаётся
 пользователя, а новое состояние того же устройства — и это надо записать в контракте
 задачи 14, чтобы клиент не ждал `201`); `400 invalid_request` + details `{"field":
 "public_key"}`; `409 duplicate_device`; `409 conflict` (`device_revoked` — details
-`{"reason":"device_revoked"}`); `404 not_found` на чужой `id`.
+`{"reason":"device_revoked"}`); `409 conflict` (`profile_changed` — details
+`{"reason":"profile_changed"}`, профиль отозвали между чтением и переводом в overlap);
+`404 not_found` на чужой `id`.
 
 - [ ] **Step 4: Интеграционный тест — `tests/integration/rotation_test.go`**
 
@@ -1731,12 +2179,14 @@ idem-обёртки; ответ `200 deviceView` (не `201`: создаётся
 |---|---|
 | ротация устройства с одним профилем | потомок `rotation_of = предок`, предок `revoked_at` выставлен, профиль предка `superseded` + `peer_state='rotating_old_key'` + `overlap_valid_until ≈ now+10min`, профиль потомка `active` с **тем же адресом**, `rotate_from` = id предка, `tunnel_addresses.allocated_to` = профиль потомка, `config_version` +1, событие `profile_issued` |
 | ротация на лимите 3 (3 живых устройства, одно из них ротится) | `200`: живых осталось 3 (предок отозван) — это и есть проверка решения §4 |
+| advisory lock пользователя занят чужой транзакцией | `RotateKey` ждёт её завершения и не создаёт ребёнка до снятия блокировки: без lock две параллельные ротации одного предка оставили бы двух живых детей |
 | ротация устройства без профилей | `200`, профилей не появилось, `config_version` не изменился |
 | ротация отозванного устройства | `409 conflict` + `device_revoked` |
+| ротацию ждут на заблокированной строке профиля, строку отзывают и отпускают | `409 conflict` + `{"reason":"profile_changed"}`, а не `500`: `SupersedeProfile` с условием `status='active'` вернул `ErrNoRows` |
 | тот же публичный ключ, что у другого живого устройства | `409 duplicate_device`, и **не** создан потомок (проверка SELECT) |
-| неканонический ключ (spare-биты nonzero) | `400 invalid_request` — фикстура строится как в `devices_test.keyAt` |
+| неканонический ключ (spare-биты nonzero) | `400 invalid_request`. Фикстура правкой байтов **не** строится: base64, собранный из любых 32 байт, каноничен по построению, и первая версия теста получила бы 200 вместо отказа. Значит поднимается младший spare-бит последнего символа самой строки |
 | повтор с тем же `Idempotency-Key` | тот же ответ + `Idempotency-Replayed: true`; потомок **один** (второй ротацией был бы другой id) |
-| два последовательных rotate (цепочка из трёх устройств) | `RotationChainIDs` (задача 7) возвращает все три; отзыв среднего гасит крайние — проверить вызовом `DeleteDevice` |
+| два последовательных rotate (цепочка из трёх устройств) | оба обхода (задача 7) возвращают все три id; отзыв **живого** узла гасит всю цепочку — проверить вызовом `DeleteDevice`, живым после второй ротации остаётся последний узел, а «середина» уже отзована (находка 28) |
 
 Run: `make unit && make vet && make integration`
 Expected: PASS.
@@ -1759,9 +2209,8 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 **Interfaces:**
 - Consumes: `DesiredCandidates`, `HandshakedDevicesAfter`, `ServerByID` (задача 1),
   `connections.NodeTunnelAddress` и `connections.RotationOverlap` (задачи 4 и 5).
-  Направление `servers → connections` разрешено и является единственным: запрет задачи 3
-  стоит на `connections → devices`, а зацикливание `servers ↔ connections` появилось бы,
-  умри адресная арифметика в другом месте.
+  Направление `servers → connections` разрешено; обратный импорт запрещён, чтобы
+  не возник цикл зависимостей. Адресная арифметика остаётся в `connections`.
 - Produces (пакет `servers`):
   - `type Peer struct` — JSON ровно как в примере спецификации §4.1: `public_key`,
     `allowed_ips` (массив строк CIDR), `expires_at` (RFC 3339 UTC), `state`
@@ -1772,25 +2221,45 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   - ошибку `ErrServerUnknown`;
   - непубличный `type candidate struct` и чистую `selectPeers`.
 
-- [ ] **Step 1: Чистое отсечение — дословный исходник (часть `internal/servers/desired.go`)**
+- [ ] **Step 1: Вычисление набора и чистое отсечение — дословный исходник `internal/servers/desired.go`**
 
 ```go
 package servers
 
 import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/novavpn/novavpn/internal/connections"
 	"github.com/novavpn/novavpn/internal/db"
 )
 
-// candidate — срез строки DesiredCandidates, достаточный для правила отсечения.
-// Отдельный тип нужен, чтобы чистая часть не зависела ни от sqlc, ни от БД: §9.1
-// требует проверять свойство desired set на случайных данных, а случайные данные
-// проще строить как структури, чем как строки результата запроса.
+type Peer struct {
+	PublicKey  string    `json:"public_key"`
+	AllowedIPs []string  `json:"allowed_ips"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	State      string    `json:"state"`
+}
+
+type DesiredSet struct {
+	ServerID      string    `json:"server_id"`
+	ConfigVersion int64     `json:"config_version"`
+	MTU           int       `json:"mtu"`
+	ListenPort    int       `json:"listen_port"`
+	DNSServers    []string  `json:"dns_servers"`
+	KeepaliveSec  int       `json:"keepalive_sec"`
+	Peers         []Peer    `json:"peers"`
+	MeasuredAt    time.Time `json:"measured_at"`
+}
+
 type candidate struct {
 	ProfileID       uuid.UUID
 	DeviceID        uuid.UUID
@@ -1803,10 +2272,60 @@ type candidate struct {
 	DeviceRevokedAt *time.Time
 }
 
-// selectPeers — единственное место, где решается, кто имеет право попасть в desired
-// set (спецификация §4.1). Порядок ответа — по адресу, а не по порядку строк: узел
-// сравнивает наборы как отсортированный список, и детерминированный порядок нужен
-// хотя бы для того, чтобы ETag не менялся от перестановки одинаковых пиеров.
+var ErrServerUnknown = errors.New("servers: server not found")
+
+func Compute(ctx context.Context, q *db.Queries, serverID uuid.UUID, now time.Time) (DesiredSet, error) {
+	srv, err := q.ServerByID(ctx, serverID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DesiredSet{}, ErrServerUnknown
+	}
+	if err != nil {
+		return DesiredSet{}, fmt.Errorf("servers: server by id: %w", err)
+	}
+	out := DesiredSet{
+		ServerID: serverID.String(), ConfigVersion: srv.ConfigVersion,
+		MTU: int(srv.Mtu), ListenPort: int(srv.ListenPort),
+		DNSServers:   []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()},
+		KeepaliveSec: int(srv.KeepaliveSec), Peers: []Peer{}, MeasuredAt: now.UTC(),
+	}
+	if srv.MaintenanceStatus != db.MaintenanceStatusOnline {
+		return out, nil
+	}
+	rows, err := q.DesiredCandidates(ctx, serverID)
+	if err != nil {
+		return DesiredSet{}, fmt.Errorf("servers: desired candidates: %w", err)
+	}
+	cands := make([]candidate, 0, len(rows))
+	ids := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		cands = append(cands, candidate{
+			ProfileID: row.ID, DeviceID: row.DeviceID, PublicKey: row.PublicKey,
+			Address: row.AddressV4, Status: row.Status, ExpiresAt: row.ExpiresAt,
+			OverlapUntil: row.OverlapValidUntil, RotateFrom: row.RotateFrom,
+			DeviceRevokedAt: row.DeviceRevokedAt,
+		})
+		if row.RotateFrom != nil {
+			ids = append(ids, row.DeviceID)
+		}
+	}
+	handshaked := make(map[uuid.UUID]bool)
+	if len(ids) > 0 {
+		observed, err := q.HandshakedDevicesAfter(ctx, db.HandshakedDevicesAfterParams{
+			ServerID: &serverID, CreatedAt: now.Add(-connections.RotationOverlap), Column3: ids,
+		})
+		if err != nil {
+			return DesiredSet{}, fmt.Errorf("servers: observed handshakes: %w", err)
+		}
+		for _, id := range observed {
+			if id != nil {
+				handshaked[*id] = true
+			}
+		}
+	}
+	out.Peers = selectPeers(cands, handshaked, now)
+	return out, nil
+}
+
 func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time) []Peer {
 	successor := make(map[uuid.UUID]candidate, len(cands))
 	for _, c := range cands {
@@ -1814,68 +2333,78 @@ func selectPeers(cands []candidate, handshaked map[uuid.UUID]bool, now time.Time
 			successor[*c.RotateFrom] = c
 		}
 	}
-
-	peers := make([]Peer, 0, len(cands))
-	for _, c := range cands {
-		// Мёртвое устройство не имеет права быть в наборе, даже если его профиль по
-		// какой-то причине остался active: критерий приёмки 10 сформулирован как
-		// «ни при каких условиях», и проверка здесь дешевле дыры в туннеле.
-		if c.DeviceRevokedAt != nil {
-			continue
+	sorted := slices.Clone(cands)
+	slices.SortFunc(sorted, func(a, b candidate) int {
+		if order := a.Address.Compare(b.Address); order != 0 {
+			return order
 		}
+		return cmp.Compare(a.PublicKey, b.PublicKey)
+	})
+	peers := make([]Peer, 0, len(cands))
+	for _, c := range sorted {
 		if !c.ExpiresAt.After(now) {
 			continue
 		}
+		// Срок пиера — момент, после которого он больше не нужен: у активного это
+		// срок профиля, у старого ключа — закрытие overlap-окна (§7.3). Без второго
+		// узел не знал бы, когда снять старый ключ, и держал бы его до истечения
+		// профиля, то есть месяц вместо десяти минут.
+		expiresAt := c.ExpiresAt
+		var state string
 		switch c.Status {
 		case db.ProfileStatusActive:
-			peers = append(peers, newPeer(c, string(db.PeerStateActive)))
+			if c.DeviceRevokedAt != nil {
+				continue
+			}
+			state = string(db.PeerStateActive)
 		case db.ProfileStatusSuperseded:
-			succ, ok := successor[c.ProfileID]
-			if !ok || succ.DeviceRevokedAt != nil || !succ.ExpiresAt.After(now) {
+			// Ротация отзывает старое устройство, но сохраняет его ключ до закрытия окна.
+			next, ok := successor[c.ProfileID]
+			if !ok || next.Status != db.ProfileStatusActive || next.DeviceRevokedAt != nil || !next.ExpiresAt.After(now) {
 				continue
 			}
-			if c.OverlapUntil == nil || !c.OverlapUntil.After(now) {
+			if c.OverlapUntil == nil || !c.OverlapUntil.After(now) || handshaked[next.DeviceID] {
 				continue
 			}
-			// Наблюдённый handshake нового ключа снимает старый немедленно (§7.3),
-			// не дожидаясь конца окна.
-			if handshaked[succ.DeviceID] {
-				continue
-			}
-			peers = append(peers, newPeer(c, string(db.PeerStateRotatingOldKey)))
+			state = string(db.PeerStateRotatingOldKey)
+			expiresAt = *c.OverlapUntil
+		default:
+			continue
 		}
+		peers = append(peers, Peer{
+			PublicKey:  c.PublicKey,
+			AllowedIPs: []string{c.Address.String() + "/32"},
+			ExpiresAt:  expiresAt.UTC(),
+			State:      state,
+		})
 	}
-
-	sorted := slices.Clone(cands)
-	slices.SortFunc(sorted, func(a, b candidate) int { return a.Address.Compare(b.Address) })
-	byAddr := make(map[string]Peer, len(peers))
-	for _, p := range peers {
-		byAddr[p.AllowedIPs[0]] = p
+	counts := make(map[string]int, len(peers))
+	for _, peer := range peers {
+		counts[peer.PublicKey]++
 	}
-	out := make([]Peer, 0, len(peers))
-	for _, c := range sorted {
-		if p, ok := byAddr[c.Address.String()+"/32"]; ok {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func newPeer(c candidate, state string) Peer {
-	return Peer{
-		PublicKey: c.PublicKey,
-		// /32 — единственная разрешённая маска клиентского адреса: 32-битный хост в
-		// туннеле, а не подсеть (задача 3 проверяет это и на разборе).
-		AllowedIPs: []string{c.Address.String() + "/32"},
-		ExpiresAt:  c.ExpiresAt.UTC(),
-		State:      state,
-	}
+	// Ключ не уникален между пользователями; при коллизии нельзя выбирать владельца.
+	return slices.DeleteFunc(peers, func(peer Peer) bool {
+		return counts[peer.PublicKey] > 1
+	})
 }
 ```
 
-Сортировка через `byAddr`, а не `sort` по готовым `Peer`, потому что адрес есть у
-кандидата и он уникален в пределах узла (PK `tunnel_addresses`), а `Peer` адреса не
-хранит: дублировать адрес в ответе значило бы дать два источника одного факта.
+Сортируется копия кандидатов: сначала численно по IPv4, затем по публичному ключу.
+При ротации у предка и преемника один адрес, поэтому сворачивание через `byAddr`
+теряло бы один ключ и могло бы продублировать другой. Отзыв старого устройства
+в `RotateKey` не закрывает окно: `DeviceRevokedAt` проверяется для активного профиля
+и его преемника, но не запрещает сам `superseded` профиль. Отзыв через `DeleteDevice`
+снимает профили всей цепочки, поэтому они исключаются по статусу.
+
+Независимое ревью выявило ещё одну допустимую схемой ситуацию: одинаковый публичный
+ключ у разных пользователей (`devices_user_key` уникален только внутри пользователя).
+Если после отбора остались несколько профилей одного ключа, исключить **все** записи
+этого ключа, сохранив остальные. Выбор первого адреса скрывал бы неоднозначность
+владельца. Снятый профиль не участвует в подсчёте коллизий. Это отказ в доступе при
+неоднозначности, а не замена отдельного решения о глобальной уникальности ключей.
+
+Сначала написать тесты шагов 2 и 4, подтвердить падения на пустых реализациях, затем
+добавлять соответствующую часть исходника. Наличие исходника выше не меняет порядок TDD.
 
 - [ ] **Step 2: Падающий unit-тест — `internal/servers/desired_test.go`, схема, не исходник**
 
@@ -1886,17 +2415,18 @@ func newPeer(c candidate, state string) Peer {
   падение воспроизводилось;
 - генератор строит от 1 до 12 кандидатов: `ProfileID` и `DeviceID` — детерминированные из
   индекса (`uuid.MustParse` из `fmt.Sprintf` с фиксированным префиксом), `PublicKey` —
-  уникальный по индексу строка вида `k007` (чистая функция ключ не валидирует: каноничность
-  проверяет `devices`, задача 14 A-1), `Address` — `10.99.<i/250>.<i%250>`, уникальный;
+  уникальная строка вида `k007` (чистая функция ключ не валидирует: каноничность
+  проверяет `devices`, задача 14 A-1), `Address` — `10.99.0.<i+2>`;
 - `Status` — случайно из четырёх значений `db.ProfileStatus` (включая `revoked` и
   `expired`, хотя SQL их не отдаёт: функция обязана быть безопасной и без фильтра БД);
-- `ExpiresAt` — случайное «в прошлом» или «now+1с…30 сут»; `OverlapUntil` — `nil`,
-  «в прошлом» или «в будущем»; `DeviceRevokedAt` — `nil` или «в прошлом»;
-- `RotateFrom`: с вероятностью 1/3 указывает на **предыдущий** кандидат (`out[i-1]`), иначе
-  `nil`. Два правила, оба из-за ловушек: указатель брать нельзя (адрес элемента растущего
-  среза инвалидируется `append`, и `RotateFrom` указывал бы в мусор — копировать id в
-  локальную переменную), и цель обязана быть одна на предка (иначе карта `successor` выбрала
-  бы одного из двух преемников, а проверка-оракул в тесте видела бы другого);
+- `ExpiresAt` — случайное время в пределах 30 суток до или после `now`;
+  `OverlapUntil` — `nil` либо время в пределах 10 минут до или после `now`;
+  `DeviceRevokedAt` — `nil` или «в прошлом»;
+- `RotateFrom`: с вероятностью 1/3 ссылается на предыдущего кандидата, иначе `nil`.
+  При ссылке адрес наследуется от предка: разные ключи с одним IP обязательны для
+  проверки ротации. Идентификатор копируется в локальную переменную; утверждение
+  прежнего текста о висячем указателе после `append` было ошибочным — Go сохраняет
+  достижимый массив. В генераторе у предка не более одного прямого преемника;
 - `handshaked` — случайно помеченные `DeviceID` из тех же кандидатов.
 
 Инварианты, которые обязана проверять каждая итерация (проверка идёт по исходным
@@ -1904,70 +2434,79 @@ func newPeer(c candidate, state string) Peer {
 ту же функцию):
 
 1. каждый выданный `Peer` имеет `State` из `{active, rotating_old_key}`;
-2. у источника каждого выданного пиера `DeviceRevokedAt == nil` и `ExpiresAt.After(now)`;
-3. если источник — `superseded`: у него есть живой `active`-преемник (тот же критерий
-   времени и отзыва), окно открыто (`OverlapUntil != nil && After(now)`) и преемник **не**
-   в множестве наблюденных handshake;
-4. ни один пиер не выдан дважды (по `PublicKey`) и ни один `AllowedIPs` не содержит ничего,
-   кроме одного `/32`;
-5. `selectPeers` на **перевёрнутом** входе даёт результат, побайтово равный результату на
-   исходном (детерминированность и порядок);
-6. пиеров не больше кандидатов.
+2. у источника каждого пира `ExpiresAt.After(now)`; для `active` обязательны
+   `Status == active` и `DeviceRevokedAt == nil`;
+3. для `rotating_old_key` источник имеет статус `superseded` и живого `active`-преемника,
+   окно открыто (`OverlapUntil != nil && After(now)`), преемник не входит в множество
+   наблюдённых handshake. Старое устройство может быть отозвано самой ротацией;
+4. ни один пир не выдан дважды (по `PublicKey`), `AllowedIPs` содержит только адрес
+   источника с маской `/32`, а срок в ответе совпадает со сроком профиля;
+5. `selectPeers` на перевёрнутом входе даёт побайтово тот же JSON;
+6. пиров не больше кандидатов.
+
+Свойство безопасности само по себе пропустило бы всегда пустой ответ. Поэтому
+обязательны таблицы примеров: выдача активного пира, два разных ключа с общим IP,
+отозванный ротацией предок, снятие после handshake, границы срока и окна, отсутствие
+или неактивность преемника. Отдельная проверка числового порядка адресов `.2/.3/.10`,
+неизменности входного среза, UTC и пустого массива.
 
 Run: `make unit`
-Expected: FAIL до реализации (`undefined: selectPeers`), PASS после.
+Expected: FAIL до реализации: сначала отсутствуют типы и функция, затем пустая
+заготовка компилируется, но падает на ожидаемых пирах. После реализации — PASS.
 
 - [ ] **Step 3: `Compute` — схема, не исходник**
 
-1. `srv, err := q.ServerByID(ctx, serverID)`; `pgx.ErrNoRows` → `ErrServerUnknown` (для
-   nodeapi это `404`, и узел по нему уходит на повторный enroll, а не на пустой набор).
-2. `cands, err := q.DesiredCandidates(ctx, serverID)` → перекладывание в `[]candidate`:
-   `RotateFrom` (`*string` из-за `::text`) парсится `uuid.Parse`, ошибка парсинга —
-   `fmt.Errorf("servers: profile %s: bad rotate_from: %w", …)`, а не «пустой предок»:
-   молча потерять ссылку означало бы снять предка раньше окна.
-3. handshake-свидетельство: `ids` — `DeviceID` кандидатов с `RotateFrom != nil`; если
-   `len(ids) > 0`, один вызов
-   `q.HandshakedDevicesAfter(ctx, serverID, now.Add(-connections.RotationOverlap), ids)` →
-   `map[uuid.UUID]bool`. Почему порога достаточно: любое открытое окно длится ровно
-   `RotationOverlap`, значит любое релевантное событие не старше `now − RotationOverlap`;
-   более старые события (от уже закрытых ротаций) в выборку не попадают. Граница
-   сравнивается по `created_at` базы, а не по времени из отчёта узла: часы узла нам не
-   свидетели (задача 10).
-4. `srv.MaintenanceStatus != db.MaintenanceStatusOnline` → `Peers` = пустой **слайс**
-   (`[]Peer{}`, не `nil`: `nil` сериализуется в `null`, а контракт §4.1 обещает массив) и
-   никаких запросов за кандидатами. §7.6: `draining` → desired пуст; `maintenance` и
-   `retired` — тем более. MTU, порт, keepalive и версия при этом отдаются настоящие: узел
-   обязан видеть, что набор опустел именно по решению оператора.
-5. `DNSServers = []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()}` —
-   адрес рекурсора в туннеле это адрес `wg0` узла (§8, пример §4.1 `10.99.0.1` при пуле
-   `10.99.0.0/24`); вторых DNS в цикле A нет, и выдумывать `8.8.8.8` запрещает §8 же.
-6. `ConfigVersion: srv.ConfigVersion`, `MTU: int(srv.Mtu)`, `ListenPort: int(srv.ListenPort)`,
-   `KeepaliveSec: int(srv.KeepaliveSec)`, `MeasuredAt: now.UTC()`,
-   `ServerID: serverID.String()`.
-7. `Peers: selectPeers(cands, handshaked, now)` для online-узла.
+1. `srv, err := q.ServerByID(ctx, serverID)`; `pgx.ErrNoRows` → `ErrServerUnknown`.
+   Прочие ошибки запросов возвращаются с контекстом, а не превращаются в пустой набор.
+2. Собрать параметры: `ConfigVersion`, `MTU`, `ListenPort`, `KeepaliveSec` из сервера,
+   `MeasuredAt: now.UTC()`, `ServerID: serverID.String()`, `Peers: []Peer{}`.
+   `DNSServers = []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()}`:
+   единственный DNS — рекурсор узла в туннеле (§8).
+3. Если `MaintenanceStatus != online`, вернуть параметры с пустым массивом **до**
+   запроса кандидатов. Это относится к `draining`, `maintenance` и `retired` (§7.6).
+4. `DesiredCandidates(ctx, serverID)` переложить в `[]candidate`. `RotateFrom`
+   уже имеет тип `*uuid.UUID`, повторное строковое преобразование не требуется.
+5. `ids` — `DeviceID` кандидатов с `RotateFrom != nil`. При непустом списке вызвать
+   `HandshakedDevicesAfter` с `db.HandshakedDevicesAfterParams{ServerID: &serverID,
+   CreatedAt: now.Add(-connections.RotationOverlap), Column3: ids}`. Результат
+   `[]*uuid.UUID` преобразовать в `map[uuid.UUID]bool`, пропуская nil.
+   Любое релевантное событие открытого окна не старше `now − RotationOverlap`.
+   Порог включительный, сравнивается с `created_at` базы, не с часами узла.
+6. `Peers: selectPeers(cands, handshaked, now)` для online-узла.
 
 - [ ] **Step 4: Интеграционный тест — `tests/integration/desired_test.go`, схема, не исходник**
 
-Фикстуры — `seedServer`/`setServerOnline`/`seedDevice`/`seedProfile` из задачи 1, события —
-прямой `INSERT INTO connection_events … ('handshake_observed', …)` в тесте (создавать их
-через телеметрию здесь незачем: проверяется отсечение).
+Фикстуры — `seedServer`/`setServerOnline`/`seedDevice`/`seedProfile` из задачи 1.
+Пара ротации создаётся настоящими `Issue` и `RotateKey`: это проверяет совместимость
+с отзывом старого устройства и общим IP, а не только вручную собранные строки.
+События — прямой `INSERT INTO connection_events … ('handshake_observed', …)`:
+проверяется отсечение, а телеметрия появится в задаче 10.
 
 | случай | ожидание |
 |---|---|
 | активный профиль | один пиер, `state=active`, `allowed_ips=["<адрес>/32"]`, `expires_at` = срок профиля |
 | два активных профиля + один `revoked` | двух пиеров, отозванного нет; `DesiredCandidates` его строки не возвращает вообще |
 | `active`, но `expires_at` в прошлом | пиера нет (это и есть «просроченный не попадает», до свиппера) |
-| `superseded` с открытым окном и живым преемником, handshake нет | **два** пиера: предок в состоянии `rotating_old_key` |
+| `superseded` с открытым окном и живым преемником, handshake нет | **два** пиера: предок в состоянии `rotating_old_key`, его `expires_at` = `overlap_valid_until` (закрытие окна), а не срок профиля: иначе узлу нечем исполнить «окно закрылось, пиер снять» и он держал бы старый ключ месяц вместо десяти минут |
 | тот же набор + событие `handshake_observed` на преемника | предка нет, преемник есть |
 | `superseded` с закрытым окном | предка нет |
 | `superseded` без преемника вообще | предка нет (иначе снятый ключ жил бы вечно) |
 | предок жив, преемник отозван (`revoked` профиль) | предка нет |
-| событие handshake **старше** `now − RotationOverlap` | предок остался: порог отсекает свидетельства закрытых ротаций |
-| `draining` | `peers` сериализуется в `[]`, версия и MTU — из строки сервера |
-| два вызова `Compute` подряд без изменений | побайтово одинаковый JSON (условие стабильности ETag, задача 11) |
-| сервер из `seedServer` в `maintenance` | `dns_servers = ["<база+1>"]`, `keepalive_sec` и `listen_port` совпадают со строкой |
+| событие handshake старше `now − RotationOverlap` на микросекунду | предок остался |
+| событие точно на границе `now − RotationOverlap` | предок снят |
+| событие другого узла или старого ключа | предок остался |
+| отозвано устройство преемника | обоих ключей нет |
+| выполнен `DeleteDevice` для преемника | вся цепочка отсутствует |
+| `draining`, `maintenance`, `retired` | `peers` сериализуется в `[]`, версия и настройки — из строки сервера |
+| два вызова `Compute` без изменений с одинаковым `now` | побайтово одинаковый JSON; при другом `now` меняется `measured_at` |
+| настройки сервера | `dns_servers = ["<база+1>"]`, MTU, версия, порт и keepalive совпадают со строкой; время UTC |
+| неизвестный сервер | `ErrServerUnknown`, не пустой набор |
+| один ключ у двух пользователей на одном узле | оба конфликтующих пира исключены, независимый ключ сохранён; после отзыва одного профиля второй снова выдаётся |
 
-Run: `make unit && make vet && make integration`
+Run: модульные тесты, `go vet ./...`, `go vet -tags=integration ./...` и интеграционные
+тесты в контейнере Go. Параметры БД передавать только через `--env-file` вне репозитория;
+текущая цель `make integration` передаёт пароль в аргументе и не используется.
+Команды запускаются без конвейера, чтобы код выхода принадлежал самой проверке.
 Expected: PASS.
 
 - [ ] **Step 5: Коммит**
@@ -1986,11 +2525,24 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 **Files:**
 - Create: `internal/telemetry/delta.go`, `internal/telemetry/delta_test.go`,
   `internal/telemetry/service.go`, `tests/integration/telemetry_test.go`
-- Modify: `internal/db/query/telemetry.sql` (добавить `MarkServerHealth`, `SetDeviceSeen`)
+- Modify: `internal/db/query/telemetry.sql` (добавить `MarkObservedHealth`,
+  `MarkServerHealth`, `ObservedDevicesByPublicKeys`, `RecordHandshake`,
+  `ClaimTelemetryPacket`), `internal/db/telemetry.sql.go`, `internal/db/querier.go`,
+  `internal/db/models.go` (генерация sqlc)
+- Create: `migrations/0007_telemetry_receipts.up.sql`,
+  `migrations/0007_telemetry_receipts.down.sql`: квитанции обработки пакетов и индекс handshake
+- Create: `migrations/0008_node_query_indexes.up.sql`,
+  `migrations/0008_node_query_indexes.down.sql`: индексы под `ObservedDevicesByPublicKeys`
+  этой задачи и `DesiredCandidates` задачи 9, плюс два индекса внешних ключей ротации
+- Modify: `tests/integration/net_queries_test.go` — `TestMigration0006UpDownUp` сверяет
+  применённую версию с последней миграцией из embedded FS, а не с цифрой 6: с 0007 в
+  наборе жёсткая проверка «applied == 6» падала бы на полностью применившемся наборе;
+  новый `TestNetQueriesUseIndexes` снимает план двух запросов горячего пути
 
 **Interfaces:**
-- Consumes: `UpsertServerHealth`, `UpsertDeviceDayTraffic`, `DevicesByPublicKeys`,
-  `InsertConnectionEvent`, `redis.Client`.
+- Consumes: `pgxpool.Pool`, `db.RunInTx`, `LockServerRow`, запросы телеметрии,
+  `InsertConnectionEvent`, `UpsertDeviceDayTraffic`, `ClaimTelemetryPacket`,
+  `redis.Client`.
 - Produces (пакет `telemetry`):
   - `func Delta(lastRx, lastTx, curRx, curTx int64, haveBase bool) (rx, tx int64, reset bool)`;
   - `func DayOf(now time.Time) time.Time`;
@@ -1998,10 +2550,12 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   - `type PeerStat struct { PublicKey string; LatestHandshake *time.Time; RxBytes, TxBytes int64 }`
     (JSON-имена: `public_key`, `latest_handshake`, `rx_bytes`, `tx_bytes`);
   - `type ObservedReport struct` — `config_version`, `interface_rx_bytes`,
-    `interface_tx_bytes`, `peers []PeerStat`, `applied_at` (JSON: `config_version`, …);
+    `interface_tx_bytes`, `peers []PeerStat` (JSON-имена совпадают с тегами полей);
   - `type Heartbeat struct` — `agent_version`, `agent_uptime_sec`, `load1 *float64`,
     `cpu_pct *float64`, `applied_config_version`;
-  - `func NewService(q *db.Queries, rdb *redis.Client, log *slog.Logger) *Service`;
+  - `func NewService(pool *pgxpool.Pool, rdb *redis.Client, log *slog.Logger) *Service`;
+    пул нужен для атомарной записи и сериализации отчётов одного сервера;
+  - `ErrInvalidReport` — проверяется через `errors.Is` в узловом HTTP-слое;
   - `(s *Service) IngestObserved(ctx context.Context, serverID uuid.UUID, rep ObservedReport, now time.Time) error`;
   - `(s *Service) IngestHeartbeat(ctx context.Context, serverID uuid.UUID, hb Heartbeat, now time.Time) error`;
   - константы `PeerCountersTTL = 48 * time.Hour`, `HandshakeFresh = 3 * time.Minute`.
@@ -2013,16 +2567,6 @@ package telemetry
 
 import "time"
 
-// Delta — прирост счётчиков пиера между двумя отчётами узла.
-//
-// Отрицательного трафика не бывает, а счётчик WireGuard обнуляется при рестарте агента,
-// перезагрузке узла и при удалении пиера. Поэтому «cur < last» — это not «клиент отдал
-// байты назад», а reset: прирост считаем нулём и запоминаем новое основание. Складывать
-// отрицательную дельту в device_day_traffic значило бы тихо уменьшать чужую квоту.
-//
-// Последний аргумент — «основания не было вообще» (первый отчёт пиера или TTL бакета
-// истёк): он тоже даёт ноль, потому что отсутствие предыдущего замера не доказывает,
-// что трафика не было, но и не доказывает, что он был.
 func Delta(lastRx, lastTx, curRx, curTx int64, haveBase bool) (rx, tx int64, reset bool) {
 	switch {
 	case !haveBase:
@@ -2034,21 +2578,15 @@ func Delta(lastRx, lastTx, curRx, curTx int64, haveBase bool) (rx, tx int64, res
 	}
 }
 
-// DayOf — сутки агрегата `device_day_traffic` всегда в UTC: ключ (user, device, day)
-// не должен зависеть от часового пояса ни сервера, ни клиента.
 func DayOf(now time.Time) time.Time {
 	y, m, d := now.UTC().Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
-// CountHandshaked — сколько пиеров действительно живы на момент отчёта.
-// Считать «у latest_handshake вообще есть значение» нельзя: снятый, но ещё видимый
-// ядром пиер имеет старый handshake, и узел выглядел бы нагруженным чужими
-// соединениями.
 func CountHandshaked(peers []PeerStat, at time.Time, fresh time.Duration) int {
 	n := 0
 	for _, p := range peers {
-		if p.LatestHandshake != nil && p.LatestHandshake.After(at.Add(-fresh)) {
+		if p.LatestHandshake != nil && p.LatestHandshake.After(at.Add(-fresh)) && !p.LatestHandshake.After(at) {
 			n++
 		}
 	}
@@ -2060,95 +2598,269 @@ Unit-тест `internal/telemetry/delta_test.go` — схема, не исход
 обязана содержать: `haveBase=false` → `(0,0,false)`; рост `100→180`, `50→50` → `(80,0,false)`;
 падение обоих → `(0,0,true)`; падение только `tx` → `(0,0,true)` (основание сбрасывается по
 обоим счётчикам разом — иначе `rx` следующего цикла сравнится с «прошлым» из другой эпохи);
-нулевой прирост → `(0,0,false)`. `DayOf` — случай «16:30 +0500» обязан дать ту же дату, что
-«11:30 UTC», и случай перехода через полночь UTC. `CountHandshaked` — три пиера
-(свежий, старый, `nil`) → `1`.
+нулевой прирост → `(0,0,false)`, значения у границы int64. `DayOf` проверяется в UTC,
+положительном и отрицательном часовом поясе, включая смену даты. `CountHandshaked`
+считает только отметки из интервала `(now − fresh, now]`: старый, граничный, будущий
+handshake и `nil` не считаются. Будущая отметка не доказывает состоявшееся соединение.
 
-Run: `make unit`
-Expected: FAIL до реализации (`undefined: Delta`), PASS после.
+Run: модульные тесты в контейнере Go.
+Expected: сначала ошибки отсутствующих функций, затем поведенческие падения пустых
+заготовок; после реализации PASS. Отрицательные счётчики отсекаются на входе сервиса.
 
-- [ ] **Step 2: Запросы — дословный исходник, добавить в `internal/db/query/telemetry.sql`**
+- [ ] **Step 2: Запросы телеметрии и миграция квитанций — дословные исходники**
+
+Первый блок — `internal/db/query/telemetry.sql` целиком.
 
 ```sql
--- name: MarkServerHealth :exec
--- Heartbeat не приносит пиерных статистик, поэтому его upsert трогает только свои
--- колонки. Двойка 0,0 в peers_* при самой первой строке — честное «наблюдений ещё не
--- было», а не «пиеров нет»: их перетрёт первый observed. Один общий upsert на оба
--- сообщения (задача 1) для observed, здесь — второй, потому что иначе heartbeat каждый
--- раз обнулял бы счётчики, принесённые observed три секундой раньше.
+-- name: UpsertServerHealth :exec
+-- Один узел = одна строка наблюдаемого состояния; heartbeat и observed пишут её
+-- одними руками, поэтому наивный INSERT убивал бы второй отчёт того же узла.
 INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
                            interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
                            applied_config_version, status, agent_version, agent_uptime_sec)
-VALUES ($1, $2, 0, 0, 0, 0, $3::numeric, $4::numeric, $5, 'ok', $6, $7)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (server_id) DO UPDATE SET
     observed_at            = EXCLUDED.observed_at,
+    peers_configured       = EXCLUDED.peers_configured,
+    peers_handshaked       = EXCLUDED.peers_handshaked,
+    interface_rx_bytes     = EXCLUDED.interface_rx_bytes,
+    interface_tx_bytes     = EXCLUDED.interface_tx_bytes,
     load1                  = EXCLUDED.load1,
     cpu_pct                = EXCLUDED.cpu_pct,
     applied_config_version = EXCLUDED.applied_config_version,
-    status                 = 'ok',
+    status                 = EXCLUDED.status,
     agent_version          = EXCLUDED.agent_version,
     agent_uptime_sec       = EXCLUDED.agent_uptime_sec;
 
--- name: SetDeviceSeen :one
--- last_seen_at — и поле ответа /devices (контракт A-1), и единственный дешёвый способ
--- понять, что handshake устройства наблюдаем ВПЕРВЫЕ: UPDATE с условием «пришёл момент
--- свежее уже записанного» возвращает строку ровно один раз на каждый новый handshake,
--- и событие handshake_observed не размножается каждым опросом узла. Дедупликация в БД,
--- а не в Redis, обязательна: снятие предка (§7.3) читает события, и отказ Redis не
--- имеет права превращать это в вечный overlap.
-UPDATE devices SET last_seen_at = $2
- WHERE id = $1 AND (last_seen_at IS NULL OR last_seen_at < $2)
- RETURNING id, user_id;
+-- name: InsertConnectionEvent :exec
+-- detail — jsonb из «только коды и версии»: содержимое трафика сюда не кладёт
+-- ни один путь этого плана (ТЗ §11).
+INSERT INTO connection_events (user_id, device_id, server_id, event, detail)
+VALUES ($1, $2, $3, $4, $5);
+
+-- name: UpsertDeviceDayTraffic :exec
+-- Прирост, а не абсолют: узел репортирует счётчики, дельту считает telemetry.Delta
+-- (задача 10), а здесь она складывается в агрегат устройство-сутки (ADR-006).
+INSERT INTO device_day_traffic (user_id, device_id, day, rx_bytes, tx_bytes)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (user_id, device_id, day) DO UPDATE SET
+    rx_bytes = device_day_traffic.rx_bytes + EXCLUDED.rx_bytes,
+    tx_bytes = device_day_traffic.tx_bytes + EXCLUDED.tx_bytes;
+
+-- name: DevicesByPublicKeys :many
+-- Узел называет пиеров публичным ключом; пользователь и устройство — то, чем
+-- этот ключ был выдан. Ключи, которых нет в базе (снятый, но ещё видимый на узле),
+-- просто не возвращаются.
+SELECT id, user_id, public_key FROM devices WHERE public_key = ANY($1::text[]);
+
+-- name: ServerHealthOf :one
+SELECT server_id, observed_at, peers_configured, peers_handshaked,
+       interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
+       applied_config_version, status,
+       agent_version, agent_uptime_sec
+FROM server_health WHERE server_id = $1;
+
+-- name: MarkObservedHealth :exec
+INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
+                           interface_rx_bytes, interface_tx_bytes, applied_config_version, status)
+VALUES ($1, $2, $3, $4, $5, $6, $7, 'ok')
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    peers_configured = EXCLUDED.peers_configured,
+    peers_handshaked = EXCLUDED.peers_handshaked,
+    interface_rx_bytes = EXCLUDED.interface_rx_bytes,
+    interface_tx_bytes = EXCLUDED.interface_tx_bytes,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok';
+
+-- name: MarkServerHealth :exec
+INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,
+                           applied_config_version, status, agent_version, agent_uptime_sec)
+VALUES ($1, $2, $3, $4, $5, 'ok', $6, $7)
+ON CONFLICT (server_id) DO UPDATE SET
+    observed_at = EXCLUDED.observed_at,
+    load1 = EXCLUDED.load1,
+    cpu_pct = EXCLUDED.cpu_pct,
+    applied_config_version = EXCLUDED.applied_config_version,
+    status = 'ok',
+    agent_version = EXCLUDED.agent_version,
+    agent_uptime_sec = EXCLUDED.agent_uptime_sec;
+
+-- name: ObservedDevicesByPublicKeys :many
+SELECT d.id, d.user_id, d.public_key FROM devices d
+WHERE d.public_key = ANY(sqlc.arg(public_keys)::text[])
+  AND EXISTS (SELECT 1 FROM vpn_profiles p WHERE p.device_id = d.id AND p.server_id = sqlc.arg(server_id));
+
+-- name: RecordHandshake :exec
+-- Блокировка сервера в вызывающей транзакции сериализует проверку и вставку события.
+WITH inserted AS (
+    INSERT INTO connection_events (user_id, device_id, server_id, event, detail)
+    SELECT d.user_id, d.id, sqlc.arg(server_id)::uuid, 'handshake_observed',
+           jsonb_build_object('handshake_at', sqlc.arg(handshake_at)::timestamptz,
+                              'config_version', sqlc.arg(config_version)::bigint)
+    FROM devices d
+    WHERE d.id = sqlc.arg(device_id)
+      AND NOT EXISTS (
+          SELECT 1 FROM connection_events e
+          WHERE e.server_id = sqlc.arg(server_id)::uuid AND e.device_id = d.id
+            AND e.event = 'handshake_observed'
+            AND (e.detail->>'handshake_at')::timestamptz >= sqlc.arg(handshake_at)::timestamptz
+      )
+    RETURNING device_id
+)
+UPDATE devices SET last_seen_at = GREATEST(last_seen_at, sqlc.arg(handshake_at)::timestamptz)
+WHERE id IN (SELECT device_id FROM inserted);
+
+-- name: ClaimTelemetryPacket :execrows
+-- Квитанция живёт дольше неподтверждённого пакета в Redis (48 часов).
+WITH expired AS (
+    DELETE FROM telemetry_receipts
+    WHERE server_id = $2 AND processed_at < now() - interval '49 hours'
+)
+INSERT INTO telemetry_receipts (id, server_id) VALUES ($1, $2)
+ON CONFLICT (id) DO NOTHING;
 ```
 
 Run: `make sqlc-generate && make vet`
-Expected: PASS; в `internal/db/telemetry.sql.go` появились оба метода, у `SetDeviceSeen`
-параметры `ID, LastSeenAt`.
+Expected: PASS; сгенерированы `MarkObservedHealth`, `MarkServerHealth`,
+`ObservedDevicesByPublicKeys` и `RecordHandshake`. Числовые nullable поля параметров
+имеют тип `*string`; `RecordHandshakeParams` содержит `HandshakeAt`, `ServerID`,
+`ConfigVersion`, `DeviceID`.
 
-- [ ] **Step 3: `IngestObserved` — схема, не исходник (порядок шагов менять нельзя)**
+`SetDeviceSeen` из прежнего плана не применяется: одно глобальное `last_seen_at`
+не может дедуплицировать handshake одного устройства на разных серверах. Новый
+`RecordHandshake` проверяет события конкретной пары сервер/устройство, вставляет
+событие и монотонно обновляет `last_seen_at` одним SQL-запросом. Вызывающая транзакция
+держит блокировку сервера, поэтому параллельные отчёты не проходят проверку одновременно.
 
-1. `DevicesByPublicKeys(keys)` → карта `public_key → (device_id, user_id)`. Ключей, которых
-   нет в базе, в карте нет: узел мог ещё не снять пиера после отзыва (окно применения), и
-   это не ошибка отчёта.
-2. `UpsertServerHealth` **до** разбора пиеров: `peers_configured = len(rep.Peers)`,
-   `peers_handshaked = CountHandshaked(rep.Peers, now, HandshakeFresh)`, интерфейсные
-   счётчики как есть, `applied_config_version = rep.ConfigVersion`, `status = 'ok'`,
-   `observed_at = now`, `agent_version`/`agent_uptime_sec` — `nil` (heartbeat их не
-   приносил, выдумывать нечем).
-3. События `handshake_observed` — по каждому известному пиеру с `LatestHandshake != nil`:
-   `SetDeviceSeen(deviceID, *LatestHandshake)`; вернул строку → `InsertConnectionEvent`
-   (`handshake_observed`, `device_id`, `server_id`, `user_id`,
-   `detail {"handshake_at": …,"config_version": …}`). Не вернул (строка не новее) → ничего:
-   дедупликация уже случилась в условии UPDATE.
-4. Дельты по байтам: для каждого известного пиера прочитать основание из Redis
-   (`HGETALL tsc:<server_id>:<device_id>`), посчитать `Delta`, записать текущие счётчики
-   (`HSET` + `PEXPIRE PeerCountersTTL` одним `Pipeline`). Если `rx+tx > 0` —
-   `UpsertDeviceDayTraffic(user_id, device_id, DayOf(now), rx, tx)`.
-5. `peer_applied` / `peer_removed` — diff множества публичных ключей против предыдущего
-   отчёта, сохранённого в Redis (`SMEMBERS`/`SADD`/`SREM peers:<server_id>` с тем же TTL).
-   Событие пишет только код и версию, без адресов и байт (§6).
+Три запроса (`MarkObservedHealth`, `ObservedDevicesByPublicKeys`, `RecordHandshake`)
+нужны потому, что прежний вариант плана писал health одним `UpsertServerHealth` с
+нулевыми чужими полями и искал пиеров глобальным `DevicesByPublicKeys`. Первый затирал
+heartbeat-колонки при каждом observed, второй сопоставлял ключ устройства с произвольным
+узлом и не различал владельцев одного ключа. `ClaimTelemetryPacket` закрывает третью
+дыру: без квитанции пакет, записанный в Redis до отката PostgreSQL, либо теряет дельты,
+либо начисляет их повторно.
 
-Правила отказов, которые обязана реализовать именно эта функция:
+Миграция 0007 — дословные исходники `migrations/0007_telemetry_receipts.up.sql`
+(блок 2) и `migrations/0007_telemetry_receipts.down.sql` (блок 3):
 
-- Ошибка Redis (шаги 4 и 5) — `s.log.Warn("telemetry: redis unavailable, counters skipped", …)`
-  и продолжение: health и события handshake уже записаны, а агрегат по байтам просто
-  не пополняется. Это то же решение, что и fail-open лимитера (§4.3): отказ кэша не должен
-  отрезать доступ, и не должен врать про трафик.
-- Ошибка БД на шаге 2 — вернуть: health этого отчёта не записан, и узел по своей стороне
-  повторит отчёт на следующем опросе (он шлёт его каждый цикл, а не один раз).
-- `RxBytes`/`TxBytes` `< 0` в отчёте — отклонить отчёт целиком (`validationError`, задача 11
-  отдаст `400`): отрицательный счётчик в дельте означает, что узел прислал не то, что мы
-  думаем, а молча сложить его в агрегат — испортить чужую статистику.
-- Пиер, absent в базе (ключ не известен), байты не агрегирует: без `user_id` некуда писать,
-  и придумывать пользователя по адресу — ровно та выдумка, которую запрещает ТЗ §19.3.
+```sql
+CREATE TABLE telemetry_receipts (
+    id uuid PRIMARY KEY,
+    server_id uuid NOT NULL REFERENCES vpn_servers(id) ON DELETE CASCADE,
+    processed_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX telemetry_receipts_server_time ON telemetry_receipts (server_id, processed_at);
+CREATE INDEX connection_events_handshake ON connection_events (server_id, device_id)
+    WHERE event = 'handshake_observed';
+```
+
+```sql
+DROP INDEX connection_events_handshake;
+DROP TABLE telemetry_receipts;
+```
+
+Квитанция живёт дольше неподтверждённого пакета (49 против 48 часов): иначе пакет
+успевает истечь, а квитанция о нём исчезнет, и повтор сообщения начнёт начисления
+заново. Отдельный частичный индекс нужен проверке «event уже был» — без него
+`RecordHandshake` на узле с десятками тысяч событий сканировал бы всю таблицу
+`connection_events`; полное покрытие по `(server_id, device_id)` здесь не нужно,
+другие выборки событий идут по индексам `created` и `user`.
+
+Run: `python .scratch/plan_blocks.py 10`, `make migrate-up && make migrate-down &&
+make migrate-up` либо тест up→down→up из задачи 5 A-1, затем `make sqlc-generate &&
+make vet`.
+Expected: 0 расхождений блоков; миграция применяется и откатывается без ошибок;
+сгенерированы `MarkObservedHealth`, `MarkServerHealth`, `ObservedDevicesByPublicKeys`,
+`RecordHandshake`, `ClaimTelemetryPacket` и `TelemetryReceipt`-модель.
+
+Миграция 0008 — индексы горячего пути — схема, не исходник. Пять индексов:
+`devices_public_key` (уникальность в схеме есть только по `(user_id, public_key)`,
+а отчёт узла ищет по одному ключу), полный `profiles_device_server` (частичный
+`profiles_one_active_per_device_server` не покрывает `EXISTS` без фильтра статуса),
+`profiles_server_address` (`DesiredCandidates` отдаёт профили сервера уже в порядке
+адреса), `devices_rotation_of` и `profiles_rotate_from` (внешние ключи
+`ON DELETE SET NULL` без индекса: удаление строки-родителя перебирает всю таблицу).
+Последние два индекса найдены замером тестовой очистки, а не чтением схемы: удаление
+20 000 устройств занимало 14.4 с без индекса `devices.rotation_of` и 0.62 с с ним,
+а вместе с профилями — 30 с без `vpn_profiles.rotate_from` и 1.18 с с ним.
+`TestNetQueriesUseIndexes` подтверждает оба плана `EXPLAIN (ANALYZE, BUFFERS,
+FORMAT JSON)` с настоящими параметрами, а не литеральную копию запроса.
+
+- [ ] **Step 3: `IngestObserved` — схема, не исходник**
+
+1. До любых записей проверить неотрицательность версии и всех счётчиков, отсутствие
+   повторяющихся ключей и ограничение в 4096 пиров. Счётчики байт ограничены сверху
+   `MaxCounterBytes = 1 << 50`: дельта порядка max int64 переполняет bigint суточного
+   агрегата, транзакция откатывается, а неподтверждённый пакет остаётся в Redis и
+   повторяется при каждом отчёте до истечения TTL. Ошибка — `ErrInvalidReport`.
+2. `db.RunInTx` и `LockServerRow(serverID.String())`. Поиск через
+   `ObservedDevicesByPublicKeys` ограничен устройствами с профилями этого сервера.
+   Ключ, которого нет на сервере, и ключ нескольких владельцев не сопоставляются
+   с произвольным устройством. Исторические профили нужны для наблюдения снятия.
+3. `MarkObservedHealth`: реальные интерфейсные счётчики, число пиров, свежие handshake,
+   версия и `observed_at = now`. Этот запрос не трогает поля heartbeat. В обратном
+   направлении `MarkServerHealth` не трогает счётчики и число пиров.
+4. Для известных устройств с непустым handshake не из будущего вызвать
+   `RecordHandshake`. Событие содержит время handshake и версию. Одинаковая или более
+   старая отметка для того же сервера не создаёт нового события. Общая отметка
+   устройства не уменьшается от более старого наблюдения другого сервера.
+5. Одним Redis Pipeline прочитать основания `tsc:<server_id>:<device_id>` и прошлое
+   множество `peers:<server_id>`. При отсутствии либо некорректности основания дельта
+   равна нулю. Сброс любого счётчика даёт ноль по обоим и отладочную запись без ключа.
+   TxPipeline того же шага сохраняет новые основания с TTL 48 часов, заменяет множество
+   ключей и удаляет основания исчезнувших устройств.
+6. Пакет начислений собирается целиком до записей в Redis: положительные дельты в
+   `device_day_traffic` за `DayOf(now)` (сутки фиксируются в пакете, а не в момент
+   применения) и изменения множества как `peer_applied`/`peer_removed` без адресов и
+   байтов в detail. Проверять `rx > 0 || tx > 0`, а не сумму, которая может переполнить
+   int64. Пакет имеет собственный `id` — он и есть квитанция.
+7. Пакет живёт в Redis до коммита PostgreSQL: тело в `tsp:<server_id>`, основания в
+   `tsc:<server_id>:<device_id>`. Перед началом работы с основаниями читается
+   `tsp:<server_id>`: непустой ключ означает «прежний пакет не подтверждён», тогда он
+   применяется первым и цикл повторяется — только после применения к текущему отчёту
+   применяются дельты.
+8. Применение пакета — `ClaimTelemetryPacket(id, server_id)`: `ON CONFLICT DO NOTHING`
+   под блокировкой сервера. Ноль строк означает «квитанция уже есть», пакет не
+   начисляется второй раз, и это единственный случай, когда Redis-квитанция удаляется
+   без применения. Подтверждение — Lua-скрипт, удаляющий `tsp:<server_id>` только если
+   значение равно подтверждённому телу: пакет более свежего отчёта не исчезает чужими
+   руками.
+9. Зафиксировать транзакцию, затем подтвердить пакет. Журнал содержит сервер, версию и
+   число пиров, не тело отчёта.
+
+Правила отказов:
+- Ошибка Redis при чтении или записи — предупреждение и пропуск байтовых агрегатов
+  и событий изменения множества; health и handshake сохраняются в PostgreSQL.
+- Ошибка PostgreSQL возвращается вызывающему и откатывает транзакцию, в том числе
+  событие handshake вместе с отметкой устройства. Неподтверждённый пакет остаётся в
+  Redis, и следующее сообщение узла применяет его до новых начислений.
+- Redis не участвует в транзакции PostgreSQL: точный однократный учёт держится квитанцией
+  в PostgreSQL, а не распределённой транзакцией. Если PostgreSQL откатил уже применённый
+  пакет, он применится заново при повторе; если пакет подтверждён, но отчёт узла не
+  дошёл до ответа, повтор сообщения не даёт двойной дельты.
+- Ошибка подтверждения пакета (Redis недоступен между коммитом и удалением ключа) —
+  предупреждение и выход из цикла: начисления уже зафиксированы, а повтор применит
+  пакет только если квитанция не совпадёт.
+- Пакет, который отказал при постановке и отказал повторно при применении, снимается
+  из Redis после второго отказа: иначе одна ошибка выключала бы приём телеметрии узла
+  на все 48 часов TTL. Начисления такого пакета утрачены, но основания счётчиков уже
+  сдвинуты неудавшейся попыткой, поэтому повторно эти байты не начислятся.
+- Тело пакета пишет только этот код, и ключ живёт 48 часов. Если он не разбирается,
+  пакет выбрасывается с предупреждением, а приём продолжается: возвращать ошибку
+  означало бы потерянную телеметрию узла на всё время жизни ключа. Начисления из
+  неразобранного тела утрачены — это ограниченная потеря, а не двойной учёт.
+- Неизвестные, чужие для узла и неоднозначные ключи не начисляют байты и не порождают
+  пользовательские события; численные показатели интерфейса сохраняются как наблюдение узла.
 
 - [ ] **Step 4: `IngestHeartbeat` — схема, не исходник**
 
 `MarkServerHealth(serverID, now, load1, cpu_pct, applied_config_version, agent_version,
 agent_uptime_sec)`. Отчёт отклоняется **до** обращения к БД, если `agent_version` длиннее 64
-символов, `agent_uptime_sec < 0`, `load1` вне `[0, 999]` или `cpu_pct` вне `[0, 100]`: на
-этих колонках уже стоят CHECK (миграции 0003 и 0006), и внятный `400` клиенту лучше, чем
-`22P02`/`22003`, которые наружу уйдут как `500` и затрут настоящий смысл отказа. Heartbeat
+символов или пуста, `agent_uptime_sec < 0`, версия конфигурации отрицательная,
+`load1` вне `[0, 999]` или `cpu_pct` вне `[0, 100]`. NaN и бесконечность также запрещены.
+Длина версии считается в символах; значения nullable numeric передаются как `*string`.
+`ErrInvalidReport` позволит HTTP-слою вернуть `400`, а не ошибку БД `500`. Heartbeat
 ничего не знает про пиеров и не трогает `device_day_traffic`. Оба метода пишут журнал без
 содержимого отчёта: только `server_id`, версия и число пиеров (§5.2 про журнал, ТЗ §15).
 
@@ -2160,22 +2872,48 @@ agent_uptime_sec)`. Отчёт отклоняется **до** обращени�
 | второй observed, rx+1000, tx+500 | агрегат прибавил ровно `1000/500`; `handshake_observed` **не** продублирован, если `latest_handshake` тот же; продублирован, если стал новее (проверка `count(*)` по событиям) |
 | счётчики упали (`rx` 5000 → 10) | дельта нулевая, агрегат не уменьшился, `reset` в журнале отладочным уровнем, `server_health.interface_rx_bytes` = новое значение |
 | пиер с неизвестным ключом | health посчитан, событий по нему нет, агрегат пуст |
-| observed → heartbeat | `agent_version` и `uptime` заполнены, `peers_configured` сохранилось из observed (не обнулилось) |
+| heartbeat → observed → heartbeat | оба типа сообщения сохраняют чужие поля; `NULL` нагрузки остаётся `NULL` |
 | heartbeat на узле без observed вообще | `server_health` создан, `peers_configured=0`, `status='ok'` |
 | `load1=nil`, `cpu_pct=nil` | в БД `NULL`, а не `0`; каталог (задача 2) по-прежнему отдаёт `load: null` |
 | Redis остановлен (тест: адрес `127.0.0.1:1`) | `IngestObserved` завершился без ошибки, health и `handshake_observed` записаны, `device_day_traffic` пусто; в журнале предупреждение |
-| diff множества 2 → 1 | ровно одно событие `peer_removed` на снятый ключ, одно `peer_applied` на добавленный в обратном переходе |
+| множество 1 → 0 → 0 → 1 | одно событие снятия; повтор пустого отчёта не дублирует событие; повторное появление создаёт применение и новое основание |
+| отрицательные счётчики, повтор ключа, неверные метрики heartbeat | `ErrInvalidReport` до записи health и событий |
+| счётчик байт выше `MaxCounterBytes`, включая пиерный и `math.MaxInt64` | `ErrInvalidReport` до обращений к БД и Redis: дельта такого размера переполнила бы bigint суточного агрегата |
+| пакет отказал при постановке и повторно при применении | после второго отказа `tsp:<server_id>` снят, ошибка вызывающему не возвращена; следующий корректный отчёт начисляет только свою дельту |
+| ключ неизвестен, относится к другому узлу или неоднозначен | нет пользовательских событий и агрегатов, health сохранён |
+| handshake из будущего | не учитывается как состоявшийся и не меняет отметку устройства |
+| одно устройство на двух серверах | событие есть для каждого сервера; более старая отметка второго не уменьшает общий last_seen_at |
+| восемь параллельных одинаковых отчётов | прирост начислен один раз, новый handshake записан один раз |
+| TTL оснований и множества | между 47 и 48 часами; конкретное значение не проверяется, проверается что TTL выставлен |
+| журнал observed и heartbeat | содержит `server_id`, версию и число пиров; не содержит публичный ключ и байтовые значения |
+| PostgreSQL откатил транзакцию после записи пакета в Redis | дельта и событие не потеряны: повтор того же отчёта начисляет ровно `50/25` и одно `peer_applied` (отказ настоящий — переполнение `rx_bytes` CHECK) |
+| подтверждение пакета не прошло (перехвачен Lua-вызов) | неподтверждённый `tsp:<server_id>` остаётся; два повтора не удваивают агрегат; после успеха ключ удалён, `count(*) FROM telemetry_receipts` равно числу применённых пакетов |
+| 20 000 событий `handshake_observed` на двух узлах | `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` для проверки «event уже был» использует `connection_events_handshake` |
+| тело `tsp:<server_id>` не разбирается | приём продолжается: предупреждение, ключ выброшен, дельта текущего отчёта начислена; ошибка вместо этого означала бы потерянную телеметрию на 48 часов |
+| настоящая ротация → observed нового ключа → `Compute` | handshake нового ключа снимает старый ключ из набора узла (`TestTelemetryHandshakeClosesRotationOverlap`); сама логика набора проверена в задаче 9 |
 
-Run: `make unit && make vet && make integration`
+Run: `go test -count=1 ./...`, `go vet ./...`, `go vet -tags=integration ./...`,
+`go test -count=1 -tags=integration ./...` в контейнере Go, `gofmt -l` по изменённым
+пакетам и `git diff --check`. Параметры БД и Redis передаются через внешний env-файл
+(в `make integration` пароль уходит в аргументы командной строки — этот путь закрыт
+постоянным ограничением проекта); команды выполняются без конвейера, чтобы код выхода
+принадлежал самой проверке.
 Expected: PASS.
 
 - [ ] **Step 6: Коммит**
 
 ```bash
-git add internal/telemetry internal/db/query/telemetry.sql tests/integration/telemetry_test.go
+git add internal/telemetry internal/db/query/telemetry.sql internal/db/telemetry.sql.go \
+  internal/db/querier.go internal/db/models.go migrations/0007_telemetry_receipts.up.sql \
+  migrations/0007_telemetry_receipts.down.sql migrations/0008_node_query_indexes.up.sql \
+  migrations/0008_node_query_indexes.down.sql tests/integration/telemetry_test.go \
+  tests/integration/net_queries_test.go
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     commit -m "feat(telemetry): дельты пиерных счётчиков, health узла и события handshake"
 ```
+
+Отдельным коммитом — правка плана и `.scratch/plan_blocks.py` сверяются до него:
+`python .scratch/plan_blocks.py` обязана давать 0 расхождений.
 
 ---
 
@@ -2186,26 +2924,47 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `tests/integration/nodeapi_test.go`
 - Modify: `internal/httpx/context.go`, `internal/httpx/logging.go` (server_id в контексте и
   журнале), `internal/httpx/decorators.go` (третья обёртка — `Node`),
+  `internal/httpx/mux.go` (см. находку ниже: `Envelope` обязан диспетчеризовать через
+  `ServeMux.ServeHTTP`, иначе `PathValue("server_id")` пуст),
+  `internal/db/query/nodeapi.sql` и перегенерированный `internal/db/nodeapi.sql.go`
+  (`RevokeNodeCredential` — отзыв ровно предъявленного токена),
+  `internal/telemetry/service.go` (`MaxReportPeers`),
   `services/api/router.go` (монтаж `/internal/v1` и узловой лимитер).
   Правки `internal/config` нет: узловой токен бессрочен до отзыва и ротации, поэтому
   отдельного TTL в конфигурации не появляется.
+
+**Находка при исполнении (вне плана, исправлена этой же задачей):** `httpx.Envelope`
+диспетчеризовал запрос «по возвращённому хендлеру» (`handler, pattern := routes.Handler(r)`),
+а значения сегментов пути `{…}` проставляет только `ServeMux.ServeHTTP`. Каждый маршрут с
+id в пути — `DELETE /api/v1/devices/{id}`, `…/profiles/{server_id}`, весь `/internal/v1/nodes/{server_id}/*`
+— получал пустой `PathValue`. В A-1 это не всплыло, потому что тесты дёргали маршруты без
+джокеров. Исправление: `Envelope` принимает интерфейс `PatternResolver` (embed `http.Handler`
+плюс `Handler(*http.Request) (http.Handler, string)`) и вызывает `routes.ServeHTTP`, а регрессия
+— `internal/httpx/mux_test.go: TestEnvelopePassesWildcardPathValuesToHandler`.
 
 **Interfaces:**
 - Consumes: `auth.Bearer`, `db.Queries`, `devices.ParsePublicKey` (каноничность — единственный
   источник, задача 14 A-1), `servers.Compute`, `servers.DesiredSet`, `telemetry.Service`,
   `httpx.Limiter`, `httpx.Decorators.Node`.
 - Produces (пакет `nodeapi`):
-  - `func NewAuthenticator(q *db.Queries) *Authenticator` с
-    `(a *Authenticator) Middleware(next http.Handler) http.Handler`;
+  - `func NewAuthenticator(q *db.Queries, log *slog.Logger) *Authenticator` с
+    `(a *Authenticator) Middleware(next http.Handler) http.Handler`; у `Handler` —
+    `NodeMiddleware() func(http.Handler) http.Handler`, чтобы сборщик и маршруты
+    опирались на один экземпляр проверяющего;
   - `httpx.WithServerID(ctx, uuid.UUID) context.Context` и
     `httpx.ServerIDFromContext(ctx) (uuid.UUID, bool)`;
   - `type Handler` c `RegisterRoutes(mux *http.ServeMux, dec httpx.Decorators)` и
-    `NewHandler(q *db.Queries, tel *telemetry.Service, log *slog.Logger) *Handler`;
-  - ошибки `ErrUnknownNode`, `ErrServerMismatch`, `ErrBootstrapInvalid`;
+    `NewHandler(pool *pgxpool.Pool, tel *telemetry.Service, log *slog.Logger) *Handler`;
+    пул, а не готовые `Queries`: расход стартового токена, отзыв прежнего и вставка
+    нового идут одной транзакцией `db.RunInTx`;
+  - sentinel-ошибок (`ErrUnknownNode`, `ErrServerMismatch`, `ErrBootstrapInvalid`) **нет**:
+    отказ узла наружу — это код HTTP + стабильный `httpx`-код, а различение причин нужно
+    только журналу, где оно живёт полем `reason`. Второй источник истины о причине был бы
+    способом начать сравнивать строки отказа;
   - JSON-типы контракта: `EnrollRequest{BootstrapToken, PublicKey string}`,
     `NodeTokenResponse{ServerID, NodeToken string}`;
-  - константу `maxNodePeers = 4096` (потолок разбора отчёта) и константы сборщика
-    `nodePerMin = 120.0`, `nodeBurst = 10` в `services/api/router.go`.
+  - константы сборщика `nodePerMin = 120.0`, `nodeBurst = 10` в `services/api/router.go`;
+    потолок разбора отчёта живёт рядом с валидацией отчёта — `telemetry.MaxReportPeers`.
 
 - [ ] **Step 1: Узловая аутентификация — схема, не исходник**
 
@@ -2216,9 +2975,19 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
    зарегистрирован (§2, строка «Узел-самозванец»).
 3. `TouchNodeCredential(id)` — одна запись на запрос, без кэша: `last_used_at` нужен
    отзыву «неиспользуемого» токена (задача 12), и «примерно последний раз» для этого не
-   годится.
-4. `httpx.WithServerID(r.Context(), cred.ServerID)` → дальше в `r.WithContext`.
-5. `Authenticator` не проверяет прав по маршрутам: «какой сервер» — всё, что знает узел, и
+   годится. Пишется она **не** в `Authenticator`, а отдельной обёрткой маршрута внутри
+   `dec.Node`, то есть после лимитера: отклонённый лимитером запрос не имеет права
+   писать в БД, иначе флуд продолжает нагружать базу при каждом отказе. Отказ самого
+   UPDATE — учёт, а не право: токен уже принят, поэтому он пишется в журнал
+   (`log.Warn`), а запрос продолжает путь; `500` здесь выключал бы узел из-за сбоя
+   одной колонки.
+4. `httpx.WithServerID(r.Context(), cred.ServerID)` → дальше в `r.WithContext`. Тот же
+   вызов дописывает субъекта и в аккумулятор журнала (`noteServerID` по образцу
+   `noteUserID`), иначе строка запроса от узла не отвечает на «кто стучался».
+5. В тот же контекст кладётся и `id` строки токена (неэкспортируемый `credentialKey`):
+   ротация обязана отзывать **предъявленный** токен, а не «самый свежий токен сервера» —
+   у узла может работать второй процесс со своим токеном.
+6. `Authenticator` не проверяет прав по маршрутам: «какой сервер» — всё, что знает узел, и
    это уже в контексте.
 
 Тест `internal/nodeapi/auth_test.go` (unit, fake-хранилище не нужен — проверяются только
@@ -2228,31 +2997,48 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - [ ] **Step 2: enroll — схема, не исходник**
 
 `POST /internal/v1/nodes/enroll` — **единственный** маршрут префикса, доступный без
-узлового токена (иначе enroll невозможен физически); монтируется под `dec.Node`, где
-`Node` для него = `dec.Anonymous`-подобная обёртка по IP (шаг 4).
+узлового токена (иначе enroll невозможен физически); монтируется под `dec.Anonymous` —
+бакет по паре (маршрут, IP), потому что `server_id` у ещё не зарегистрированного узла
+нет и ключа «на узел» для него взять неоткуда (шаг 4).
 
 1. Тело ≤ 1 MiB (`httpx.DecodeJSON`), `bootstrap_token` и `public_key` обязательны;
    `devices.ParsePublicKey(public_key)` → `400 invalid_request` + details `{"field":
    "public_key"}`.
-2. `BootstrapTokenByHash(sha256(token))` → четыре причины отказа различаются **в журнале**
+2. `BootstrapTokenByHash(sha256(token))` → семь причин отказа различаются **в журнале**
    (`log.Warn("node enroll refused", "reason", …, "server_id", …)`), а наружу уходит один
    `401 unauthenticated` с `"стартовый токен не принят"`: различение по ответу — оракул
    «какие токены существуют» для чужого узла.
-   Причины: `unknown`, `expired`, `used`, `revoked`.
-3. `ConsumeBootstrapToken(id)` → `pgx.ErrNoRows` означает «равно одновременно выиграл
-   другой enroll»: тот же `401`, причина `race` в журнале.
-6. `srv, err := q.ServerByID(serverID)`; `pgx.ErrNoRows` здесь означает «токен валиден, а
+   Причины: `unknown`, `used`, `revoked`, `expired`, `server_missing`, `key_mismatch`, `race`.
+3. `srv, err := q.ServerByID(bt.ServerID)`; `pgx.ErrNoRows` здесь означает «токен валиден, а
    сервера нет» — то есть испорченную операцию админа (FK на `vpn_servers` теоретически это
    исключает, а на практике это значит, что сервер удалили, не отозвав его токен). Ответ —
    `401 unauthenticated` (для узла это ровно одно: «пере-зарегистрируйся»), в журнал —
    `log.Error` с `server_id`: оставить такое состояние без сигнала значило бы, что оператор
    узнает о нём из «узел молчит».
-7. `node_token = 32 байта crypto/rand → base64.RawURLEncoding`; в БД — только
-   `sha256` (`InsertNodeCredential`, `rotated_from = nil`). Ответ содержит сам токен
-   **один раз** и больше нигде его не возвращает: это секрет доступа узла, и recover
-   его из журнала или из повтора ответа был бы способом переписать чужой узел.
-8. `RevokeNodeCredentialsForServer(serverID)` **перед** вставкой нового: перевыпуск
-   обязан гасить прежний, иначе украденный старый токен живёт вечно рядом с новым.
+4. `srv.PublicKey != public_key` → тот же `401`, причина `key_mismatch`. Проверка стоит
+   **до** расходования: `ConsumeBootstrapToken` помечает токен израсходованным, и попытка
+   с опечаткой в ключе сожгла бы одноразовый токен, обязав админа перевыпускать его.
+   Сравнение строк здесь — сравнение ключей, потому что неканонических форм уже не бывает
+   (шаг 1, `ParsePublicKey`).
+5. Новый `node_token = 32 байта crypto/rand → base64.RawURLEncoding` генерируется
+   **до** расхода токена: отказ entropy не имеет права сжечь одноразовый токен.
+   Затем одна транзакция `db.RunInTx`: `ConsumeBootstrapToken(id)` → `pgx.ErrNoRows`
+   означает «равно одновременно выиграл другой enroll»: тот же `401`, причина `race`
+   в журнале. Одноразовость держит условие `used_at IS NULL` в самом UPDATE, а не
+   выборка «проверить потом». В той же транзакции —
+   `RevokeNodeCredentialsForServer(serverID)` **перед** вставкой нового и
+   `InsertNodeCredential` (в БД — только `sha256`, `rotated_from = nil`). Отказ
+   отзыва или вставки откатывает и расход: иначе сожжённый стартовый токен и уже
+   отозванный рабочий оставляли бы узел без способа перерегистрироваться.
+6. Перевыпуск обязан гасить прежний токен: украденный старый не имеет права жить
+   вечно рядом с новым; порядок «отозвал, потом вставил» внутри транзакции не даёт
+   узлу остаться без действующего токена при откате.
+7. Ответ содержит сам токен **один раз** и больше нигде его не возвращает: это секрет
+   доступа узла, и recover его из журнала или из повтора ответа был бы способом
+   переписать чужой узел. Поэтому ответ несёт `Cache-Control: no-store` — и на enroll,
+   и на rotate: кэш посредника, вернувший ответ после отзыва, вернул бы рабочий секрет.
+8. Ответ — `200`, а не `201`: узел не создаёт объект от имени пользователя, он получает
+   пропуск к уже зарегистрированной за собой строке.
 9. Событие соединения на enroll не пишется: enroll — не событие туннеля, а
    `connection_events` описывает пиеров и доступ (§6). След административного действия —
    `node_enrolled` в `admin_audit_logs` на выдаче bootstrap-токена (задача 12), плюс
@@ -2262,10 +3048,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 | маршрут | поведение |
 |---|---|
-| `GET /internal/v1/nodes/{server_id}/desired` | `serverID != ServerIDFromContext` → `403 forbidden` («несовпадение сервера», §2 узел-самозванец). Иначе `servers.Compute(q, serverID, now)`, а `ETag` — `fmt.Sprintf("%q", "v"+strconv.FormatInt(set.ConfigVersion, 10))`: кавычки обязательны по RFC 9110, сравнение — строгое равенство строки заголовка. Совпавший `If-None-Match` → `304` без тела и без `Content-Type`. Полный ответ при этом всё равно собран, и это осознанно: версия живёт в той же строке сервера, что и `Compute`, а отдельный путь «только ETag» дал бы вторую реализацию одного правила отсечения ради экономии одной сериализации |
-| `POST …/observed` | `httpx.DecodeJSON` в `telemetry.ObservedReport`, `IngestObserved` → `204`; `400 invalid_request` на битое тело, на отрицательные счётчики и на `peers` больше `maxNodePeers = 4096` (потолок тела — единственная защита от «узел прислал мегабайты и мы их разобрали») |
+| `GET /internal/v1/nodes/{server_id}/desired` | `server_id` в пути не UUID → `400 invalid_request` + details `{"field": "server_id"}` (это дефект запроса, а не прав); `serverID != ServerIDFromContext` → `403 forbidden` («несовпадение сервера», §2 узел-самозванец). Иначе `servers.Compute(q, serverID, now)`, а `ETag` — сильный валидатор от содержимого набора: sha256 канонического JSON с обнулённым `measured_at` (время ответа — не содержимое). Версия для ETag не годится: overlap-окно закрывается по времени, а старый ключ снимается сразу после handshake нового (§7.3), и с версионным ETag узел получал бы `304` и держал снятый ключ до следующего явного изменения. Кавычки обязательны по RFC 9110, сравнение — строгое равенство строки заголовка. Совпавший `If-None-Match` → `304` без тела и без `Content-Type`. Полный набор при этом всё равно собран, и это осознанно: отдельный путь «только ETag» дал бы вторую реализацию одного правила отсечения ради экономии одной сериализации |
+| `POST …/observed` | `httpx.DecodeJSON` в `telemetry.ObservedReport`, `IngestObserved` → `204`; `400 invalid_request` на битое тело, на отрицательные счётчики, на значения выше `telemetry.MaxCounterBytes = 1 << 50` и на `peers` больше `telemetry.MaxReportPeers = 4096` (потолки живут в `telemetry`, рядом с валидацией, чтобы контракт узла не держал их копии; верхняя граница счётчиков защищает bigint суточного агрегата от переполнения) |
 | `POST …/heartbeat` | `telemetry.Heartbeat`, `IngestHeartbeat` → `204`, `400` на битое тело и `403` на чужой `server_id` |
-| `POST …/token/rotate` | новый токен тем же способом, что и на enroll; `InsertNodeCredential(rotated_from = текущий id)` → `RevokeNodeCredential(id)` ровно текущего → `200 NodeTokenResponse`. Порядок «вставил, потом отозвал предъявленный» обязателен: обратный порядок оставлял бы узел без доступа при ошибке вставки. Узел, потерявший ответ, уходит в enroll заново — цена conscious: висящие валидными оба токена удваивали бы поверхность украденного токена |
+| `POST …/token/rotate` | новый токен тем же способом, что и на enroll; `InsertNodeCredential(rotated_from = текущий id)` → `RevokeNodeCredential(id)` ровно текущего → `200 NodeTokenResponse`. Порядок «вставил, потом отозвал предъявленный» обязателен: обратный порядок оставлял бы узел без доступа при ошибке вставки. Узел, потерявший ответ, уходит в enroll заново — цена размена известна: висящие валидными оба токена удваивали бы поверхность украденного токена. Отзыв по `id`, а не по `server_id`: чужой процесс того же узла не обязан терять доступ из-за чужой ротации |
 | всё, кроме enroll | под `dec.Node`: аутентификация узла **до** лимитера по `server_id` (как `dec.Auth` в A-1: ключ бакета читает контекст, появляющийся только после проверки токена) |
 
 - [ ] **Step 4: Третья обёртка в `httpx.Decorators` — схема, не исходник**
@@ -2278,50 +3064,79 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 `Auth` и `Anonymous` не меняются ни поведением, ни порядком — существующие тесты A-1
 обязаны пройти без правок (проверка: `make unit && make integration` на этом шаге).
 
-В `services/api/router.go`:
+В `services/api/router.go` (`node` — уже собранный `nodeapi.NewHandler(d.Pool,
+telemetry.NewService(d.Pool, d.RDB, d.Log), d.Log)`, конструируется до `dec`, потому что
+обёртку отдаёт сам модуль):
 
 ```go
 	Node: func(next http.Handler) http.Handler {
-		return nodeapi.NewAuthenticator(q)(
+		return node.NodeMiddleware()(
 			lim.Middleware("node", httpx.RatePerMinute(nodePerMin), nodeBurst, nodeKey)(next))
 	},
 ```
 
 `nodeKey` — `server_id` из контекста, иначе `"unknown"`; enroll монтируется отдельно под
-`dec.Anonymous` (по IP), потому что у ещё не зарегистрированного узла `server_id` нет.
+`dec.Anonymous` (бакет по паре маршрут+IP), потому что у ещё не зарегистрированного узла
+`server_id` нет.
 
 - [ ] **Step 5: Интеграционный тест — `tests/integration/nodeapi_test.go`, схема, не исходник**
 
-Стенд: `httptest.NewServer(api.NewRouter(...))`? — нет, в существующей практике A-1
-тесты дёргают `mux` напрямую через `httptest.NewRecorder`; здесь так же, но **сквозь**
-настоящий роутер задачи 6 (чтобы проверка 404/405 и конверт были те же, что в проде).
-Fake-узел = последовательность HTTP-вызовов из теста.
+Стенд: `newRouter(t)` из задачи 18 — настоящий `api.NewRouter` за `httptest.NewServer`
+и чистый Redis (база 9, `FlushDB` на тест), чтобы проверка 404/405, конверт, журнал и
+оба лимитера были те же, что в проде. Fake-узел = последовательность HTTP-вызовов из
+теста. Отдельного стенда без сборщика нет: гонка enroll'ов идёт тем же путём, а число
+попыток равно burst анонимного лимитера (5) — больше означало бы проверку лимитера,
+а не одноразовости токена.
 
 | случай | ожидание |
 |---|---|
 | enroll битым bootstrap | `401`, тело-конверт, в журнале причина `unknown`; второй enroll с просроченным токеном даёт **такой же** ответ (проверка по телу, а не по журналу) |
 | enroll валидным токеном | `200`, `node_token` совпадает с `^[A-Za-z0-9_-]{43}$` (32 байта в base64url без дополнений), `server_id` = сервер токена; в `node_credentials` — только `sha256` от него, а не сам токен; повторный enroll тем же токеном → `401`, в журнале причина `used` |
-| два параллельных enroll одним токеном (10 горутин) | ровно один `200`, остальные `401`; в `node_credentials` одна активная строка на сервер |
+| два параллельных enroll одним токеном (5 горутин) | ровно один `200`, остальные `401`; в `node_credentials` одна активная строка на сервер |
+| enroll токеном, чей сервер удалён (внешний ключ снят на время теста) | тот же `401`, что и неизвестным токеном; в журнале причина `server_missing` |
+| отказ `last_used_at` (триггер `BEFORE UPDATE` на `node_credentials`) | desired — `200`, сбой записи только в журнале: учёт не имеет права выключать узел |
+| запрос, отклонённый лимитером | `429`, и `last_used_at` не записан: touch стоит после лимитера |
+| enroll и token/rotate | `Cache-Control: no-store` в обоих ответах: в теле секрет |
+| enroll при отказе вставки токена (триггер-сбой на `node_credentials`) | `500`; `bootstrap_tokens.used_at` нового токена остался `NULL`, прежний рабочий токен не отозван, `desired` с ним по-прежнему `200`: расход, отзыв и вставка откатились вместе |
 | desired с чужим токеном (`server_id` в пути ≠ токену) | `403 forbidden` |
+| desired с не-UUID в пути | `400 invalid_request`, поле в `details.field = server_id`; это НЕ 401 и НЕ 404: маршрут существует, токен принят, сломан путь |
+| enroll каноническим ключом чужого узла, а затем тем же токеном своим ключом | первый — `401`, второй — `200`: отказ по ключу не имеет права израсходовать одноразовый токен (порядок шага 2.4) |
 | desired без токена / с битым | `401` |
 | desired, первый вызов | `200`, `ETag` присутствует, JSON совпадает с §4.1 по именам полей, `peers` — массив (пустой, если профилей нет), приватных ключей нет (`checkEvidence`) |
 | desired с тем же `If-None-Match` | `304`, пустое тело |
 | desired после выдачи профиля | `config_version` вырос, `ETag` другой, пиер появился |
+| desired после handshake нового ключа при ротации | старый ключ снят из набора, но `config_version` не изменился; повтор с прежним `If-None-Match` обязан дать `200` и другой `ETag` — версионный валидатор здесь отдал бы `304` и оставил снятый ключ |
 | observed c `peers` (один известный ключ) | `204`, `server_health` заполнен, событие `handshake_observed` одно |
-| observed с отрицательным `rx_bytes` | `400 invalid_request` |
+| observed с отрицательным или выше `MaxCounterBytes` счётчиком | `400 invalid_request` до записи health и событий |
 | heartbeat после observed | `204`, `agent_version` в health, `peers_configured` сохранился |
-| token/rotate | `200` новый токен; старый → `401` на desired; новый → `200`; в `node_credentials` `rotated_from` = id первого |
-| 130 запросов desired одним узлом подряд | хотя бы один `429` с `Retry-After` (окно 120/мин, burst 10 — числа сборщика) |
-| журнал всех вызовов | нет ни одного из переданных токенов, есть `server_id` |
+| token/rotate | `200` новый токен; старый → `401` на desired; новый → `200`; в `node_credentials` `rotated_from` = id первого; вторая ротация ссылается на второй токен |
+| rotate при втором живом токене того же сервера | отзыв касается только предъявленного: чужой процесс продолжает получать `200`, живых токенов остаётся два (подмена отзыва на «по server_id» обязана упасть здесь) |
+| 130 запросов desired одним узлом подряд | хотя бы один `429` с числовым `Retry-After`, и первый `429` не позже ~15-го запроса: иначе сработало базовое окно по IP (burst 60), а бакета «на узел» (burst 10) в сборке нет |
+| два узла: у первого бакет исчерпан | у второго — `200`, и первый остаётся `429`: обратный порядок обёрток (лимитер до аутентификации) дал бы обоим общий бакет `"unknown"` |
+| журнал всех вызовов | нет ни одного из переданных токенов, есть `server_id`; проверяется разбором строк `msg=request` по маршруту, а не `Contains` по буферу — сервисные строки (`telemetry: heartbeat accepted`) содержат `server_id` и закрыли бы его отсутствие в строке запроса |
 
-Run: `make unit && make vet && make integration`
+Run: `go test ./... && go vet ./... && go vet -tags=integration ./... && gofmt -l .` и
+интеграционный набор в том же контейнере (`go test -tags=integration ./tests/integration/`,
+учётные данные через `--env-file`, а не в аргументах команды). Те же шаги по имени —
+`make unit`, `make vet`, `make integration`, но на хосте Windows Go нет, а `make integration`
+подставляет пароль в аргументы `docker exec`, поэтому прогон идёт контейнером напрямую.
 Expected: PASS.
 
-- [ ] **Step 6: Коммит**
+- [ ] **Step 6: Коммиты**
+
+Правка `httpx.Envelope` — отдельный коммит: это продовдефект сборки с собственной
+регрессией, и в одном коммите с контрактом узла он выглядел бы как «попутная» строка
+диффа, хотя ломал каждый маршрут с id в пути, включая устройства и профили A-2.
 
 ```bash
+git add internal/httpx/mux.go internal/httpx/mux_test.go
+git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
+    commit -m "fix(httpx): конверт диспетчеризует через ServeMux — PathValue доходит до хендлера"
+
 git add internal/nodeapi internal/httpx/context.go internal/httpx/logging.go \
-        internal/httpx/decorators.go services/api/router.go tests/integration/nodeapi_test.go
+        internal/httpx/decorators.go internal/db/query/nodeapi.sql internal/db/nodeapi.sql.go \
+        internal/db/querier.go internal/telemetry/service.go services/api/router.go \
+        tests/integration/nodeapi_test.go
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
     commit -m "feat(nodeapi): контракт /internal/v1 — enroll, desired+ETag, отчёты, ротация токена"
 ```
@@ -2415,8 +3230,9 @@ func NewAdminIssuer(secret []byte, ttl time.Duration) *Issuer {
 
 - [ ] **Step 2: Тест взаимного отторжения — дословный исходник, добавить в `internal/auth/token_test.go`**
 
-Хелперы `bytes32` и пакетные импорты (`context`, `errors`? — `errors` в файле уже есть,
-`strings` есть; при отсутствии `errors` добавить) переиспользуются как есть.
+Хелпер `bytes32` и пакетные импорты переиспользуются как есть; `context`, `time`, `uuid` и
+`strings` в файле уже есть, а `errors` — нет, его нужно добавить в блок импортов (в файле
+A-1 он не требовался: проверки сравнивали `err == nil`).
 
 ```go
 func TestAdminAndUserIssuersRejectEachOther(t *testing.T) {
@@ -2439,7 +3255,7 @@ func TestAdminAndUserIssuersRejectEachOther(t *testing.T) {
 	if _, err := user.Parse(ac.Value); !errors.Is(err, ErrInvalidToken) {
 		t.Errorf("user issuer accepted an admin token: %v", err)
 	}
-	//Обратная проверка: свой токен обязан проходить, иначе две проверки выше проходили бы «на пустоте».
+	// Обратная проверка: свой токен обязан проходить, иначе две проверки выше проходили бы «на пустоте».
 	if _, err := admin.Parse(ac.Value); err != nil {
 		t.Errorf("admin issuer rejected its own token: %v", err)
 	}
@@ -2754,7 +3570,7 @@ Expected: PASS. В `internal/db/admin.sql.go` типы `peers_active`/`days` —
 
 | маршрут | поведение |
 |---|---|
-| `POST …/servers/{id}/bootstrap-tokens` | `{ttl_sec?}` (60..86400, по умолчанию 3600) → `32` байта `crypto/rand` → `base64.RawURLEncoding`, `sha256` в `token_hash`, `expires_at = now.Add(ttl)` (не `now() + $5::interval`: override'а на `interval` в sqlc.yaml нет, и параметром стал бы `pgtype.Interval` — см. правку задачи 1), `created_by = admin_id`. Ответ содержит сам токен один раз; `audit.Do(bootstrap_token_issued)` с `target_type="bootstrap_token"`. Сервера нет → `404`; сервер в `retired` → `409 conflict` («сервер выведен, выдавать ему токен бессмысленно») |
+| `POST …/servers/{id}/bootstrap-tokens` | `{ttl_sec?}` (60..86400, по умолчанию 3600) → `32` байта `crypto/rand` → `base64.RawURLEncoding`, `sha256` в `token_hash`, `expires_at = now.Add(ttl)` (не `now() + $5::interval`: override'а на `interval` в sqlc.yaml нет, и параметром стал бы `pgtype.Interval` — см. правку задачи 1), `created_by = admin_id`. Ответ содержит сам токен один раз и несёт `Cache-Control: no-store`: кэш посредника вернул бы рабочий секрет после отзыва. `audit.Do(bootstrap_token_issued)` с `target_type="bootstrap_token"`. Сервера нет → `404`; сервер в `retired` → `409 conflict` («сервер выведен, выдавать ему токен бессмысленно») |
 | `GET …/servers/{id}/bootstrap-tokens` | `LiveBootstrapTokensOfServer`: `id`, `created_at`, `expires_at`. Ни `token_hash`, ни, тем более, секрета — восстановить выданный токен нельзя по построению, и список обязан это показывать отсутствием поля |
 | `DELETE /api/v1/admin/bootstrap-tokens/{id}` | `RevokeBootstrapToken` (ноль строк = уже использован или отозван) → `409 conflict` (`ErrTokenNotLive`): «токен уже сожжён» и «токена нет» для админа — разные ситуации, и первая требует не повторного отзыва, а поиска узла, который его использовал. `audit.Do(bootstrap_token_revoked)` |
 | `POST …/servers/{id}/node-token/revoke` | `RevokeNodeCredentialsForServer` (`:execrows`, ноль — не ошибка: у ещё не зарегистрированного сервера отзывов нет) + `BumpServerConfigVersion` + `SetServerMaintenance(draining)` и `audit.Do(node_token_revoked)`; если сервер был `online`, второй записью того же `audit.Do` идёт `server_drained` — «узел отрезан» и «набор пиеров снят» должны читаться из журнала как одно решение, а не как два разных действия, разнесённых по времени |
@@ -2804,7 +3620,7 @@ password) string` — вход через настоящий маршрут (н�
 | `POST …/maintenance` `retired → online` | `409 conflict` |
 | `DELETE …/servers/{id}` при активном профиле | `409 conflict`, details `{"peers_active":1}`, сервер жив, профиль жив |
 | `DELETE …/servers/{id}` после отзыва профиля | `204`; сервера, его `tunnel_addresses`, `server_health`, `node_credentials`, остатков `vpn_profiles` — нет; `connection_events` его сервера остались с `server_id = null`; в аудите `server_deleted` с причиной |
-| `POST …/bootstrap-tokens` | `201`, токен `^[A-Za-z0-9_-]{43}$`, `expires_at ≈ now+3600s`; в `bootstrap_tokens` — только sha256; enroll этим токеном (маршрут задачи 11) даёт `200` |
+| `POST …/bootstrap-tokens` | `201`, токен `^[A-Za-z0-9_-]{43}$`, `Cache-Control: no-store`, `expires_at ≈ now+3600s`; в `bootstrap_tokens` — только sha256; enroll этим токеном (маршрут задачи 11) даёт `200` |
 | `ttl_sec = 30` и `ttl_sec = 100000` | `400 invalid_request` |
 | `DELETE /bootstrap-tokens/{id}` дважды | первый `204`, второй `409` |
 | `POST …/node-token/revoke` на `online`-сервере | `204`; предъявленный узлом токен → `401` на desired; сервер в `draining`; в аудите две записи — `node_token_revoked` и `server_drained`, один и тот же `request_id` |
@@ -2819,6 +3635,12 @@ password) string` — вход через настоящий маршрут (н�
 | `GET /audit` после всех действий | записи упорядочены по `created_at DESC`, у каждой непустая `reason` и `request_id`, совпадающий с журналом соответствующего запроса |
 | `audit.Do` с причиной из 2 символов | `mutate` не вызвана ни разу, в базе нет ни изменения, ни записи аудита: валидация причины происходит до начала транзакции, а не «после, и тогда откат» |
 | журнал всех admin-запросов | есть `admin_id`, нет email ни одного админа, нет bootstrap-токенов, нет паролей (`checkEvidence` задачи 15) |
+
+Прогон идёт на общей dev-базе, и admin-тесты (файл `admin_test.go`) выполняются раньше
+`migrations_test.go`: к моменту отката в аудите уже лежат значения enum, добавленные A-2,
+а откат 0006 на них умышленно падает. Поэтому `TestMigrationsUpToDownToUp` очищает
+`admin_audit_logs` до отката: проверка up→down→up — про схему, и фикстуры общего прогона
+не имеют права валить откат, который в производстве защищает настоящий аудит.
 
 Run: `make unit && make vet && make integration`
 Expected: PASS.
@@ -2837,10 +3659,14 @@ Expected: PASS.
 2. §7.6: дописать «удаление сервера возможно только при `peers_active = 0`; остаточные
    профили в терминальных статусах удаляются вместе с сервером, узевой токен гасится
    каскадом, `connection_events` сохраняются с `server_id = null`».
-3. §13 (Известные ограничения), три новые строки: доступность отблокированного access-токена
-   заблокированного пользователя ≤ `AccessTTL`; отзыва администраторов в A-2 нет
-   (у `admin_users` нет `revoked_at`, а `DELETE` каскадом `SET NULL` обезличил бы
-   прошлые записи аудита); создания админа через CLI не оставляют записи в аудите.
+3. §13 (Известные ограничения): пункт 11 дополняется фразой, что админ-блокировка A-2
+   работает по той же схеме и `AccessTTL` — верхняя граница жизни уже выданного
+   access-токена (отдельная строка продублировала бы ту же мысль); добавляются п. 12
+   (отзыва администраторов в A-2 нет: у `admin_users` нет `revoked_at`, а `DELETE`
+   каскадом `SET NULL` обезличил бы прошлые записи аудита; админ-токен ≤ `AccessTTL`;
+   разделение прав — цикл C) и п. 13 (создание админа через CLI не оставляет записи
+   в аудите: `admin_id` — внешний ключ на `admin_users`, «создал сам себя» записать
+   нечем; след — stdout `id`/`email` и `created_at`).
 
 - [ ] **Step 13: Прогон**
 
@@ -2878,8 +3704,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `DeleteOldConnectionEvents`, `NullOldRefreshIPs`, `PurgeOldIdempotencyKeys` (задача 1);
   `RevokeProfile` (задача 1); `db.RunInTx`; `DefaultProfileTTL` (задача 5).
 - Produces (пакет `connections`):
-  - константы `DefaultSweepInterval = time.Hour`, `DormantAfter = 7 * 24 * time.Hour`,
-    `TrafficWindowDays = 30` (её читает admin-просмотр задачи 12);
+  - константы `DefaultSweepInterval = time.Hour`, `DormantAfter = 7 * 24 * time.Hour`
+    (`TrafficWindowDays = 30` здесь не появляется: её завёл admin-просмотр задачи 12
+    в `internal/admin/handlers.go`, и метле она не нужна);
   - `type Store interface { SweepExpired; SweepDormant; SweepStale; SweepRetention }` (шаг 1);
   - `type Retention struct{ EventsDeleted, IPsCleared, KeysPurged int64 }`,
     `type Report struct{ Expired, Dormant, Stale int; Retention Retention }`;
@@ -2904,7 +3731,6 @@ const (
 	// столько. Смысл числа: «выдал и забыл» становится мусором в desired set, а
 	// каждый лишний пиер — это строка в конфиге узла и адрес, занявший пул.
 	DormantAfter = 7 * 24 * time.Hour
-
 )
 
 // Retention — сколько строк метла убрала из каждого стола. Это не «для статистики»:
@@ -3020,10 +3846,11 @@ ORDER BY p.id;
 
 `SweepExpired` — одна транзакция **на профиль**, не одна на всю выборку:
 
-1. `ExpiredActiveProfiles(now)` → rows (запрос уже отдаёт `user_id`);
-2. на каждый row в `db.RunInTx`: `MarkProfileExpired(id)` → `ReleaseAddressByProfile(id)`
-   → `BumpServerConfigVersion(server_id)` → `InsertConnectionEvent(profile_expired,
-   user_id, device_id, server_id, detail {})`.
+1. `ExpiredActiveProfiles(ctx)` → rows (запрос уже отдаёт `user_id`; граница
+   `expires_at <= now()` стоит в SQL задачи 1, поэтому времени в аргументах нет);
+2. на каждый row в `db.RunInTx`: `MarkProfileExpired(id)` → `ReleaseAddressByProfile(&id)`
+   (`:exec`, возвращает только ошибку) → `BumpServerConfigVersion(server_id)` →
+   `InsertConnectionEvent(profile_expired, user_id, device_id, server_id, detail {})`.
 
 `SweepDormant(now)` — та же форма, `DormantActiveProfiles(now.Add(-DormantAfter))`,
 и вместо `MarkProfileExpired` — `RevokeProfile(id)` (статус `revoked`, `revoked_at` —
@@ -3152,7 +3979,7 @@ func TestSweepAllRunsEveryKindDespiteErrors(t *testing.T) {
 		t.Errorf("kinds = %v, want all four in order", st.calls)
 	}
 	// Упавшие виды работы обязаны быть слышны, а не проглочены: ровно две Error-строки.
-	if n := strings.Count(buf.String(), `"lvl":"ERROR"`); n != 2 {
+	if n := strings.Count(buf.String(), `"level":"ERROR"`); n != 2 {
 		t.Errorf("journal has %d error lines, want 2 (%s)", n, buf.String())
 	}
 }
@@ -3164,10 +3991,21 @@ func TestSweepAllRunsEveryKindDespiteErrors(t *testing.T) {
 
 - [ ] **Step 7: Интеграционный тест — `tests/integration/sweeper_test.go`, схема, не исходник**
 
-Хранилище — настоящее (`connections.NewStore(pool)`), время подставляется в явные
-аргументы методов: просрочку играют UPDATE'ом `expires_at` в прошлое (иначе «подождать
+Шапка файла — `//go:build integration` и `package integration`, как у остальных тестов
+каталога: без тега unit-набор (`go test ./...`) компилирует файл и падает на хелперах,
+которых в этой сборке нет.
+
+Хранилище — настоящее (`connections.NewStore(pool)`), а время живёт в данных и в явных
+аргументах методов: просрочку играют UPDATE'ом `expires_at` в прошлое (иначе «подождать
 30 суток» — тест, который никто не запускал), а dormancy — `issued_at` в прошлое. Это
 не «подмена логики»: пороги живут в SQL-условиях и в константе, а тест двигает данные.
+Просрочка двигает и `issued_at` вместе с `expires_at`: constraint `profiles_window`
+требует `expires_at > issued_at`, и UPDATE одного `expires_at` база отклонит.
+
+Общая dev-база между прогонами одна и та же, и чужой просроченный профиль, оставшийся от
+предыдущего прогона, попал бы в счёт `SweepExpired`. Поэтому expired/dormant/concurrent
+тесты перед созданием фикстуры делают «осушающий» проход метлы, и только потом создают
+свои строки: точные счётчики тогда принадлежат только этому тесту.
 
 | случай | ожидание |
 |---|---|
@@ -3180,7 +4018,7 @@ func TestSweepAllRunsEveryKindDespiteErrors(t *testing.T) {
 | события старше 90 суток (вставить `created_at` UPDATE'ом) | `SweepRetention` → `EventsDeleted` ≥ 1; молодые события целы |
 | refresh-семья старше 90 суток с `ip` | `IPsCleared` ≥ 1, `ip` стал NULL, сама семья цела (детект переиспользования не должен ослепнуть) |
 | завершённый idempotency-ключ старше 24 часов и незавершённый старше 7 суток | `KeysPurged` = 2 |
-| `sweepAll` на стенде со всеми четырьмя видами | `Report` содержит все четыре числа, в журнале одна `sweep`-строка с ними же |
+| `Run` на стенде со всеми четырьмя видами (тикер 10 мс, отмена после первой `sweep`-строки) | в журнале одна строка `"msg":"sweep"` с ненулевыми `expired`, `dormant`, `stale`, `events_deleted`: `sweepAll` неэкспортируема, и наружный контракт метлы наблюдаем только через `Run` |
 | два параллельных `SweepExpired` (2 горутинки) на одном профиле | суммарно ровно 1 (не 2): `MarkProfileExpired` защищён условием статуса, и вторая транзакция видит уже `expired` |
 
 Run: `make unit && make vet && make integration`
@@ -3235,10 +4073,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 |---|---|
 | `/api/v1/servers` | `GET` → 200 `ServerList`, `GET` под `bearerAuth`; 401, 429 |
 | `/api/v1/devices/{id}` | `DELETE` → 204; 400, 401, 404, 429 |
-| `/api/v1/devices/{id}/keys/rotate` | `POST` с `IdempotencyKey` → 201 `RotateResponse`; 400 `invalid_request` (в том числе неканонический `new_public_key` — задача 8), 401, 404, 409 `device_limit_reached`, 429 |
-| `/api/v1/devices/{id}/profiles` | `POST` с `IdempotencyKey` → 201 `ProfileView`; `GET` → 200 массив `ProfileView`; 400, 401, 404, 409 (`conflict`, `device_limit_reached`, `server_not_available`), 429. `503` в контракте нет намеренно: §7.1 отказывает «сервера нет в вашем плане» и «сервер не онлайн» стабильным кодом, а `503` обещал бы клиенту «повтори позже», которого админ не выполнял |
-| `/api/v1/devices/{id}/profiles/{server_id}` | `DELETE` → 200 `ProfileView` (отозванный, чтобы клиент увидел `revoked_at`), 401, 404, 409; `GET` → 200 `ProfileView` |
-| `/api/v1/devices/{id}/profiles/{server_id}/config` | `GET` → 200 **`text/plain`**, `x-wg-config`; описание обязано содержать: «текст без строки `PrivateKey` — приватный ключ устройства не покидает устройство (ТЗ §5); клиент вставляет его локально перед применением» |
+| `/api/v1/devices/{id}/keys/rotate` | `POST` с `IdempotencyKey` → 200 `Device` (не 201: в терминах пользователя это новое состояние того же устройства, задача 8); 400 `invalid_request` (в том числе неканонический `public_key` — задача 8), 401, 404, 409 (`conflict` — отозванный предок или `profile_changed`; `duplicate_device`), 429 |
+| `/api/v1/devices/{id}/profiles` | `POST` с `IdempotencyKey` → 201 `ProfileView`; `GET` → 200 массив `ProfileView`; 400, 401, 403 (устройство отозвано или активной подписки нет), 404, 409 (`conflict`, `server_not_available`), 429. `503` в контракте нет намеренно: §7.1 отказывает «сервера нет в вашем плане» и «сервер не онлайн» стабильным кодом, а `503` обещал бы клиенту «повтори позже», которого админ не выполнял |
+| `/api/v1/devices/{id}/profiles/{server_id}` | `DELETE` → 204 **без тела** (задача 6: показывать после отзыва нечего; повторный отзыв — 409 с настоящим `status` в `details`); `GET` → 200 `ProfileView`; 400, 401, 404, 409, 429 |
+| `/api/v1/devices/{id}/profiles/{server_id}/config` | `GET` → 200 **`text/plain`**, `Cache-Control: no-store`; описание обязано содержать: «текст без строки `PrivateKey` — приватный ключ устройства не покидает устройство (ТЗ §5); клиент вставляет его локально перед применением» |
 
 - [ ] **Step 3: Маршруты управления — схема, не исходник**
 
@@ -3257,20 +4095,31 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 | путь | методы |
 |---|---|
-| `/internal/v1/nodes/enroll` | `POST`, `security: []`, тело `NodeEnrollRequest` → 201 `NodeToken`; 400, 401, 429 |
+| `/internal/v1/nodes/enroll` | `POST`, `security: []`, тело `NodeEnrollRequest` → 200 `NodeToken`; 400, 401, 429 |
 | `/internal/v1/nodes/{server_id}/desired` | `GET` под `nodeBearerAuth`; 200 `DesiredSet` + заголовок `ETag`, 304 **без тела** (отдельный response без `content`), 401, 403, 404, 429 |
 | `/internal/v1/nodes/{server_id}/observed` | `POST` → 204; 400, 401, 403, 429 |
 | `/internal/v1/nodes/{server_id}/heartbeat` | `POST` → 204; 400, 401, 403, 429 |
 | `/internal/v1/nodes/{server_id}/token/rotate` | `POST` → 200 `NodeToken`; 401, 403, 429 |
 
-Схемы: `DesiredSet{server_id, config_version, mtu, keepalive_sec, endpoint_host,
-endpoint_port, dns_servers[], allowed_ips[], peers[]}`, `Peer{public_key,
-allowed_ips[], endpoint_hint?, presplit?, persistent_keepalive?, comment}` — набор полей
-обязан совпасть с `servers.Peer` задачи 9 **по именам json-тегов**, а не по памяти;
+Схемы (по фактическим json-тегам, а не по памяти — правка после задачи 11, тест
+`TestNodeDesiredETagAndFieldNames` сверяет имена живьём):
+`DesiredSet{server_id, config_version, mtu, listen_port, dns_servers[], keepalive_sec,
+peers[], measured_at}`, `Peer{public_key, allowed_ips[], expires_at, state}` —
+`endpoint_host` с `endpoint_port` в набор не входят: узлу нужен порт прослушивания из
+`listen_port`, а адрес наружной стороны знает админ (задача 12), и `servers.Peer` задачи 9
+никогда не имел полей `endpoint_hint`, `presplit`, `persistent_keepalive`, `comment`;
 `NodeEnrollRequest{bootstrap_token, public_key}`, `NodeToken{server_id, node_token}`,
-`ObservedReport{server_id, applied_config_version, interface_rx_bytes, interface_tx_bytes,
-peers[{public_key, rx_bytes, tx_bytes, last_handshake_unix}]}`,
-`Heartbeat{server_id, agent_version, agent_uptime_sec, applied_config_version}`.
+`ObservedReport{config_version, interface_rx_bytes, interface_tx_bytes,
+peers[{public_key, latest_handshake, rx_bytes, tx_bytes}]}`,
+`Heartbeat{agent_version, agent_uptime_sec, load1?, cpu_pct?, applied_config_version}` —
+имена берутся из json-тегов `telemetry.ObservedReport`, `telemetry.PeerStat` и
+`telemetry.Heartbeat` (задача 10), а `load1` с `cpu_pct` обязаны быть `nullable`:
+неизмеренное не превращается в ноль (§13.4).
+
+В телах отчётов поля `server_id` нет намеренно: субъект запроса — токен узла, а сервер,
+которому он принадлежит, берётся из пути и сверяется с токеном (задача 11). Второе
+указание сервера в теле означало бы, что узел может сообщить один id, а получить доступ
+по другому.
 
 `304` — единственный случай «ответ без тела» во всём контракте, и он обязан быть
 описан явно: клиент, который читает спецификацию как список тел, иначе станет искать
@@ -3278,15 +4127,18 @@ JSON в пустом ответе.
 
 - [ ] **Step 5: Схемы ответов пользователя — схема, не исходник**
 
-`ServerSummary{id, name, country_code, city, advertised_host?, listen_port?,
-availability, latency_ms, load_pct, peers_active, capacity_mbps}` — пропуски измеренного
-выражаются `null` и в описании поля, а не отсутствием поля (задача 2 выбрала `null`
-именно поэтому). `ProfileView{id, device_id, server_id, address_v4, status, issued_at,
-expires_at, overlap_valid_until?, revoked_at?}`. `RotateResponse{device_id,
-new_public_key, superseded_profile_id?, overlap_valid_until}`. `AdminServerView`,
-`BootstrapToken{token?}` (поле присутствует только в ответе выдачи — в контракте это
-отдельная схема `BootstrapTokenIssued`), `AuditEntry{...}`, `AdminUserView{email, status,
-locked_reason, devices[], traffic[]}`, `TrafficEntry{device_id, rx_bytes, tx_bytes, days}`.
+`ServerSummary{id, name, country_code, city, host, port, mtu, latitude, longitude,
+availability, latency_ms, load, capacity_mbps, provider, region}` — поля по фактическому
+`servers.Summary` задачи 2; `latency_ms` и `load` всегда `null` (не измеряли, ADR-006),
+`capacity_mbps` — `null`, если оператор её не заявил, `region` — пустая строка, если не
+заполнена. `ProfileView{id, device_id, server_id, address_v4, status, issued_at,
+expires_at, overlap_valid_until?, revoked_at?}`. Ротация возвращает `Device` (deviceView
+задачи 7), отдельной схемы `RotateResponse` в коде нет. `AdminServerView`,
+`AdminServerDetail{…, health?}` (health — отдельная схема `Health` или `null`),
+`BootstrapToken{...}` и `BootstrapTokenIssued{...token}` (поле присутствует только в
+ответе выдачи), `AuditEntry{...}`, `AdminUserView{id, email, display_name, status,
+locked_reason, locale, created_at, devices[], traffic[]}`, `TrafficEntry{device_id,
+rx_bytes, tx_bytes, days}`.
 
 Ни одна схема не содержит `private_key`, `password_hash`, `token_hash`: проверка —
 задача 15 (живое сравнение ответов), а не молчание автора контракта.
@@ -3353,10 +4205,15 @@ func (e *env) node(t *testing.T, serverID uuid.UUID) nodeActor // bootstrap-то
 Бюджет запросов (правило A-1 остаётся: любая 429 в матрице обрывает прогон как «тест
 съел свой лимит»). В A-2 матрица растёт, и правило требует учёта: `userPerMin = 600` и
 `anyPerMin = 300` считаются на IP и на пользователя, `admin`-бакет — на админа, `node` —
-на `server_id`. Поэтому: анонимных вызовов одного маршрута ≤ 4 (это единственное жёсткое
-число — бакет 5 на пару (маршрут, IP)), всех вызовов прогона < 250 на IP, и узловые
-маршруты дёргаются одним `server_id` не чаще 10 раз подряд. Проверка — существующий
-цикл по `e.ev.calls` в конце `TestAccessMatrix`, новый помощник не нужен.
+на `server_id`. Число «всех вызовов прогона < 250 на IP», названное здесь до реализации,
+глобальным `any`-бакетом не выдерживается: при burst 60 он длительно пропускает 5
+запросов в секунду на IP, а матрица A-2 упиралась в 429 уже на середине. Поэтому
+`TestAccessMatrix` разбит на три изолированных прогона — участник, администратор, узел:
+у каждого своя сборка роутера (и свой чистый Redis девятой базы через `isolatedRedis`) и
+своё evidence. Правила внутри прогона: анонимных вызовов одного маршрута ≤ 4 (бакет 5 на
+пару (маршрут, IP)), узловые маршруты дёргаются одним `server_id` не чаще 10 раз подряд
+(бакет 10). Проверка — существующий цикл по `e.ev.calls` в конце каждого прогона, новый
+помощник не нужен.
 
 - [ ] **Step 2: `checkEvidence` — новые секреты, схема, не исходник**
 
@@ -3381,11 +4238,17 @@ func (e *env) node(t *testing.T, serverID uuid.UUID) nodeActor // bootstrap-то
 задачи, как в A-1: живые байты против объявленной схемы):
 
 - `GET /api/v1/servers` — форма `ServerSummary`, и обязательная тройка
-  `latency_ms`/`load_pct`/`peers_active` присутствует даже когда значения `null`;
+  `latency_ms`/`load`/`capacity_mbps` присутствует даже когда значения `null` (имена
+  взяты из контракта задачи 14: `load_pct`/`peers_active`, названные здесь раньше, в
+  схеме не существуют);
 - `POST/GET/DELETE` профилей — `ProfileView`;
 - `GET …/config` — тип ответа `text/plain`, схема не JSON, и проверка отсутствия
   `PrivateKey`;
-- `POST …/keys/rotate` — `RotateResponse`;
+- `POST …/keys/rotate` — `Device`: отдельной схемы `RotateResponse` в контракте нет;
+
+Раннер сверки расширяется под то, что уже объявлено в контракте, но им не читалось:
+`anyOf` (у `health` в `AdminServerDetail`), `text/plain` (конфиг) и path-level
+`parameters`, которые при плоском разборе `paths` падают декодировкой.
 - `GET /internal/v1/nodes/{id}/desired` — `DesiredSet`, наличие `ETag`, и `304`
   обязан быть **пустым** (для него в контракте нет `content`, и живой ответ должен
   совпасть);

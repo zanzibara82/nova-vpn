@@ -247,6 +247,31 @@ func TestLoggingRecoversPanicWithEnvelope(t *testing.T) {
 	}
 }
 
+func TestEnvelopePassesWildcardPathValuesToHandler(t *testing.T) {
+	// Диспетчер обязан идти через ServeHTTP самого mux: значения сегментов пути
+	// ({id}) проставляет только ServeMux.ServeHTTP, а Handler(r) лишь говорит,
+	// какой handler выиграл. Вызов «выигравшего» напрямую оставлял
+	// r.PathValue("id") пустым, то есть каждый маршрут с id в пути отвечал 400 на
+	// собственный же путь. Через Envelope это видно только здесь: тесты модулей
+	// строят mux сами и проходят мимо конверта.
+	const id = "11111111-1111-1111-1111-111111111111"
+	mux := http.NewServeMux()
+	got := make(chan string, 1)
+	mux.HandleFunc("DELETE /api/v1/devices/{id}", func(w http.ResponseWriter, r *http.Request) {
+		got <- r.PathValue("id")
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	w := httptest.NewRecorder()
+	Envelope(mux).ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/api/v1/devices/"+id, nil))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d %q, want 204", w.Code, w.Body.String())
+	}
+	if v := <-got; v != id {
+		t.Errorf("PathValue(\"id\") = %q, want %q из пути", v, id)
+	}
+}
+
 func TestEnvelopeWorksWithoutLogging(t *testing.T) {
 	// noteRoute обязан молчать без журнала: Envelope используется и в тестах
 	// модулей, где Logging не подключён.
@@ -264,5 +289,46 @@ func TestWithUserIDWithoutJournalDoesNotPanic(t *testing.T) {
 	got, ok := UserIDFromContext(ctx)
 	if !ok || got != id {
 		t.Errorf("UserIDFromContext = (%v, %v), want (%v, true)", got, ok, id)
+	}
+}
+
+func TestLoggingCarriesAdminIDSeparatelyFromUser(t *testing.T) {
+	admin := uuid.New()
+	var buf bytes.Buffer
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v1/admin/audit", func(w http.ResponseWriter, r *http.Request) {
+		// Так делает admin.Middleware: id администратора появляется только после
+		// проверки токена, а строка журнала пишется снаружи.
+		ctx := WithAdminID(r.Context(), admin)
+		if got, ok := AdminIDFromContext(ctx); !ok || got != admin {
+			t.Errorf("AdminIDFromContext = (%v, %v), want (%v, true)", got, ok, admin)
+		}
+		if _, ok := UserIDFromContext(ctx); ok {
+			t.Error("admin id leaked into UserIDFromContext: субъекты обязаны различаться типом ключа")
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	w := httptest.NewRecorder()
+	chain(mux, slog.New(slog.NewJSONHandler(&buf, nil))).ServeHTTP(w,
+		httptest.NewRequest(http.MethodGet, "/api/v1/admin/audit", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	entry := jsonLine(t, &buf)
+	if got, _ := entry["admin_id"].(string); got != admin.String() {
+		t.Errorf("admin_id = %q, want %q", got, admin.String())
+	}
+	// Пустого user_id в строке быть не должно: маршрут не может иметь оба субъекта,
+	// и общая «универсальная» переменная субъекта здесь же сломала бы различие.
+	if _, ok := entry["user_id"]; ok {
+		t.Error("user_id present on an admin route")
+	}
+	// Email в журнал не кладётся (§10, §15): проверяем, что единственное поле
+	// личности — id, а не «admin_email» или «subject».
+	for k := range entry {
+		if strings.Contains(k, "email") {
+			t.Errorf("journal carries an identity field %q", k)
+		}
 	}
 }

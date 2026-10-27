@@ -13,14 +13,18 @@ import (
 type ErrorCode string
 
 const (
-	ErrInvalidRequest         ErrorCode = "invalid_request"
-	ErrUnauthenticated        ErrorCode = "unauthenticated"
-	ErrAccountLocked          ErrorCode = "account_locked"
-	ErrForbidden              ErrorCode = "forbidden"
-	ErrNotFound               ErrorCode = "not_found"
-	ErrConflict               ErrorCode = "conflict"
-	ErrDeviceLimitReached     ErrorCode = "device_limit_reached"
-	ErrDuplicateDevice        ErrorCode = "duplicate_device"
+	ErrInvalidRequest     ErrorCode = "invalid_request"
+	ErrUnauthenticated    ErrorCode = "unauthenticated"
+	ErrAccountLocked      ErrorCode = "account_locked"
+	ErrForbidden          ErrorCode = "forbidden"
+	ErrNotFound           ErrorCode = "not_found"
+	ErrConflict           ErrorCode = "conflict"
+	ErrDeviceLimitReached ErrorCode = "device_limit_reached"
+	ErrDuplicateDevice    ErrorCode = "duplicate_device"
+	// 409 server_not_available — §7.1 требует отказа «сервер не online» при выдаче, а
+	// §5.2 требует стабильного кода. Отдельный от `conflict`: клиент по коду понимает,
+	// что стоит выбрать другой сервер, а не повторять тот же запрос.
+	ErrServerNotAvailable     ErrorCode = "server_not_available"
 	ErrIdempotencyKeyRequired ErrorCode = "idempotency_key_required"
 	ErrIdempotencyConflict    ErrorCode = "idempotency_key_conflict"
 	ErrIdempotencyInProgress  ErrorCode = "idempotency_key_in_progress"
