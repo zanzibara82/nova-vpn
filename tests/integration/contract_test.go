@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -29,6 +30,9 @@ import (
 type node struct {
 	Ref   string `yaml:"$ref"`
 	AllOf []node `yaml:"allOf"`
+	// AnyOf встречается ровно у health в AdminServerDetail: Health либо null.
+	// Проверяется как «совпала хотя бы одна ветка», остальное — по общим правилам.
+	AnyOf []node `yaml:"anyOf"`
 	Type  any    `yaml:"type"`
 	// Значения в properties — всегда схемы (объекты), поэтому map[string]node, а не
 	// map[string]any: раскодировка узлов происходит здесь, а не на уровне any.
@@ -53,11 +57,21 @@ type response struct {
 	} `yaml:"content"`
 }
 
-// jsonSchema — схема application/json этого ответа. has=false означает «ответ без тела»
-// (204), а не «контракт сломан»: путать эти два случая — значит валить тест на
-// правильном коде.
+// jsonSchema — схема application/json этого ответа. has=false означает «ответ без
+// JSON-тела» (204, 304 или text/plain), а не «контракт сломан»: путать эти случаи —
+// значит валить тест на правильном коде.
 func (r response) jsonSchema() (node, bool) {
 	c, ok := r.Content["application/json"]
+	if !ok {
+		return node{}, false
+	}
+	return c.Schema, true
+}
+
+// textSchema — схема text/plain. Сейчас это только WireGuard-конфиг: тело — строка,
+// и разбирать её как JSON нечем и незачем.
+func (r response) textSchema() (node, bool) {
+	c, ok := r.Content["text/plain"]
 	if !ok {
 		return node{}, false
 	}
@@ -69,8 +83,18 @@ type operation struct {
 	Responses map[string]response `yaml:"responses"`
 }
 
+// pathItem — элемент paths. Кроме методов у шаблонных путей есть общий список
+// parameters: это не операция, и без отдельного поля раскодировка падала бы на
+// попытке превратить последовательность в operation.
+type pathItem struct {
+	Parameters []any `yaml:"parameters"`
+	// Остальные ключи пути — методы; строчные имена совпадают с http.Method* в
+	// нижнем регистре (get, post, patch, delete).
+	Methods map[string]operation `yaml:",inline"`
+}
+
 type spec struct {
-	Paths      map[string]map[string]operation `yaml:"paths"`
+	Paths      map[string]pathItem `yaml:"paths"`
 	Components struct {
 		Schemas   map[string]node     `yaml:"schemas"`
 		Responses map[string]response `yaml:"responses"`
@@ -104,7 +128,11 @@ func (s *spec) resolve(ref string) (node, bool) {
 // разворачивается здесь же: иначе общая ошибка «InvalidRequest» была бы невидима для
 // сверки, а именно таких в контракте большинство.
 func (s *spec) responseFor(path, method string, status int) (response, bool) {
-	op, ok := s.Paths[path][strings.ToLower(method)]
+	item, ok := s.Paths[path]
+	if !ok {
+		return response{}, false
+	}
+	op, ok := item.Methods[strings.ToLower(method)]
 	if !ok {
 		return response{}, false
 	}
@@ -139,6 +167,20 @@ func validate(n node, v any, s *spec, path string) []string {
 	// Каждая ветка проверяется по всему значению, поэтому порядок веток не важен.
 	for _, sub := range n.AllOf {
 		out = append(out, validate(sub, v, s, path)...)
+	}
+	// anyOf требует совпадения хотя бы одной ветки. Провал одной ветки не ошибка,
+	// поэтому ветки проверяются отдельно, а наружу выходит одно расхождение.
+	if len(n.AnyOf) > 0 {
+		matched := false
+		for _, sub := range n.AnyOf {
+			if len(validate(sub, v, s, path)) == 0 {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			out = append(out, fmt.Sprintf("%s: value %v matches none of anyOf", path, v))
+		}
 	}
 
 	types := []string{}
@@ -257,6 +299,19 @@ func TestLiveResponsesMatchContract(t *testing.T) {
 	s := loadSpec(t)
 	e := newEnv(t)
 
+	// Один профиль на все чтения: выдача стоит POST, а список, один профиль и текст
+	// конфига читают одно и то же состояние. Отдельный профиль нужен отзыву — он
+	// меняет состояние, и общая фикстура сделала бы DELETE зависимым от порядка.
+	var readFixture *profileFixture
+	readProfile := func(t *testing.T) profileFixture {
+		t.Helper()
+		if readFixture == nil {
+			f := e.withProfile(t)
+			readFixture = &f
+		}
+		return *readFixture
+	}
+
 	cases := []liveCase{
 		{"/api/v1/auth/register", http.MethodPost, 201, func(t *testing.T, e *env) *http.Response {
 			r, _ := raw(t, e, http.MethodPost, "/api/v1/auth/register",
@@ -374,6 +429,166 @@ func TestLiveResponsesMatchContract(t *testing.T) {
 			r, _ := raw(t, e, http.MethodGet, "/api/v1/devices", nil, authHdr(e.mint(t).access))
 			return r
 		}},
+
+		// --- A-2: каталог ---
+		{"/api/v1/servers", http.MethodGet, 200, func(t *testing.T, e *env) *http.Response {
+			// Каталог отдаёт только online-серверы; фикстура гарантирует непустой
+			// список, иначе обязательные поля ServerSummary проверялись бы на нуле
+			// элементов. Тройка «не измерено» обязана быть в объекте ключами со
+			// значением null, а не отсутствовать.
+			e.server(t)
+			resp, body := raw(t, e, http.MethodGet, "/api/v1/servers", nil, authHdr(e.mint(t).access))
+			var out struct {
+				Servers []map[string]json.RawMessage `json:"servers"`
+			}
+			if err := json.Unmarshal(body, &out); err != nil {
+				t.Fatalf("servers body: %v (%s)", err, body)
+			}
+			if len(out.Servers) == 0 {
+				t.Fatalf("каталог пуст: форму ServerSummary не на чем проверить")
+			}
+			for _, srv := range out.Servers {
+				for _, k := range []string{"latency_ms", "load", "capacity_mbps"} {
+					v, ok := srv[k]
+					if !ok {
+						t.Errorf("ServerSummary без %q: %v", k, srv)
+					} else if string(bytes.TrimSpace(v)) != "null" {
+						t.Errorf("ServerSummary.%s = %s, контрол-плейн его не измерял", k, v)
+					}
+				}
+			}
+			return resp
+		}},
+
+		// --- A-2: профили ---
+		{"/api/v1/devices/{id}/profiles", http.MethodPost, 201, func(t *testing.T, e *env) *http.Response {
+			a := e.mint(t)
+			d := seedDevice(t, context.Background(), e.q, a.userID, 1)
+			srv := e.server(t)
+			resp, _ := raw(t, e, http.MethodPost, "/api/v1/devices/"+d.ID.String()+"/profiles",
+				map[string]string{"server_id": srv.ID.String()}, merge(authHdr(a.access), idem()))
+			return resp
+		}},
+		{"/api/v1/devices/{id}/profiles", http.MethodPost, 403, func(t *testing.T, e *env) *http.Response {
+			a := e.lapse(t, e.mint(t))
+			d := seedDevice(t, context.Background(), e.q, a.userID, 1)
+			srv := e.server(t)
+			resp, _ := raw(t, e, http.MethodPost, "/api/v1/devices/"+d.ID.String()+"/profiles",
+				map[string]string{"server_id": srv.ID.String()}, merge(authHdr(a.access), idem()))
+			return resp
+		}},
+		{"/api/v1/devices/{id}/profiles", http.MethodPost, 409, func(t *testing.T, e *env) *http.Response {
+			// Maintenance-сервер по умолчанию (seedServer): выдача обязана ответить
+			// стабильным кодом server_not_available, а не 503 «повтори позже».
+			a := e.mint(t)
+			d := seedDevice(t, context.Background(), e.q, a.userID, 1)
+			srv := seedServer(t, context.Background(), e.q, "10.99.95.0/24")
+			resp, body := raw(t, e, http.MethodPost, "/api/v1/devices/"+d.ID.String()+"/profiles",
+				map[string]string{"server_id": srv.ID.String()}, merge(authHdr(a.access), idem()))
+			if code := codeOf(t, body); resp.StatusCode == http.StatusConflict && code != "server_not_available" {
+				t.Fatalf("409 code = %q, want server_not_available (%s)", code, body)
+			}
+			return resp
+		}},
+		{"/api/v1/devices/{id}/profiles", http.MethodGet, 200, func(t *testing.T, e *env) *http.Response {
+			f := readProfile(t)
+			resp, _ := raw(t, e, http.MethodGet, f.profilePath(e), nil, authHdr(f.actor.access))
+			return resp
+		}},
+		{"/api/v1/devices/{id}/profiles/{server_id}", http.MethodGet, 200, func(t *testing.T, e *env) *http.Response {
+			f := readProfile(t)
+			resp, _ := raw(t, e, http.MethodGet, f.onePath(), nil, authHdr(f.actor.access))
+			return resp
+		}},
+		{"/api/v1/devices/{id}/profiles/{server_id}", http.MethodDelete, 204, func(t *testing.T, e *env) *http.Response {
+			f := e.withProfile(t)
+			resp, _ := raw(t, e, http.MethodDelete, f.onePath(), nil, authHdr(f.actor.access))
+			return resp
+		}},
+		{"/api/v1/devices/{id}/profiles/{server_id}/config", http.MethodGet, 200, func(t *testing.T, e *env) *http.Response {
+			f := readProfile(t)
+			resp, _ := raw(t, e, http.MethodGet, f.onePath()+"/config", nil, authHdr(f.actor.access))
+			return resp
+		}},
+		{"/api/v1/devices/{id}/keys/rotate", http.MethodPost, 200, func(t *testing.T, e *env) *http.Response {
+			// Контракт объявляет здесь Device, а не отдельную RotateResponse: план
+			// называл несуществующую схему, сверяемся с контрактом.
+			a := e.mint(t)
+			d := seedDevice(t, context.Background(), e.q, a.userID, 1)
+			resp, _ := raw(t, e, http.MethodPost, "/api/v1/devices/"+d.ID.String()+"/keys/rotate",
+				map[string]string{"public_key": keyFromSeed("contract-rotate-" + uuid.NewString())},
+				merge(authHdr(a.access), idem()))
+			return resp
+		}},
+
+		// --- A-2: контракт узла ---
+		{"/internal/v1/nodes/{server_id}/desired", http.MethodGet, 200, func(t *testing.T, e *env) *http.Response {
+			own := e.node(t, e.server(t).ID)
+			resp, _ := raw(t, e, http.MethodGet, nodePath(own.serverID, "/desired"), nil,
+				authHdr(own.token))
+			if etag := resp.Header.Get("ETag"); etag == "" {
+				t.Errorf("desired set answer has no ETag")
+			}
+			return resp
+		}},
+		{"/internal/v1/nodes/{server_id}/desired", http.MethodGet, 304, func(t *testing.T, e *env) *http.Response {
+			// Второй вызов того же узла: ETag предыдущего ответа обязан дать 304 без
+			// тела. Строгое сравнение проверяет сам хендлер, здесь — живой ответ.
+			own := e.node(t, e.server(t).ID)
+			path := nodePath(own.serverID, "/desired")
+			first, _ := raw(t, e, http.MethodGet, path, nil, authHdr(own.token))
+			etag := first.Header.Get("ETag")
+			if first.StatusCode != http.StatusOK || etag == "" {
+				t.Fatalf("desired 200 = %d, ETag = %q", first.StatusCode, etag)
+			}
+			resp, _ := raw(t, e, http.MethodGet, path, nil,
+				merge(authHdr(own.token), map[string]string{"If-None-Match": etag}))
+			return resp
+		}},
+		{"/internal/v1/nodes/{server_id}/observed", http.MethodPost, 204, func(t *testing.T, e *env) *http.Response {
+			own := e.node(t, e.server(t).ID)
+			resp, _ := raw(t, e, http.MethodPost, nodePath(own.serverID, "/observed"),
+				map[string]any{"config_version": 0, "interface_rx_bytes": 0,
+					"interface_tx_bytes": 0, "peers": []any{}},
+				authHdr(own.token))
+			return resp
+		}},
+		{"/internal/v1/nodes/{server_id}/heartbeat", http.MethodPost, 204, func(t *testing.T, e *env) *http.Response {
+			own := e.node(t, e.server(t).ID)
+			resp, _ := raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"),
+				map[string]any{"agent_version": "contract", "agent_uptime_sec": 1,
+					"load1": 0.1, "cpu_pct": 1.0, "applied_config_version": 0},
+				authHdr(own.token))
+			return resp
+		}},
+
+		// --- A-2: администратор ---
+		{"/api/v1/admin/login", http.MethodPost, 200, func(t *testing.T, e *env) *http.Response {
+			// Отдельный администратор, а не e.admin: тот кэширует токен, иначе первая
+			// же строка контура съедала бы ответ входа, который здесь и проверяется.
+			_, email := seedAdmin(t, context.Background(), e.q)
+			resp, _ := raw(t, e, http.MethodPost, "/api/v1/admin/login",
+				map[string]string{"email": email, "password": adminPassword}, nil)
+			return resp
+		}},
+		{"/api/v1/admin/servers/{id}", http.MethodGet, 200, func(t *testing.T, e *env) *http.Response {
+			// Свежезаведённый сервер никогда не отвечал heartbeat'ом: health обязан
+			// быть null, а не нулями (§13.4).
+			srv := seedServer(t, context.Background(), e.q, "10.99.95.0/24")
+			resp, body := raw(t, e, http.MethodGet, "/api/v1/admin/servers/"+srv.ID.String(), nil,
+				authHdr(e.admin(t).token))
+			var out map[string]json.RawMessage
+			if err := json.Unmarshal(body, &out); err != nil {
+				t.Fatalf("admin server body: %v (%s)", err, body)
+			}
+			health, ok := out["health"]
+			if !ok {
+				t.Errorf(`admin server answer has no "health": %s`, body)
+			} else if string(bytes.TrimSpace(health)) != "null" {
+				t.Errorf("health = %s, want null: замера не было", health)
+			}
+			return resp
+		}},
 	}
 
 	for _, c := range cases {
@@ -384,6 +599,7 @@ func TestLiveResponsesMatchContract(t *testing.T) {
 					c.method, c.path, c.status)
 			}
 			schema, hasSchema := doc.jsonSchema()
+			_, hasText := doc.textSchema()
 			resp := c.run(t, e)
 			if resp.StatusCode != c.status {
 				t.Fatalf("live status = %d, case expects %d (%s)",
@@ -396,15 +612,35 @@ func TestLiveResponsesMatchContract(t *testing.T) {
 			}
 
 			data := lastBody(t, e)
-			if c.status == http.StatusNoContent {
-				if hasSchema {
-					t.Errorf("contract gives %d a schema, but 204 has no body", c.status)
+			// 204 и 304 — ответы без тела; в контракте у них нет content. Для 304 это
+			// единственный такой случай, и JSON в нём искать не нужно.
+			if c.status == http.StatusNoContent || c.status == http.StatusNotModified {
+				if hasSchema || hasText {
+					t.Errorf("contract gives %d a schema, but it has no body", c.status)
 				}
 				if len(bytes.TrimSpace(data)) != 0 {
-					t.Errorf("204 must have no body, got %s", data)
+					t.Errorf("%d must have no body, got %s", c.status, data)
 				}
 				if ct := resp.Header.Get("Content-Type"); ct != "" {
-					t.Errorf("204 must not declare Content-Type, got %q", ct)
+					t.Errorf("%d must not declare Content-Type, got %q", c.status, ct)
+				}
+				return
+			}
+			if hasText {
+				// text/plain — конфиг WireGuard. JSON-схемы у него нет, а приватного
+				// ключа быть не должно ни при каких обстоятельствах (ТЗ §5, §19.6):
+				// клиент вставляет его локально, сервер его не знает.
+				if hasSchema {
+					t.Errorf("contract declares both JSON and text/plain for %d", c.status)
+				}
+				if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+					t.Errorf("Content-Type = %q, want text/plain", ct)
+				}
+				if len(bytes.TrimSpace(data)) == 0 {
+					t.Errorf("text/plain answer is empty")
+				}
+				if strings.Contains(strings.ToLower(string(data)), "privatekey") {
+					t.Errorf("config body contains PrivateKey: %s", data)
 				}
 				return
 			}
@@ -457,6 +693,7 @@ func checkErrorCodeKnown(t *testing.T, v any) {
 		httpx.ErrIdempotencyKeyRequired, httpx.ErrIdempotencyConflict,
 		httpx.ErrIdempotencyInProgress, httpx.ErrRateLimited, httpx.ErrInternal,
 		httpx.ErrInvalidCredentials, httpx.ErrRefreshTokenInvalid, httpx.ErrEmailTaken,
+		httpx.ErrServerNotAvailable,
 	} {
 		if string(known) == code {
 			return
