@@ -4073,10 +4073,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 |---|---|
 | `/api/v1/servers` | `GET` → 200 `ServerList`, `GET` под `bearerAuth`; 401, 429 |
 | `/api/v1/devices/{id}` | `DELETE` → 204; 400, 401, 404, 429 |
-| `/api/v1/devices/{id}/keys/rotate` | `POST` с `IdempotencyKey` → 201 `RotateResponse`; 400 `invalid_request` (в том числе неканонический `new_public_key` — задача 8), 401, 404, 409 `device_limit_reached`, 429 |
-| `/api/v1/devices/{id}/profiles` | `POST` с `IdempotencyKey` → 201 `ProfileView`; `GET` → 200 массив `ProfileView`; 400, 401, 404, 409 (`conflict`, `device_limit_reached`, `server_not_available`), 429. `503` в контракте нет намеренно: §7.1 отказывает «сервера нет в вашем плане» и «сервер не онлайн» стабильным кодом, а `503` обещал бы клиенту «повтори позже», которого админ не выполнял |
-| `/api/v1/devices/{id}/profiles/{server_id}` | `DELETE` → 200 `ProfileView` (отозванный, чтобы клиент увидел `revoked_at`), 401, 404, 409; `GET` → 200 `ProfileView` |
-| `/api/v1/devices/{id}/profiles/{server_id}/config` | `GET` → 200 **`text/plain`**, `x-wg-config`; описание обязано содержать: «текст без строки `PrivateKey` — приватный ключ устройства не покидает устройство (ТЗ §5); клиент вставляет его локально перед применением» |
+| `/api/v1/devices/{id}/keys/rotate` | `POST` с `IdempotencyKey` → 200 `Device` (не 201: в терминах пользователя это новое состояние того же устройства, задача 8); 400 `invalid_request` (в том числе неканонический `public_key` — задача 8), 401, 404, 409 (`conflict` — отозванный предок или `profile_changed`; `duplicate_device`), 429 |
+| `/api/v1/devices/{id}/profiles` | `POST` с `IdempotencyKey` → 201 `ProfileView`; `GET` → 200 массив `ProfileView`; 400, 401, 403 (устройство отозвано или активной подписки нет), 404, 409 (`conflict`, `server_not_available`), 429. `503` в контракте нет намеренно: §7.1 отказывает «сервера нет в вашем плане» и «сервер не онлайн» стабильным кодом, а `503` обещал бы клиенту «повтори позже», которого админ не выполнял |
+| `/api/v1/devices/{id}/profiles/{server_id}` | `DELETE` → 204 **без тела** (задача 6: показывать после отзыва нечего; повторный отзыв — 409 с настоящим `status` в `details`); `GET` → 200 `ProfileView`; 400, 401, 404, 409, 429 |
+| `/api/v1/devices/{id}/profiles/{server_id}/config` | `GET` → 200 **`text/plain`**, `Cache-Control: no-store`; описание обязано содержать: «текст без строки `PrivateKey` — приватный ключ устройства не покидает устройство (ТЗ §5); клиент вставляет его локально перед применением» |
 
 - [ ] **Step 3: Маршруты управления — схема, не исходник**
 
@@ -4127,15 +4127,18 @@ JSON в пустом ответе.
 
 - [ ] **Step 5: Схемы ответов пользователя — схема, не исходник**
 
-`ServerSummary{id, name, country_code, city, advertised_host?, listen_port?,
-availability, latency_ms, load_pct, peers_active, capacity_mbps}` — пропуски измеренного
-выражаются `null` и в описании поля, а не отсутствием поля (задача 2 выбрала `null`
-именно поэтому). `ProfileView{id, device_id, server_id, address_v4, status, issued_at,
-expires_at, overlap_valid_until?, revoked_at?}`. `RotateResponse{device_id,
-new_public_key, superseded_profile_id?, overlap_valid_until}`. `AdminServerView`,
-`BootstrapToken{token?}` (поле присутствует только в ответе выдачи — в контракте это
-отдельная схема `BootstrapTokenIssued`), `AuditEntry{...}`, `AdminUserView{email, status,
-locked_reason, devices[], traffic[]}`, `TrafficEntry{device_id, rx_bytes, tx_bytes, days}`.
+`ServerSummary{id, name, country_code, city, host, port, mtu, latitude, longitude,
+availability, latency_ms, load, capacity_mbps, provider, region}` — поля по фактическому
+`servers.Summary` задачи 2; `latency_ms` и `load` всегда `null` (не измеряли, ADR-006),
+`capacity_mbps` — `null`, если оператор её не заявил, `region` — пустая строка, если не
+заполнена. `ProfileView{id, device_id, server_id, address_v4, status, issued_at,
+expires_at, overlap_valid_until?, revoked_at?}`. Ротация возвращает `Device` (deviceView
+задачи 7), отдельной схемы `RotateResponse` в коде нет. `AdminServerView`,
+`AdminServerDetail{…, health?}` (health — отдельная схема `Health` или `null`),
+`BootstrapToken{...}` и `BootstrapTokenIssued{...token}` (поле присутствует только в
+ответе выдачи), `AuditEntry{...}`, `AdminUserView{id, email, display_name, status,
+locked_reason, locale, created_at, devices[], traffic[]}`, `TrafficEntry{device_id,
+rx_bytes, tx_bytes, days}`.
 
 Ни одна схема не содержит `private_key`, `password_hash`, `token_hash`: проверка —
 задача 15 (живое сравнение ответов), а не молчание автора контракта.
