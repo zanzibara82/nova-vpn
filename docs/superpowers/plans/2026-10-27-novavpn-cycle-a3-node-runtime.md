@@ -1182,7 +1182,9 @@ EOF
 ### Task 5: Применение набора — порядок, снимок до изменений, ноль обращений при пустой дельте
 
 **Files:**
-- Create: `internal/nodeagent/wg/applier.go`, `internal/nodeagent/wg/applier_test.go`
+- Create: `internal/nodeagent/wg/applier.go`
+- Create: `internal/nodeagent/wg/applier_test.go`
+- Modify: `docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md` — только фрагмент Task 5
 
 **Interfaces:**
 - Consumes: `wg.LinkManager`, `wg.DeviceClient`, `wg.Diff`, `wg.ConfigFor`.
@@ -1190,14 +1192,19 @@ EOF
   `wg.ApplyResult{Before LiveState; Ops int}`,
   `(*Applier).Apply(t Target) (ApplyResult, error)`.
 
+Порядок шагов задан ADR-004: интерфейс и адрес, затем снимок, затем дельта, затем
+`Configure`. Снимок обязан быть до `Configure`, потому что пересоздание пиера
+обнуляет счётчики в ядре. Пустая дельта не вызывает `Configure` вовсе.
+
 - [ ] **Step 1: Написать падающий тест**
 
-`internal/nodeagent/wg/applier_test.go`:
+Используй ровно этот исходник `internal/nodeagent/wg/applier_test.go` (R24/R25):
 
 ```go
 package wg
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 
@@ -1216,18 +1223,32 @@ func (f *fakeLink) EnsureLink(string, int) error {
 	}
 	return nil
 }
+
 func (f *fakeLink) EnsureAddress(string, netip.Prefix) error { f.addrs++; return nil }
 
 type fakeDevice struct {
-	state     LiveState
-	configure int
-	last      wgtypes.Config
+	state         LiveState
+	snapshots     int
+	configure     int
+	last          wgtypes.Config
+	failSnapshot  bool
+	failConfigure bool
 }
 
-func (f *fakeDevice) Snapshot(string) (LiveState, error) { return f.state, nil }
+func (f *fakeDevice) Snapshot(string) (LiveState, error) {
+	f.snapshots++
+	if f.failSnapshot {
+		return LiveState{}, errTest
+	}
+	return f.state, nil
+}
+
 func (f *fakeDevice) Configure(_ string, cfg wgtypes.Config) error {
 	f.configure++
 	f.last = cfg
+	if f.failConfigure {
+		return errTest
+	}
 	return nil
 }
 
@@ -1237,92 +1258,189 @@ func (testError) Error() string { return "boom" }
 
 var errTest = testError{}
 
+func newKey(t *testing.T) wgtypes.Key {
+	t.Helper()
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func peerFrom(key wgtypes.Key, prefix string, keepalive int) TargetPeer {
+	return TargetPeer{
+		PublicKey:    key.PublicKey().String(),
+		AllowedIPs:   []netip.Prefix{netip.MustParsePrefix(prefix)},
+		KeepaliveSec: keepalive, State: StateActive,
+	}
+}
+
+func targetFor(private wgtypes.Key, peers ...TargetPeer) Target {
+	return Target{
+		PrivateKey: private.String(), ListenPort: 51820, MTU: 1420,
+		TunnelAddress: netip.MustParsePrefix("10.99.0.1/24"), Peers: peers,
+	}
+}
+
 func TestApplyDoesNotTouchUnchangedPeers(t *testing.T) {
-	pub := "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
+	priv := newKey(t)
+	peer := newKey(t)
+	target := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
 	dev := &fakeDevice{state: LiveState{Peers: map[string]PeerState{
-		pub: {PublicKey: pub, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")}, KeepaliveSec: 25},
+		peer.PublicKey().String(): {
+			PublicKey:    peer.PublicKey().String(),
+			AllowedIPs:   []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
+			KeepaliveSec: 25,
+		},
 	}}}
 	link := &fakeLink{}
-	a := Applier{Link: link, Device: dev, Iface: "wg0"}
-	target := Target{
-		PrivateKey: "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=", ListenPort: 51820, MTU: 1420,
-		TunnelAddress: netip.MustParsePrefix("10.99.0.1/24"),
-		Peers: []TargetPeer{{PublicKey: pub, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
-			KeepaliveSec: 25, State: StateActive}},
-	}
-	res, err := a.Apply(target)
+	res, err := (&Applier{Link: link, Device: dev, Iface: "wg0"}).Apply(target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Ops != 0 || dev.configure != 0 {
-		t.Fatalf("ops = %d, configure calls = %d, want 0/0", res.Ops, dev.configure)
+		t.Fatalf("операций %d, вызовов configure %d; ожидалось 0/0", res.Ops, dev.configure)
 	}
-	if len(link.links) == 0 || link.addrs == 0 {
-		t.Fatal("link or address was not ensured")
+	if link.links != 1 || link.addrs != 1 || dev.snapshots != 1 {
+		t.Fatalf("интерфейс %d, адрес %d, снимков %d; ожидалось 1/1/1", link.links, link.addrs, dev.snapshots)
 	}
 }
 
 func TestApplyRemovesAndAdds(t *testing.T) {
-	add := "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
-	drop := "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
+	priv := newKey(t)
+	add := newKey(t)
+	drop := newKey(t)
 	dev := &fakeDevice{state: LiveState{Peers: map[string]PeerState{
-		drop: {PublicKey: drop, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.3/32")}},
+		drop.PublicKey().String(): {
+			PublicKey:  drop.PublicKey().String(),
+			AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.3/32")},
+		},
 	}}}
-	a := Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}
-	target := Target{
-		PrivateKey: drop, ListenPort: 51820, MTU: 1420,
-		TunnelAddress: netip.MustParsePrefix("10.99.0.1/24"),
-		Peers: []TargetPeer{{PublicKey: add, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
-			KeepaliveSec: 25, State: StateActive}},
-	}
-	res, err := a.Apply(target)
+	res, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(priv, peerFrom(add, "10.99.0.2/32", 25)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Ops != 2 || dev.configure != 1 {
-		t.Fatalf("ops = %d, configure = %d, want 2/1", res.Ops, dev.configure)
+		t.Fatalf("операций %d, configure %d; ожидалось 2/1", res.Ops, dev.configure)
 	}
 	if dev.last.ReplacePeers {
-		t.Fatal("ReplacePeers must stay false")
+		t.Fatal("ReplacePeers должен оставаться false")
 	}
-	if len(dev.last.Peers) != 2 || !dev.last.Peers[0].Remove && !dev.last.Peers[1].Remove {
-		t.Fatalf("peers = %+v", dev.last.Peers)
+	if len(dev.last.Peers) != 2 {
+		t.Fatalf("пиров в конфигурации %d; ожидалось 2", len(dev.last.Peers))
+	}
+	removed := 0
+	for _, p := range dev.last.Peers {
+		if p.Remove {
+			removed++
+		}
+	}
+	if removed != 1 {
+		t.Fatalf("снятых пиров %d; ожидался 1", removed)
 	}
 }
 
 func TestApplyStopsBeforeKernelWhenLinkFails(t *testing.T) {
 	dev := &fakeDevice{}
-	a := Applier{Link: &fakeLink{failLink: true}, Device: dev, Iface: "wg0"}
-	_, err := a.Apply(Target{PrivateKey: "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="})
+	_, err := (&Applier{Link: &fakeLink{failLink: true}, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(newKey(t)))
 	if err == nil {
-		t.Fatal("link failure ignored")
+		t.Fatal("отказ интерфейса проигнорирован")
+	}
+	if dev.snapshots != 0 || dev.configure != 0 {
+		t.Fatalf("снимков %d, configure %d; ожидалось 0/0", dev.snapshots, dev.configure)
+	}
+}
+
+func TestApplyStopsOnSnapshotFailure(t *testing.T) {
+	dev := &fakeDevice{failSnapshot: true}
+	res, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(newKey(t)))
+	if err == nil {
+		t.Fatal("отказ снимка проигнорирован")
+	}
+	if dev.configure != 0 || res.Ops != 0 {
+		t.Fatalf("configure %d, операций %d; ожидалось 0/0", dev.configure, res.Ops)
+	}
+}
+
+func TestApplyStopsOnDiffFailure(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	dev := &fakeDevice{}
+	dup := peerFrom(peer, "10.99.0.2/32", 25)
+	_, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(priv, dup, dup))
+	if err == nil {
+		t.Fatal("повтор ключа в целевом наборе проигнорирован")
+	}
+	if !errors.Is(err, ErrDuplicatePeer) {
+		t.Fatalf("ожидалась ErrDuplicatePeer, получено %v", err)
 	}
 	if dev.configure != 0 {
-		t.Fatal("configure called after link failure")
+		t.Fatal("configure вызван после ошибки дельты")
+	}
+}
+
+func TestApplyStopsOnConfigFailure(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	dev := &fakeDevice{}
+	bad := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
+	bad.PrivateKey = "не-ключ"
+	_, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).Apply(bad)
+	if err == nil {
+		t.Fatal("неверный приватный ключ проигнорирован")
+	}
+	if dev.configure != 0 {
+		t.Fatal("configure вызван после ошибки конфигурации")
+	}
+}
+
+func TestApplyReportsConfigureFailureWithBefore(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	target := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
+	dev := &fakeDevice{
+		state: LiveState{Peers: map[string]PeerState{
+			peer.PublicKey().String(): {
+				PublicKey:  peer.PublicKey().String(),
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
+			},
+		}},
+		failConfigure: true,
+	}
+	res, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).Apply(target)
+	if err == nil {
+		t.Fatal("отказ configure проигнорирован")
+	}
+	if res.Ops != 1 || res.Before.Peers == nil {
+		t.Fatalf("операций %d, снимок %v; ожидался 1 и непустой Before", res.Ops, res.Before.Peers)
 	}
 }
 ```
 
-Исправить очевидную опечатку условия в `TestApplyRemovesAndAdds` при наборе: проверка
-должна быть `(!dev.last.Peers[0].Remove && !dev.last.Peers[1].Remove)`; тест обязан
-содержать хотя бы одного снятого пиера.
+R24: в плане два дефекта тестового кода — `len(link.links)` для числового поля и
+инвертированное условие `!Remove && !Remove`; здесь они исправлены. R25: литеральные
+44-символьные ключи плана не используются, ключи генерируются через `wgtypes`.
 
 - [ ] **Step 2: Прогнать и убедиться, что не компилируется**
 
-Run: `make unit`
-Expected: FAIL — `undefined: Applier`.
+Run: focused `make unit` по пакету `internal/nodeagent/wg` с `-mod=readonly`.
+Expected: FAIL — `undefined: Applier`, `undefined: Target` уже существует, поэтому
+ошибка должна быть именно про `Applier` и `ApplyResult`.
 
-- [ ] **Step 3: Реализовать `applier.go` (дословный исходник)**
+- [ ] **Step 3: Реализовать `applier.go`**
 
 ```go
 package wg
 
 import "fmt"
 
-// Applier — единственное место, где порядок шагов задан явно: устройство и адрес,
-// затем снимок, затем дельта. Снимок обязан быть до Configure: пересоздание пиера
-// обнуляет счётчики в ядре, и отчёт, снятый после применения, потерял бы байты
-// (ADR-004, правило 4).
+// Applier задаёт порядок шагов явно: интерфейс и адрес, снимок, дельта.
+// Снимок обязан быть до Configure: пересоздание пиера обнуляет счётчики в ядре,
+// и отчёт, снятый после применения, потерял бы байты (ADR-004, правило 4).
 type Applier struct {
 	Link   LinkManager
 	Device DeviceClient
@@ -1336,45 +1454,52 @@ type ApplyResult struct {
 
 func (a *Applier) Apply(t Target) (ApplyResult, error) {
 	if err := a.Link.EnsureLink(a.Iface, t.MTU); err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: link: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: интерфейс: %w", err)
 	}
 	if err := a.Link.EnsureAddress(a.Iface, t.TunnelAddress); err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: address: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: адрес: %w", err)
 	}
 	before, err := a.Device.Snapshot(a.Iface)
 	if err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: snapshot: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: снимок: %w", err)
 	}
 	ops, err := Diff(before, t.Peers)
 	if err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: diff: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: дельта: %w", err)
 	}
 	if len(ops) == 0 {
 		return ApplyResult{Before: before}, nil
 	}
 	cfg, err := ConfigFor(t, ops)
 	if err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: config: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: конфигурация: %w", err)
 	}
 	if err := a.Device.Configure(a.Iface, cfg); err != nil {
-		return ApplyResult{Before: before, Ops: len(ops)}, fmt.Errorf("apply: configure: %w", err)
+		return ApplyResult{Before: before, Ops: len(ops)}, fmt.Errorf("wg: применение: настройка: %w", err)
 	}
 	return ApplyResult{Before: before, Ops: len(ops)}, nil
 }
 ```
 
+R26: тексты ошибок в пакете `wg` русские; префикс `wg: применение: ...` согласован
+с `device.go` и `link.go`. Английские `apply: link:` из плана не использовать.
+
 - [ ] **Step 4: Прогнать тесты**
 
-Run: `make unit`
-Expected: PASS, включая три теста `Applier`.
+Run: focused `make unit` по пакету с `-mod=readonly`, затем полные `unit` и `vet`.
+Expected: PASS, семь тестов `Applier`; полный прогон без новых падений.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/nodeagent/wg/applier.go internal/nodeagent/wg/applier_test.go
+git add internal/nodeagent/wg/applier.go internal/nodeagent/wg/applier_test.go \
+  docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(a3): применение набора — снимок до изменений и пустая дельта без netlink"
 ```
+
+Один новый локальный коммит, без amend и push. `go.mod`/`go.sum` меняться не должны:
+новых импортов нет.
 
 ---
 
