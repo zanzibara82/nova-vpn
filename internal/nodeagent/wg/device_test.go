@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -70,6 +71,35 @@ func TestReadCounterReadErrors(t *testing.T) {
 		if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), "счётчик") {
 			t.Fatal("ошибка чтения должна содержать путь и русский контекст счётчика")
 		}
+	}
+}
+
+func TestReadCounterDistinguishesParseErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    error
+	}{
+		{name: "syntax", content: "not-a-counter", want: strconv.ErrSyntax},
+		{name: "range", content: "9223372036854775808", want: strconv.ErrRange},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "rx_bytes")
+			if err := os.WriteFile(path, []byte(tc.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := readCounter(path)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("ошибка разбора должна различаться: получено %v, ожидалась %v", err, tc.want)
+			}
+			var numErr *strconv.NumError
+			if !errors.As(err, &numErr) {
+				t.Fatal("исходная ошибка strconv должна сохраняться в цепочке")
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Fatal("ошибка разбора должна содержать путь")
+			}
+		})
 	}
 }
 

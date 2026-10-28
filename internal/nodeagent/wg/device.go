@@ -27,7 +27,12 @@ func Open() (*WG, error) {
 	return &WG{c: c}, nil
 }
 
-func (w *WG) Close() error { return w.c.Close() }
+func (w *WG) Close() error {
+	if err := w.c.Close(); err != nil {
+		return fmt.Errorf("wg: закрытие управляющего сокета: %w", err)
+	}
+	return nil
+}
 
 // Snapshot не возвращает частичный снимок: без обоих счётчиков применение приостанавливается (R5).
 func (w *WG) Snapshot(iface string) (LiveState, error) {
@@ -97,7 +102,7 @@ func readCounter(path string) (int64, error) {
 	}
 	v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("wg: неверный счётчик %s", path)
+		return 0, fmt.Errorf("wg: неверный счётчик %s: %w", path, err)
 	}
 	if v < 0 {
 		return 0, fmt.Errorf("wg: отрицательный счётчик %s", path)

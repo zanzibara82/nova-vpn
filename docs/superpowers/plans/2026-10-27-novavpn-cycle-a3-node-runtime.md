@@ -1022,7 +1022,8 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 - [x] **Step 1: Написать тесты вспомогательных функций и получить RED**
 
 `device_test.go`: ошибка чтения (нет файла, вместо файла каталог), пустое,
-неверное, отрицательное и переполненное значение счётчика; настоящий ноль,
+неверное, отрицательное и переполненное значение счётчика с различимостью
+`strconv.ErrSyntax` и `strconv.ErrRange` через `errors.Is`; настоящий ноль,
 пробелы и максимальный `int64`. Ошибка содержит путь и русский контекст.
 Преобразование адресов: IPv4 в 4 и 16 байтах, IPv6, `/0`, host-биты,
 обратное преобразование через `toIPNets`, отсутствие мутаций входа.
@@ -1070,7 +1071,12 @@ func Open() (*WG, error) {
 	return &WG{c: c}, nil
 }
 
-func (w *WG) Close() error { return w.c.Close() }
+func (w *WG) Close() error {
+	if err := w.c.Close(); err != nil {
+		return fmt.Errorf("wg: закрытие управляющего сокета: %w", err)
+	}
+	return nil
+}
 
 // Snapshot не возвращает частичный снимок: без обоих счётчиков применение приостанавливается (R5).
 func (w *WG) Snapshot(iface string) (LiveState, error) {
@@ -1140,7 +1146,7 @@ func readCounter(path string) (int64, error) {
 	}
 	v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("wg: неверный счётчик %s", path)
+		return 0, fmt.Errorf("wg: неверный счётчик %s: %w", path, err)
 	}
 	if v < 0 {
 		return 0, fmt.Errorf("wg: отрицательный счётчик %s", path)
