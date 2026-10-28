@@ -1009,12 +1009,36 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Files:**
 - Create: `internal/nodeagent/wg/device.go`
+- Create: `internal/nodeagent/wg/device_test.go`
+- Modify: `go.mod`, `go.sum` — корневой пакет `wgctrl` импортируется впервые,
+  `make mod` добавляет косвенные `mdlayher/netlink`, `mdlayher/genetlink`,
+  `mdlayher/socket`, `josharian/native`, `golang.org/x/net`,
+  `golang.zx2c4.com/wireguard`, `github.com/google/go-cmp` (R23)
 
 **Interfaces:**
 - Produces: `wg.DeviceClient` (`Snapshot(iface string) (LiveState, error)`,
   `Configure(iface string, cfg wgtypes.Config) error`), `wg.WG`, `wg.Open() (*WG, error)`.
 
-- [ ] **Step 1: Реализовать `device.go` (дословный исходник)**
+- [x] **Step 1: Написать тесты вспомогательных функций и получить RED**
+
+`device_test.go`: ошибка чтения (нет файла, вместо файла каталог), пустое,
+неверное, отрицательное и переполненное значение счётчика; настоящий ноль,
+пробелы и максимальный `int64`. Ошибка содержит путь и русский контекст.
+Преобразование адресов: IPv4 в 4 и 16 байтах, IPv6, `/0`, host-биты,
+обратное преобразование через `toIPNets`, отсутствие мутаций входа.
+Неподдерживаемые адреса и маски пропускаются; порядок и повторы сохраняются.
+При 32-битной маске IPv4 преобразуется через `Unmap`; при 128-битной маске
+сохраняется семейство IPv6, включая mapped-префиксы.
+Сосредоточенный запуск через `run-make.sh unit`: переопределить `DOCKER_FLAGS`
+с `-w /src/internal/nodeagent/wg` и фильтром `TestReadCounter|TestFromIPNets`.
+
+- [x] **Step 2: Реализовать `device.go`**
+
+R5: `readCounter` возвращает `(int64, error)`, ошибка не является нулевым
+измерением. `Snapshot` возвращает полный снимок только после успешного чтения
+обоих интерфейсных счётчиков. Любой отказ возвращает `LiveState{}` и ошибку
+с контекстом; интерфейс и пиры не изменяются, `Configure` не вызывается.
+Сбой sysfs приостанавливает применение, не меняя форму отчёта API.
 
 ```go
 package wg
@@ -1031,8 +1055,6 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// DeviceClient — граница с ядром. Интерфейс нужен не ради тестов ради тестов:
-// Applier проверяется на fake-клиенте, а настоящий путь остаётся тонким.
 type DeviceClient interface {
 	Snapshot(iface string) (LiveState, error)
 	Configure(iface string, cfg wgtypes.Config) error
@@ -1043,26 +1065,32 @@ type WG struct{ c *wgctrl.Client }
 func Open() (*WG, error) {
 	c, err := wgctrl.New()
 	if err != nil {
-		return nil, fmt.Errorf("wg: control socket: %w", err)
+		return nil, fmt.Errorf("wg: управляющий сокет: %w", err)
 	}
 	return &WG{c: c}, nil
 }
 
 func (w *WG) Close() error { return w.c.Close() }
 
-// Snapshot читает устройство целиком. Ошибка здесь означает, что применять
-// нельзя: без живого состояния дельта была бы равна всему набору, то есть
-// каждый цикл пересоздавал бы пиеров — ровно то, что запрещает ADR-004.
+// Snapshot не возвращает частичный снимок: без обоих счётчиков применение приостанавливается (R5).
 func (w *WG) Snapshot(iface string) (LiveState, error) {
 	dev, err := w.c.Device(iface)
 	if err != nil {
-		return LiveState{}, fmt.Errorf("wg: device %s: %w", iface, err)
+		return LiveState{}, fmt.Errorf("wg: устройство %s: %w", iface, err)
+	}
+	rx, err := readCounter("/sys/class/net/" + iface + "/statistics/rx_bytes")
+	if err != nil {
+		return LiveState{}, fmt.Errorf("wg: снимок %s: %w", iface, err)
+	}
+	tx, err := readCounter("/sys/class/net/" + iface + "/statistics/tx_bytes")
+	if err != nil {
+		return LiveState{}, fmt.Errorf("wg: снимок %s: %w", iface, err)
 	}
 	out := LiveState{
 		PublicKey:    dev.PublicKey.String(),
 		ListenPort:   dev.ListenPort,
-		IfaceRxBytes: readCounter("/sys/class/net/" + iface + "/statistics/rx_bytes"),
-		IfaceTxBytes: readCounter("/sys/class/net/" + iface + "/statistics/tx_bytes"),
+		IfaceRxBytes: rx,
+		IfaceTxBytes: tx,
 		Peers:        make(map[string]PeerState, len(dev.Peers)),
 	}
 	for _, p := range dev.Peers {
@@ -1070,7 +1098,7 @@ func (w *WG) Snapshot(iface string) (LiveState, error) {
 		out.Peers[key] = PeerState{
 			PublicKey:     key,
 			AllowedIPs:    fromIPNets(p.AllowedIPs),
-			KeepaliveSec:  int(p.PersistentKeepalive.Seconds()),
+			KeepaliveSec:  int(p.PersistentKeepaliveInterval.Seconds()),
 			RxBytes:       p.ReceiveBytes,
 			TxBytes:       p.TransmitBytes,
 			LastHandshake: p.LastHandshakeTime,
@@ -1081,7 +1109,7 @@ func (w *WG) Snapshot(iface string) (LiveState, error) {
 
 func (w *WG) Configure(iface string, cfg wgtypes.Config) error {
 	if err := w.c.ConfigureDevice(iface, cfg); err != nil {
-		return fmt.Errorf("wg: configure %s: %w", iface, err)
+		return fmt.Errorf("wg: настройка %s: %w", iface, err)
 	}
 	return nil
 }
@@ -1093,42 +1121,54 @@ func fromIPNets(nets []net.IPNet) []netip.Prefix {
 		if !ok {
 			continue
 		}
-		bits, _ := n.Mask.Size()
-		out = append(out, netip.PrefixFrom(addr, bits).Masked())
+		ones, bits := n.Mask.Size()
+		if bits == 32 {
+			addr = addr.Unmap()
+		}
+		if bits != addr.BitLen() {
+			continue
+		}
+		out = append(out, netip.PrefixFrom(addr, ones).Masked())
 	}
 	return out
 }
 
-// readCounter читает счётчик интерфейса. Ноль при ошибке — не «трафика не было»,
-// а «счётчик недоступен»: значение не участвует в тарифе (он считается по
-// пиерным счётчикам) и попадает только в health, где ошибка видна по нулю у
-// живого интерфейса. Возвращать ошибку отсюда нельзя: без sysfs узел не должен
-// терять способность применять набор.
-func readCounter(path string) int64 {
+func readCounter(path string) (int64, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("wg: чтение счётчика %s: %w", path, err)
 	}
 	v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("wg: неверный счётчик %s", path)
 	}
-	return v
+	if v < 0 {
+		return 0, fmt.Errorf("wg: отрицательный счётчик %s", path)
+	}
+	return v, nil
 }
 ```
 
-- [ ] **Step 2: Проверить сборку**
+- [ ] **Step 3: Проверить сборку и тесты**
 
-Run: `make unit && make vet`
-Expected: PASS. Настоящий снимок проверяется в E2E: без загруженного модуля
-`wireguard` он невозможен, и это ограничение стенда, а не кода.
+Run: `run-make.sh mod`, затем `run-make.sh unit` и `run-make.sh vet` из каталога постановки.
+Expected: PASS, включая повторный строгий прогон с `-mod=readonly`: модульные
+файлы полны, `go mod tidy` больше ничего не меняет. Сосредоточенный GREEN
+не заменяет полные unit/vet.
+Настоящий путь `Snapshot`/`Configure` проверяется в E2E задачи 11;
+до этого он отмечается `not-run`, компиляция не считается запуском туннеля.
 
-- [ ] **Step 3: Коммит**
+- [x] **Step 4: Коммит**
 
 ```bash
-git add internal/nodeagent/wg/device.go
-git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
-  commit -m "feat(a3): клиент wgctrl — снимок и применение конфигурации"
+git add internal/nodeagent/wg/device.go internal/nodeagent/wg/device_test.go \
+  go.mod go.sum docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md
+GIT_AUTHOR_NAME='NovaVPN Dev' GIT_AUTHOR_EMAIL='dev@novavpn.local' \
+GIT_COMMITTER_NAME='NovaVPN Dev' GIT_COMMITTER_EMAIL='dev@novavpn.local' \
+git commit -m "$(cat <<'EOF'
+feat(a3): не подменять ошибки снимка WireGuard нулевыми измерениями
+EOF
+)"
 ```
 
 ---
