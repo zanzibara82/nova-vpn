@@ -63,8 +63,10 @@ egress = адрес узла), **4** (отзыв снимает пиера ≤ 3
   снимаются **до** применения (ADR-004). Неизменённый пиер не попадает в netlink.
 - Desired set содержит только `state` равный `active` или `rotating_old_key`; просроченный и
   отозванный отсутствует всегда (§4.1).
-- Интервал опроса узла — **25 с** с jitter ±10 % (правка §4.3спеки в задаче 1): худший
-  случай 27,5 с, поэтому критерий «отзыв ≤ 30 с» выполняется, а не почти выполняется.
+- Интервал опроса узла — **25 с** с jitter ±10 % (§4.3 спецификации): ожидание до 27,5 с
+  оставляет бюджет 2,5 с на доставку, обработку и применение, включая остаток текущего шага
+  и планирование. Критерий «отзыв ≤ 30 с» требует доступного API и соблюдения бюджета;
+  до сквозного замера от фиксации отзыва до удаления пиера в runtime/E2E SLA не подтверждён.
 - Неизмеренные величины — `null`, никогда `0` (ADR-006, §13.4). `load1`/`cpu_pct` при
   недоступном `/proc` — `null`.
 - Содержимое трафика и DNS-запросы не пишутся ни в одну базу и ни в один журнал; unbound
@@ -168,10 +170,11 @@ docs/testing-status.md                                  # закрытые и н
 **Files:**
 - Modify: `api-spec/openapi.yaml` (схемы `DesiredSet`, `Heartbeat`)
 - Modify: `internal/servers/desired.go`, `internal/servers/desired_test.go`
-- Modify: `internal/telemetry/service.go`
-- Modify: `internal/db/query/telemetry.sql`; регенерация `internal/db/telemetry.sql.go`
+- Modify: `internal/telemetry/service.go`, `internal/nodeapi/handlers.go`
+- Modify: `internal/db/query/telemetry.sql`; регенерация `internal/db/telemetry.sql.go` и `internal/db/querier.go`
 - Modify: `tests/integration/desired_test.go`, `tests/integration/telemetry_test.go`,
-  `tests/integration/contract_test.go`
+  `tests/integration/contract_test.go`; при необходимости `nodeapi_test.go`, `sweeper_test.go`
+  и корректные фикстуры `matrix_test.go`
 - Modify: `docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md` (§4.1, §4.3)
 
 **Interfaces:**
@@ -258,43 +261,40 @@ Expected: PASS, включая `TestTunnelAddressUsesPoolMask`.
 ```
 
 В спецификации §4.1 в примере ответа добавить `"tunnel_address": "10.99.7.1/24"` после
-`listen_port`; в §4.3 заменить «Интервал desired-poll — 30 с» на «Интервал desired-poll —
-25 с» и добавить причину: «худший случай с jitter ±10 % — 27,5 с, поэтому отзыв
-укладывается в критерий ≤ 30 с; при 30 с верхняя граница была бы 33 с».
+`listen_port`; в §4.3 установить интервал desired-poll 25 с с jitter ±10 %.
+Ожидание до 27,5 с оставляет бюджет 2,5 с на доставку, обработку и применение,
+включая остаток текущего шага и планирование. При интервале 30 с ожидание достигало бы 33 с.
+Не объявлять критерий «отзыв ≤ 30 с» выполненным до runtime/E2E-замера от фиксации
+отзыва до удаления пиера при доступном API: отзыв сразу после снимка desired,
+максимальный jitter, контролируемые задержки ответа и применения. Здесь меняется
+формулировка контракта, а не реализуются будущие задачи.
 
 - [ ] **Step 6: Написать падающий тест `stale` в телеметрии**
 
-В `tests/integration/telemetry_test.go` добавить (использовать существующие хелперы файла:
-`newEnv`, `env.server`, `env.adminToken` — имена взять из файла, не выдумывать):
+В `tests/integration/telemetry_test.go` использовать существующие `newEnv`, `env.server`,
+`env.node`, `raw`, `authHdr`, `nodePath` из `matrix_test.go` и `env.q.ServerHealthOf`.
+Не добавлять обёртки `postNode`/`healthStatus`.
 
-```go
-func TestHeartbeatStaleMarksHealthStale(t *testing.T) {
-	env := newEnv(t)
-	srv := env.server(t)
-	hb := map[string]any{
-		"agent_version": "test", "agent_uptime_sec": 10,
-		"load1": nil, "cpu_pct": nil, "applied_config_version": 0, "stale": true,
-	}
-	env.postNode(t, srv, "/internal/v1/nodes/"+srv.ID.String()+"/heartbeat", hb, http.StatusNoContent)
-	if got := env.healthStatus(t, srv.ID); got != "stale" {
-		t.Fatalf("health = %q, want stale", got)
-	}
-	hb["stale"] = false
-	env.postNode(t, srv, "/internal/v1/nodes/"+srv.ID.String()+"/heartbeat", hb, http.StatusNoContent)
-	if got := env.healthStatus(t, srv.ID); got != "ok" {
-		t.Fatalf("health = %q, want ok", got)
-	}
-}
-```
+Через настоящий HTTP и БД проверить:
+- `heartbeat(true)` устанавливает `stale`; следующий `observed` обновляет ненулевые
+  счётчики и применённую версию, но сохраняет `stale`, нагрузку, версию агента и uptime;
+  только `heartbeat(false)` возвращает `ok`, сохраняя счётчики observed.
+- Устаревший `observed_at` и штатный `connections.Store.SweepStale` устанавливают `stale`;
+  свежий `observed` его не снимает, `heartbeat(false)` восстанавливает `ok`.
+- После `heartbeat(true)` тела без `stale`, с `null` и неверным типом дают HTTP 400
+  `invalid_request`, не меняя ни одного поля health, включая `observed_at`.
+  Явные `true` и `false` принимаются с HTTP 204.
 
-Если хелперов `postNode`/`healthStatus` нет — добавить их в `tests/integration/helpers_test.go`
-по образцу существующих запросов: `postNode` шлёт JSON с узловым токеном и проверяет код,
-`healthStatus` читает `server_health.status` через пул БД.
+Сохранить исходную проверку взаимного сохранения полей
+`TestTelemetryHeartbeatPreservesObservedAndViceVersa`: heartbeat владеет нагрузкой,
+версией агента, uptime и статусом, observed — счётчиками; применённая версия и время
+обновляются каждым корректным отчётом. Корректные HTTP-фикстуры обязаны передавать `stale`.
 
 - [ ] **Step 7: Прогнать и убедиться, что падает**
 
 Run: `make integration`
-Expected: FAIL — поле `stale` не декодируется / статус остаётся `ok`.
+Expected: FAIL — отсутствие реализации `stale`, observed снимает установленный `stale`
+или heartbeat без boolean принимается и изменяет health. Новые регрессии сначала RED.
 
 - [ ] **Step 8: Реализовать `stale`**
 
@@ -314,6 +314,17 @@ Expected: FAIL — поле `stale` не декодируется / статус
 ```
 
 и передать `Status: status` в `db.MarkServerHealthParams`.
+
+В `internal/nodeapi/handlers.go` декодировать heartbeat в локальный HTTP DTO с
+`Stale *bool` и остальными полями отчёта. До вызова сервиса отклонять `nil` существующим
+путём `invalid_report`/`invalid_request` с HTTP 400; неверный тип отклоняет декодер.
+После проверки передать `*Stale` в `telemetry.Heartbeat.Stale`, сохранив его тип `bool`.
+Не ослаблять обязательность boolean в OpenAPI.
+
+В `internal/db/query/telemetry.sql` у `MarkObservedHealth` убрать присвоение `status`
+из `ON CONFLICT DO UPDATE`, сохранив вставку с `ok` и обновление измеренных полей.
+Восстановлением статуса владеет `heartbeat(false)`, в том числе после sweeper;
+закрепить это одной короткой строкой SQL-комментария. Generated-файлы менять только sqlc.
 
 В `internal/db/query/telemetry.sql` заменить `MarkServerHealth`:
 
@@ -1984,6 +1995,12 @@ Expected: FAIL — `undefined: Runner`.
 
 - [ ] **Step 3: Реализовать `runner.go` (дословный исходник)**
 
+`delay` задаёт только ожидание между шагами: при 25 с и jitter ±10 % оно не превышает
+27,5 с. В бюджет 2,5 с для отзыва входят остаток текущего `Step`, доставка, обработка
+и применение следующего набора. Длительность `delay` не доказывает SLA: в runtime/E2E
+нужен сквозной замер от фиксации отзыва сразу после снимка desired до удаления пиера
+при максимальном jitter и контролируемых задержках ответа и применения (§4.3).
+
 ```go
 // Package runtime — цикл жизни узла: получить desired set, применить дельту,
 // отчитаться, пережить недоступность API. Никакой сети и никакого netlink здесь
@@ -2059,9 +2076,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 }
 
-// delay — 25 с ±10 %. Симметричный разброс разводит узлы по фазе, не растягивая
-// верхнюю границу: при базе 25 с худший случай 27,5 с, поэтому отзыв укладывается
-// в критерий «≤ 30 с» (спецификация §4.3).
+// delay — ожидание 25 с ±10 %, до 27,5 с; это не сквозное время отзыва (§4.3).
 func (r *Runner) delay() time.Duration {
 	base := r.Interval
 	if base <= 0 {

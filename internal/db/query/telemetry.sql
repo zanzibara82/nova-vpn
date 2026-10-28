@@ -46,6 +46,7 @@ SELECT server_id, observed_at, peers_configured, peers_handshaked,
 FROM server_health WHERE server_id = $1;
 
 -- name: MarkObservedHealth :exec
+-- Восстанавливает status только heartbeat(false), в том числе после sweeper.
 INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
                            interface_rx_bytes, interface_tx_bytes, applied_config_version, status)
 VALUES ($1, $2, $3, $4, $5, $6, $7, 'ok')
@@ -55,8 +56,7 @@ ON CONFLICT (server_id) DO UPDATE SET
     peers_handshaked = EXCLUDED.peers_handshaked,
     interface_rx_bytes = EXCLUDED.interface_rx_bytes,
     interface_tx_bytes = EXCLUDED.interface_tx_bytes,
-    applied_config_version = EXCLUDED.applied_config_version,
-    status = 'ok';
+    applied_config_version = EXCLUDED.applied_config_version;
 
 -- name: MarkServerHealth :exec
 INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,

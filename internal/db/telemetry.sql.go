@@ -104,8 +104,7 @@ ON CONFLICT (server_id) DO UPDATE SET
     peers_handshaked = EXCLUDED.peers_handshaked,
     interface_rx_bytes = EXCLUDED.interface_rx_bytes,
     interface_tx_bytes = EXCLUDED.interface_tx_bytes,
-    applied_config_version = EXCLUDED.applied_config_version,
-    status = 'ok'
+    applied_config_version = EXCLUDED.applied_config_version
 `
 
 type MarkObservedHealthParams struct {
@@ -118,6 +117,7 @@ type MarkObservedHealthParams struct {
 	AppliedConfigVersion int64
 }
 
+// Восстанавливает status только heartbeat(false), в том числе после sweeper.
 func (q *Queries) MarkObservedHealth(ctx context.Context, arg MarkObservedHealthParams) error {
 	_, err := q.db.Exec(ctx, markObservedHealth,
 		arg.ServerID,

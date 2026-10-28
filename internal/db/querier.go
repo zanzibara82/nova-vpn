@@ -139,6 +139,7 @@ type Querier interface {
 	// hashtextextended даёт bigint-ключ из uuid; lock держится до конца транзакции.
 	LockUserForDeviceCount(ctx context.Context, dollar_1 string) error
 	MarkDeviceSeen(ctx context.Context, id uuid.UUID) error
+	// Восстанавливает status только heartbeat(false), в том числе после sweeper.
 	MarkObservedHealth(ctx context.Context, arg MarkObservedHealthParams) error
 	// Просроченный профиль становится 'expired' отдельной операцией (sweeper, задача 13),
 	// а не «тихо не отдаётся»: событие profile_expired обязано существовать (§6).
