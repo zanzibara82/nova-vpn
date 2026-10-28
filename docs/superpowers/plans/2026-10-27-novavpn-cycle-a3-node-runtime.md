@@ -947,12 +947,15 @@ func toIPNets(prefixes []netip.Prefix) []net.IPNet {
 
 Требования к `Netlink`:
 
-- `EnsureLink(name, mtu)`: если устройство есть — сравнить MTU и при отличии вызвать
-  `netlink.LinkSetMTU`; если нет — `netlink.LinkAdd(&netlink.Wireguard{LinkAttrs:
-  netlink.LinkAttrs{Name: name, MTU: mtu}})`. Любая иная ошибка поиска — вернуть с
-  контекстом, а не создавать второй интерфейс.
-- `EnsureAddress(name, addr)`: найти устройство, `netlink.ParseAddr(addr.String())`,
-  `netlink.AddrReplace` (идемпотентно; `AddrAdd` на существующем адресе дал бы EEXIST).
+- `EnsureLink(name, mtu)`: найденное устройство сначала проверить на тип `wireguard`;
+  чужой тип с тем же именем — ошибка без изменений. Затем сравнить MTU и при отличии
+  вызвать `netlink.LinkSetMTU`. Только `netlink.LinkNotFoundError` разрешает создание
+  через `netlink.LinkAdd(&netlink.Wireguard{LinkAttrs:
+  netlink.LinkAttrs{Name: name, MTU: mtu}})`; прочие ошибки поиска вернуть с контекстом.
+  Новый или существующий интерфейс без флага UP поднять через `netlink.LinkSetUp`.
+- `EnsureAddress(name, addr)`: найти устройство, проверить тип `wireguard` до изменений,
+  затем `netlink.ParseAddr(addr.String())` и `netlink.AddrReplace` (идемпотентно;
+  `AddrAdd` на существующем адресе дал бы EEXIST).
 - Свойства: ни одного `os/exec`, ни одной строки shell; маршрут для пула не добавляется —
   адрес с маской создаёт connected route, а лишний маршрут дублировал бы его.
 - Методы — на значении (`func (Netlink) EnsureLink(...)`, `func (Netlink)
