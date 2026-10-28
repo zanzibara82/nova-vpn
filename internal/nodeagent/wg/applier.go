@@ -11,6 +11,10 @@ type Applier struct {
 	Iface  string
 }
 
+// ApplyResult — что известно после вызова. Before это снимок ядра до изменений,
+// он значим и при ошибке настройки. Ops — число операций дельты: при ошибке
+// настройки ядро могло измениться, поэтому непустой Ops нельзя прочитать как
+// «набор применён».
 type ApplyResult struct {
 	Before LiveState
 	Ops    int
@@ -31,12 +35,15 @@ func (a *Applier) Apply(t Target) (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("wg: применение: дельта: %w", err)
 	}
-	if len(ops) == 0 {
-		return ApplyResult{Before: before}, nil
-	}
+	// ConfigFor проверяет приватный ключ, поэтому вызывается и при пустой дельте:
+	// иначе один и тот же Target принимался бы по-разному в зависимости от того,
+	// совпали ли пиры, а ошибка ключа всплыла бы только на первом изменении.
 	cfg, err := ConfigFor(t, ops)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("wg: применение: конфигурация: %w", err)
+	}
+	if len(ops) == 0 {
+		return ApplyResult{Before: before}, nil
 	}
 	if err := a.Device.Configure(a.Iface, cfg); err != nil {
 		return ApplyResult{Before: before, Ops: len(ops)}, fmt.Errorf("wg: применение: настройка: %w", err)
