@@ -396,16 +396,15 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `wg.Diff(live LiveState, target []TargetPeer) ([]Op, error)`, `wg.ErrDuplicatePeer`,
   `wg.ErrDuplicateAddress`, `wg.ErrUnknownPeerState`.
 
-- [ ] **Step 1: Добавить зависимость**
+- [ ] **Step 1: Отложить неиспользуемую зависимость до задачи 3**
 
-В `go.mod` в первый блок `require` добавить:
-
-```
-	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
-```
+Чистая дельта не использует `wgctrl`: `go mod tidy` удалит эту зависимость.
+Не добавлять фиктивный blank import. Закрепить `wgctrl` версии
+`v0.0.0-20241231184526-a9ab2273dd10` в Task 3 Step 1 вместе с `netlink`
+и первым реальным использованием `wgtypes`.
 
 Run: `make mod`
-Expected: `go.sum` дополнен; команда завершилась с кодом 0.
+Expected: код 0; `go.mod` и `go.sum` могут остаться без изменений.
 
 - [ ] **Step 2: Написать падающий тест дельты**
 
@@ -792,16 +791,18 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `EnsureAddress(name string, addr netip.Prefix) error`), `wg.Netlink`,
   `wg.Target`, `wg.ConfigFor(t Target, ops []Op) (wgtypes.Config, error)`.
 
-- [ ] **Step 1: Добавить зависимость**
+- [ ] **Step 1: Добавить зависимости вместе с первым использованием**
 
-В `go.mod`:
+В `go.mod` одновременно с первым реальным использованием `wgtypes` и `netlink`
+добавить обе зависимости (закрепление `wgctrl` перенесено из задачи 2):
 
 ```
 	github.com/vishvananda/netlink v1.3.1
+	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 ```
 
-Run: `make mod`
-Expected: код 0; `go.sum` дополнен.
+Run: `make mod` после появления реальных импортов; фиктивный blank import запрещён.
+Expected: код 0; обе зависимости сохранены в `go.mod`, `go.sum` дополнен.
 
 - [ ] **Step 2: Написать падающий тест сборки конфига**
 
