@@ -528,7 +528,7 @@ func TestAdminDeleteServer(t *testing.T) {
 		t.Fatalf("tunnel_addresses: %v", err)
 	}
 	if err := s.q.MarkServerHealth(s.ctx, db.MarkServerHealthParams{
-		ServerID: serverID, ObservedAt: time.Now(), AppliedConfigVersion: 1,
+		ServerID: serverID, ObservedAt: time.Now(), AppliedConfigVersion: 1, Status: db.HealthStatusOk,
 	}); err != nil {
 		t.Fatalf("MarkServerHealth: %v", err)
 	}

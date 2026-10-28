@@ -1150,7 +1150,7 @@ func nodeCases() []routeCase {
 	}
 	heartbeat := func() any {
 		return map[string]any{"agent_version": "matrix", "agent_uptime_sec": 1,
-			"load1": 0.1, "cpu_pct": 1.0, "applied_config_version": 0}
+			"load1": 0.1, "cpu_pct": 1.0, "applied_config_version": 0, "stale": false}
 	}
 
 	cases = append(cases, nodeMatrix("GET /internal/v1/nodes/{server_id}/desired",

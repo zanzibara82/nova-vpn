@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"math"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -131,6 +132,37 @@ func TestTelemetryObservedDeltasAndHandshake(t *testing.T) {
 	}
 	if !strings.Contains(f.logs.String(), "counters reset") || strings.Contains(f.logs.String(), f.device.PublicKey) {
 		t.Fatal("сброс не отражён в журнале либо раскрыт ключ")
+	}
+}
+
+func TestHeartbeatStaleMarksHealthStale(t *testing.T) {
+	e := newEnv(t)
+	srv := e.server(t)
+	own := e.node(t, srv.ID)
+	hb := map[string]any{
+		"agent_version": "test", "agent_uptime_sec": 10,
+		"load1": nil, "cpu_pct": nil, "applied_config_version": 7,
+	}
+	for _, stale := range []bool{true, false, true} {
+		hb["stale"] = stale
+		resp, body := raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"), hb, authHdr(own.token))
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("heartbeat при stale=%t: %d %s, ожидался 204", stale, resp.StatusCode, body)
+		}
+		h, err := e.q.ServerHealthOf(context.Background(), srv.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := db.HealthStatusOk
+		if stale {
+			want = db.HealthStatusStale
+		}
+		if h.Status != want {
+			t.Fatalf("статус при stale=%t = %q, ожидался %q", stale, h.Status, want)
+		}
+		if h.AgentVersion == nil || *h.AgentVersion != "test" || h.AgentUptimeSec == nil || *h.AgentUptimeSec != 10 || h.AppliedConfigVersion != 7 || h.Load1 != nil || h.CpuPct != nil {
+			t.Fatalf("неверные поля heartbeat: %+v", h)
+		}
 	}
 }
 

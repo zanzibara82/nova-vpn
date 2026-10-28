@@ -134,13 +134,15 @@ func (q *Queries) MarkObservedHealth(ctx context.Context, arg MarkObservedHealth
 const markServerHealth = `-- name: MarkServerHealth :exec
 INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,
                            applied_config_version, status, agent_version, agent_uptime_sec)
-VALUES ($1, $2, $3, $4, $5, 'ok', $6, $7)
+VALUES ($1, $2, $3, $4,
+        $5, $6::health_status,
+        $7, $8)
 ON CONFLICT (server_id) DO UPDATE SET
     observed_at = EXCLUDED.observed_at,
     load1 = EXCLUDED.load1,
     cpu_pct = EXCLUDED.cpu_pct,
     applied_config_version = EXCLUDED.applied_config_version,
-    status = 'ok',
+    status = EXCLUDED.status,
     agent_version = EXCLUDED.agent_version,
     agent_uptime_sec = EXCLUDED.agent_uptime_sec
 `
@@ -151,6 +153,7 @@ type MarkServerHealthParams struct {
 	Load1                *string
 	CpuPct               *string
 	AppliedConfigVersion int64
+	Status               HealthStatus
 	AgentVersion         *string
 	AgentUptimeSec       *int64
 }
@@ -162,6 +165,7 @@ func (q *Queries) MarkServerHealth(ctx context.Context, arg MarkServerHealthPara
 		arg.Load1,
 		arg.CpuPct,
 		arg.AppliedConfigVersion,
+		arg.Status,
 		arg.AgentVersion,
 		arg.AgentUptimeSec,
 	)
@@ -334,8 +338,7 @@ type UpsertServerHealthParams struct {
 	AgentUptimeSec       *int64
 }
 
-// Один узел = одна строка наблюдаемого состояния; heartbeat и observed пишут её
-// одними руками, поэтому наивный INSERT убивал бы второй отчёт того же узла.
+// Только тестовые данные; отчёты пишут MarkObservedHealth и MarkServerHealth, сохраняя независимые поля.
 func (q *Queries) UpsertServerHealth(ctx context.Context, arg UpsertServerHealthParams) error {
 	_, err := q.db.Exec(ctx, upsertServerHealth,
 		arg.ServerID,

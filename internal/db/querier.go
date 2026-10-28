@@ -249,8 +249,7 @@ type Querier interface {
 	// Прирост, а не абсолют: узел репортирует счётчики, дельту считает telemetry.Delta
 	// (задача 10), а здесь она складывается в агрегат устройство-сутки (ADR-006).
 	UpsertDeviceDayTraffic(ctx context.Context, arg UpsertDeviceDayTrafficParams) error
-	// Один узел = одна строка наблюдаемого состояния; heartbeat и observed пишут её
-	// одними руками, поэтому наивный INSERT убивал бы второй отчёт того же узла.
+	// Только тестовые данные; отчёты пишут MarkObservedHealth и MarkServerHealth, сохраняя независимые поля.
 	UpsertServerHealth(ctx context.Context, arg UpsertServerHealthParams) error
 	UserByEmail(ctx context.Context, email string) (User, error)
 	UserByID(ctx context.Context, id uuid.UUID) (User, error)
