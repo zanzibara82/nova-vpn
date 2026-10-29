@@ -54,7 +54,7 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("api: базовый адрес: %w", err)
 	}
-	if u.RawQuery != "" {
+	if u.RawQuery != "" || u.ForceQuery {
 		return nil, fmt.Errorf("api: базовый адрес не должен содержать параметры")
 	}
 	if u.Fragment != "" {
@@ -141,6 +141,9 @@ func (c *Client) Desired(ctx context.Context, serverID, etag string) (DesiredSet
 	newETag := respHeader.Get("ETag")
 	if status == http.StatusNotModified {
 		return DesiredSet{}, newETag, true, nil
+	}
+	if status != http.StatusOK {
+		return DesiredSet{}, "", false, &StatusError{Status: status}
 	}
 	return out, newETag, false, nil
 }

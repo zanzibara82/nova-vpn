@@ -2077,6 +2077,7 @@ func TestNewValidatesConfig(t *testing.T) {
 		{"неподдерживаемая схема", Config{BaseURL: "ftp://example.com", Env: "prod"}},
 		{"http в dev без пропуска проверки", Config{BaseURL: "http://127.0.0.1:1", Env: "dev"}},
 		{"параметры в адресе", Config{BaseURL: "https://example.com/?a=1", Env: "prod"}},
+		{"пустой запрос в адресе", Config{BaseURL: "https://example.com?", Env: "prod"}},
 		{"фрагмент в адресе", Config{BaseURL: "https://example.com/#f", Env: "prod"}},
 		{"учётные данные в адресе", Config{BaseURL: "https://user:pass@example.com", Env: "prod"}},
 	}
@@ -2191,6 +2192,20 @@ func TestDesiredRejectsBrokenJSON(t *testing.T) {
 	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
 	if _, _, _, err := c.Desired(context.Background(), "s", ""); err == nil {
 		t.Fatal("битый JSON принят за набор")
+	}
+}
+
+func TestDesiredRequiresOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != http.StatusNoContent {
+		t.Fatalf("204 принят за пустой набор: %v", err)
 	}
 }
 
@@ -2427,8 +2442,9 @@ func TestRedirectRefused(t *testing.T) {
 }
 
 func TestTokenEndpointsRequireOK(t *testing.T) {
+	status := http.StatusNoContent
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(status)
 	}))
 	defer srv.Close()
 	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
@@ -2439,6 +2455,13 @@ func TestTokenEndpointsRequireOK(t *testing.T) {
 	}
 	if _, err := c.RotateToken(context.Background(), "srv"); !errors.As(err, &se) || se.Status != http.StatusNoContent {
 		t.Fatalf("ротация приняла 204: %v", err)
+	}
+	status = http.StatusNotModified
+	if _, err := c.Enroll(context.Background(), "стартовый", "ключ"); !errors.As(err, &se) || se.Status != http.StatusNotModified {
+		t.Fatalf("enroll принял 304: %v", err)
+	}
+	if _, err := c.RotateToken(context.Background(), "srv"); !errors.As(err, &se) || se.Status != http.StatusNotModified {
+		t.Fatalf("ротация приняла 304: %v", err)
 	}
 }
 ```
@@ -2457,7 +2480,8 @@ Expected: FAIL — `undefined: New`, `undefined: Config`, `undefined: Client`.
 Требования к `New` (R31):
 
 - `BaseURL` обязателен; разбирается через `url.Parse`; завершающая `/` срезается.
-- Адрес не должен содержать query, fragment или userinfo: такой `BaseURL` — ошибка.
+- Адрес не должен содержать query (включая пустой `?`, `ForceQuery`), fragment или
+  userinfo: такой `BaseURL` — ошибка.
 - Редиректы не выполняются: `CheckRedirect` возвращает `http.ErrUseLastResponse`;
   ответ `3xx` — `*StatusError`.
 - Вне dev допустим только `https`: `http` принимается лишь при `Env == "dev"` и
@@ -2530,8 +2554,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, token
   (даже если `SetToken` уже вызывался), ответ — `NodeToken`; требуется ровно `200`,
   иной код — `*StatusError`.
 - `Desired`: `GET /internal/v1/nodes/{server_id}/desired`; при непустом `etag` —
-  заголовок `If-None-Match`; при 304 — `(DesiredSet{}, etag из заголовка, true, nil)`,
-  иначе разобранный набор и `etag` из заголовка.
+  заголовок `If-None-Match`; при 304 — `(DesiredSet{}, etag из заголовка, true, nil)`;
+  иначе требуется ровно `200`, иной код (включая 204) — `*StatusError` без etag; при 200 —
+  разобранный набор и `etag` из заголовка.
 - `Observed`, `Heartbeat`: `POST` соответственно `/observed` и `/heartbeat` с текущим
   токеном; ожидается ровно `204`; другой успешный код — `*StatusError` с пустым `Code`.
 - `RotateToken`: `POST /internal/v1/nodes/{server_id}/token/rotate` с текущим токеном,
@@ -2604,7 +2629,7 @@ type Heartbeat struct {
 - [ ] **Step 4: Прогнать тесты**
 
 Run: сосредоточенный `make unit` по пакету, затем полные `unit` и `vet`.
-Expected: PASS, четырнадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
+Expected: PASS, пятнадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
 не менялись (новых внешних зависимостей нет).
 
 - [ ] **Step 5: Коммит**
