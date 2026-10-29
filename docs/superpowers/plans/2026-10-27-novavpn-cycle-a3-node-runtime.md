@@ -2851,120 +2851,103 @@ GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL (NovaVPN Dev, dev@novavpn.local), соо�
 
 ### Task 9: Бинарник — `init`, `enroll`, `run`, `status`
 
-**Files:**
-- Create: `services/node-agent/cmd/novavpn-node-agent/main.go`,
-  `services/node-agent/cmd/novavpn-node-agent/main_test.go`
-- Modify: `docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md` (§4.4 —
-  имена env агента)
+**Файлы:**
+- Создать `services/node-agent/cmd/novavpn-node-agent/main.go` и `main_test.go` рядом.
+- Изменить только §4.4 спецификации `docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md`,
+  этот раздел плана и записи задачи 9 в `docs/testing-status.md`.
+- Внутренние пакеты, зависимости, Makefile, прочие настройки и разрешения не менять.
 
-**Interfaces:**
-- Consumes: `state.Store`, `api.New`, `runtime.Runner`, `wg.Open`, `wg.Applier`, `wg.Netlink`.
-- Produces: исполняемый файл с командами и env-конфигурацией.
+**Интерфейсы:** `state.Store`, `api.New`, `runtime.Runner`, `wg.Open`, `wg.Applier`,
+`wg.Netlink`. Уточнения R10/R37–R40 заменяют прежние три слабые проверки.
 
-- [ ] **Step 1: Написать падающий тест**
+- [x] **Step 1: Написать тесты до реализации**
 
-`main_test.go`:
+В `main_test.go`, без тега `integration`, проверить:
 
-```go
-package main
+1. Справку для пустой, неизвестной команды и лишних аргументов; успешный `--help`.
+   Все четыре команды присутствуют; нет эха аргументов, чтения окружения и ввода,
+   файловых или сетевых побочных эффектов.
+2. Все умолчания и явные настройки из §4.4; точный набор вызовов `getenv`, стандартный
+   разбор булева значения, отказ неверного режима и неположительного интервала.
+   Запрет небезопасного TLS вне разработки действует и на локальные команды;
+   старые имена окружения не дают обхода.
+3. `init` на настоящем временном `Store`: точные две строки, соответствие публичного
+   ключа файлу, отсутствие приватного ключа в выводе, стабильный повтор, повреждённый
+   ключ не перевыпускается, права каталога и файла проверяются только во временном каталоге.
+4. `enroll` через настоящий `api.Client` и `httptest`: метод, путь, JSON, отсутствие
+   Authorization и приватного ключа; сохранение пробелов токена при удалении хвостовых
+   CR/LF, новое состояние целиком и время UTC в ограниченном окне, пустой `Applied`.
+   Пустой ввод, ошибка чтения, отсутствие/повреждение ключа не доходят до HTTP.
+   Ошибки URL/CA/TLS, HTTP-отказ, повреждённый JSON, пустые поля, статус не 200
+   не портят прежнюю регистрацию; ошибка записи не выдаётся за успех.
+5. `status`: ровно пять строк в порядке `server_id`, `applied.config_version`,
+   `applied.peers`, `applied.applied_at`, `token_issued_at`, значения из файла,
+   даты UTC RFC3339, допустимое нулевое время применения. Нет сети и чтения ключа.
+   Отсутствующая/неполная регистрация и повреждённый файл различаются безопасной диагностикой.
+6. `run`: проверка регистрации и ключа до ядра, настоящий клиент с сохранённым токеном,
+   полная сборка `Runner`, указателей `Store`/`Applier`, параметров, часов и журнала.
+   Подставляются только устройство и граница вызова цикла; проверяются контекст,
+   закрытие на каждом пути после открытия, отказы и штатная отмена.
+7. Возвращённая ошибка, stdout и stderr не содержат секретов; ошибки Writer не теряются.
+   Секретные фикстуры создаются штатной криптографией при запуске теста.
+8. Коды выхода настоящего `main` в дочернем тестовом процессе; SIGINT/SIGTERM
+   завершают команду с кодом 0. Для сигнального испытания используются настоящие
+   `wg.Open` и `Runner.Run`, но сервер возвращает 503, поэтому интерфейс не настраивается.
 
-import (
-	"strings"
-	"testing"
-)
+- [x] **Step 2: Наблюдать RED**
 
-func TestRunRejectsUnknownAndMissingCommand(t *testing.T) {
-	env := func(string) string { return "" }
-	if err := run(nil, env, strings.NewReader("")); err == nil {
-		t.Fatal("empty args accepted")
-	}
-	if err := run([]string{"nope"}, env, strings.NewReader("")); err == nil {
-		t.Fatal("unknown command accepted")
-	}
-}
+Сосредоточенный `make unit` через служебную обёртку с рабочим каталогом контейнера
+`/src/services/node-agent/cmd/novavpn-node-agent`, исходниками только для чтения,
+`GOFLAGS="-mod=readonly -v"` и `CGO_ENABLED=0`.
+Наблюдался отказ компиляции: отсутствовали `command`, `nodeDevice`, `loadConfig`,
+`config`; код обёртки 2. Это начальный RED отсутствующей реализации, не доказательство
+чувствительности каждого отрицательного сценария к отдельной мутации.
 
-func TestRunRefusesInsecureOutsideDev(t *testing.T) {
-	env := map[string]string{
-		"NOVAVPN_NODE_ENV":                "prod",
-		"NOVAVPN_NODE_ALLOW_INSECURE_API": "true",
-		"NOVAVPN_NODE_API_URL":            "https://api.example.com",
-	}
-	err := run([]string{"status"}, func(k string) string { return env[k] }, strings.NewReader(""))
-	if err == nil || !strings.Contains(err.Error(), "TLS") {
-		t.Fatalf("err = %v", err)
-	}
-}
+- [x] **Step 3: Реализовать команды на готовых компонентах**
 
-func TestInitPrintsPublicKey(t *testing.T) {
-	dir := t.TempDir()
-	env := map[string]string{"NOVAVPN_NODE_STATE_DIR": dir}
-	if err := run([]string{"init"}, func(k string) string { return env[k] }, strings.NewReader("")); err != nil {
-		t.Fatal(err)
-	}
-}
-```
+- Сохранить `run(args []string, getenv func(string) string, stdin io.Reader) error`;
+  `main` передаёт аргументы, окружение и ввод ОС, пишет безопасную русскую ошибку
+  в stderr, код 1. Успех и штатная отмена — 0. `version` по умолчанию `dev`,
+  совместима с `-ldflags '-X main.version=...'`.
+- Ровно одна из четырёх команд либо `--help`. Проверка аргументов и справка предшествуют
+  конфигурации. Настройки и ввод токена документированы только в §4.4 спецификации.
+- `init`: `(&state.Store{Dir: cfg.StateDir}).EnsureKey`; stdout строго
+  `public_key <BASE64>` и «передайте его администратору при создании сервера»,
+  обе строки заканчиваются переводом строки. Первая строка остаётся машинным контрактом.
+- `enroll`: токен только из переданного stdin; ключ только через `PrivateKey`,
+  публичная часть — `PublicKey().String()`. Ответ 200 требует непустые `ServerID`
+  и `NodeToken`; сохранить новый `NodeState` с `TokenIssuedAt=time.Now().UTC()`
+  и пустым `Applied`. Повторная регистрация разрешена; до успешного ответа состояние
+  не менять. Авария между принятием регистрации сервером и записью файла не решается.
+- `status`: только сохранённые метаданные, не подтверждение живого туннеля;
+  отсутствие `ServerID` или `NodeToken` означает «узел не инициализирован».
+- `run`: сначала регистрация и ключ, затем `api.New` и `SetToken`;
+  `signal.NotifyContext` на SIGINT/SIGTERM с обязательным `stop`; `wg.Open`
+  с обязательным `Close`, включая отказ цикла. Ошибка закрытия остаётся ошибкой.
+  `wg.Applier{Link: wg.Netlink{}, Device: device, Iface: cfg.Iface}` передаётся указателем.
+  Все публичные поля `Runner`: `API`, `Applier`, `Store`, `Iface`, `Interval`,
+  `TokenTTL: 24*time.Hour`, `Version: version`, `Now: time.Now`,
+  `Log: slog.New(slog.NewJSONHandler(stderr,nil))`. Вызвать существующий `Runner.Run(ctx)`;
+  не дублировать цикл, ETag и ротацию. Не возвращать сырые ошибки зависимостей.
 
-Тест `TestInitPrintsPublicKey` проверяет только успешный код: вывод идёт в `os.Stdout`,
-и подменять его ради одного теста не стоит — публичный ключ проверяется тестом
-`state.EnsureKey`, а формат вывода — глазами в Step 4.
+- [x] **Step 4: Собрать и проверить**
 
-- [ ] **Step 2: Прогнать и убедиться, что не компилируется**
+Сосредоточенный набор, полные `make unit` и `make vet` выполнены через обёртку,
+строго последовательно, на исходниках только для чтения и с `GOFLAGS=-mod=readonly`.
+Новый пакет: 20 тестов верхнего уровня, включая служебный тест дочернего процесса;
+все успешны. Сборка и запуск настоящего `main --help` выполнены через временную цель
+GNU make `--eval` с `$(docker-go) run ./services/node-agent/cmd/novavpn-node-agent --help`,
+без изменения Makefile. Коды всех итоговых проверок — 0.
+Живые БД, демон, применение к настоящему интерфейсу и сквозной срок отзыва — `not-run`.
 
-Run: `make unit`
-Expected: FAIL — `undefined: run`.
+- [x] **Step 5: Самопроверка и новый локальный коммит**
 
-- [ ] **Step 3: Реализовать `main.go` (схема; обязательные требования)**
-
-- `run(args []string, getenv func(string) string, stdin io.Reader) error`; `main` печатает
-  ошибку в stderr и выходит с кодом 1.
-- Конфигурация из env: `NOVAVPN_NODE_ENV` (по умолчанию `prod`),
-  `NOVAVPN_NODE_API_URL`, `NOVAVPN_NODE_STATE_DIR` (по умолчанию
-  `/var/lib/novavpn-node`), `NOVAVPN_NODE_CA_FILE`,
-  `NOVAVPN_NODE_ALLOW_INSECURE_API`, `NOVAVPN_NODE_INTERFACE` (по умолчанию `wg0`),
-  `NOVAVPN_NODE_POLL_INTERVAL` (по умолчанию `25s`). Неизвестный env не читается —
-  секретов в argv нет ни у одной команды. Префикс `NOVAVPN_NODE_` отличается от
-  спецификации §4.4 (`NOVAVPN_ENV`, `NOVAVPN_API_CA_FILE`): агент и API живут на разных
-  машинах и могут читать общий env-файл, а одинаковые имена связали бы их значения.
-  Правка §4.4 входит в коммит Step 5 вместе с кодом, чтобы спецификация и бинарник не
-  расходились.
-- `init`: `Store.EnsureKey`, печатает ровно две строки: `public_key <BASE64>` и
-  «передайте его администратору при создании сервера». Первая строка — машинный
-  формат: на неё опирается `scripts/e2e.sh` (`sed -n 's/^public_key //p'`), поэтому
-  префикс, регистр и один пробел фиксированы.
-- `enroll`: читает bootstrap-токен из stdin (обрезает `\r\n`), берёт публичный ключ из
-  состояния, вызывает `Enroll`, сохраняет `ServerID`, `NodeToken`, `TokenIssuedAt`.
-  Пустой токен — ошибка до сетевого вызова.
-- `run`: `signal.NotifyContext` (SIGINT, SIGTERM), `wg.Open`, `wg.Applier{Link:
-  wg.Netlink{}, Device: client, Iface: cfg.Iface}`, `store := &state.Store{Dir:
-  cfg.StateDir}` (методы `Load`/`Save`/`PrivateKey` объявлены на `*Store`, задача 6),
-  загрузка `NodeState`, `SetToken`,
-  затем `runtime.Runner` со **всеми** полями (у структуры нет конструктора, и
-  пропущенные `Log`/`Now` дают панику на первом же шаге):
-  `API: client, Applier: applier, Store: store, Iface: cfg.Iface,
-  Interval: cfg.Interval, TokenTTL: 24 * time.Hour, Version: version,
-  Now: time.Now, Log: logger`, где `logger` — `slog.New(slog.NewJSONHandler(os.Stderr,
-  nil))`, `cfg.Interval` — разобранный `NOVAVPN_NODE_POLL_INTERVAL`, `version` —
-  переменная, заполняемая `-ldflags "-X main.version=…"` при сборке (по умолчанию
-  `"dev"`); последний шаг — `Runner.Run(ctx)`. Код выхода при отмене контекста — 0.
-- `status`: печатает `server_id`, `applied.config_version`, `applied.peers`,
-  `applied.applied_at`, `token_issued_at`; отсутствие состояния — понятная ошибка
-  «узел не инициализирован».
-- `--help` и пустая команда — usage со всеми четырьмя командами, код 0 для `--help`.
-
-- [ ] **Step 4: Собрать и прогнать**
-
-Run: `make unit && make vet`
-Expected: PASS. Затем вручную:
-`make unit` собирает пакеты; для проверки usage — `docker run --rm … go run ./services/node-agent/cmd/novavpn-node-agent --help`
-через тот же контейнер (`make node-help` добавляется в задаче 10).
-
-- [ ] **Step 5: Коммит**
-
-```bash
-git add services/node-agent docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md
-git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
-  commit -m "feat(a3): бинарник агента — init, enroll, run, status"
-```
+Проверить состав пяти рабочих файлов, `git diff --check`, новые русские строки двумя
+способами, включая текст в кавычках. Добавить в индекс только файлы задачи.
+Автор и коммитер задаются через `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, не через Git config.
+Сообщение передать через HEREDOC: `feat(a3): бинарник агента — init, enroll, run, status`.
+Без amend, отключения хуков, push или merge. Хеш и точные журналы сохранить
+в служебном `task-9-report.md`; независимое ревью выполняет контроллер.
 
 ---
 
