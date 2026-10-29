@@ -253,12 +253,30 @@ func readLoad1(path string) *float64 {
 		return nil
 	}
 	fields := strings.Fields(string(raw))
-	if len(fields) == 0 {
+	if len(fields) != 5 {
 		return nil
 	}
-	load, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil || math.IsNaN(load) || math.IsInf(load, 0) || load < 0 {
+	var loads [3]float64
+	for i := range loads {
+		load, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil || math.IsNaN(load) || math.IsInf(load, 0) || load < 0 {
+			return nil
+		}
+		loads[i] = load
+	}
+	running, total, ok := strings.Cut(fields[3], "/")
+	if !ok {
 		return nil
 	}
-	return &load
+	for _, field := range []string{running, total, fields[4]} {
+		if field == "" {
+			return nil
+		}
+		for _, digit := range field {
+			if digit < '0' || digit > '9' {
+				return nil
+			}
+		}
+	}
+	return &loads[0]
 }

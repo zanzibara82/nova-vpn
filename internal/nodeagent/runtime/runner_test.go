@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -600,13 +601,26 @@ func TestHeartbeatUsesActualProcLoad(t *testing.T) {
 		return v
 	}
 	f := newFixture(t)
-	before := read()
-	f.stepOK(t)
-	after := read()
-	load := f.heartbeats[0].Load1
-	if load == nil || (*load != before && *load != after) {
-		t.Fatal("heartbeat не содержит фактический замер нагрузки")
+	for attempt := 0; attempt < 3; attempt++ {
+		start := time.Now()
+		before := read()
+		f.stepOK(t)
+		after := read()
+		elapsed := time.Since(start)
+		load := f.heartbeats[len(f.heartbeats)-1].Load1
+		if load == nil || math.IsNaN(*load) || math.IsInf(*load, 0) || *load < 0 {
+			t.Fatal("heartbeat не содержит допустимый замер нагрузки")
+		}
+		t.Logf("попытка %d: окно чтения /proc/loadavg %s", attempt+1, elapsed)
+		if elapsed >= time.Second {
+			continue
+		}
+		if *load != before && *load != after {
+			t.Fatal("heartbeat не содержит фактический замер нагрузки")
+		}
+		return
 	}
+	t.Skip("живая проверка /proc/loadavg пропущена: все три окна чтения заняли не менее секунды")
 }
 
 func TestReadLoad1FromFiles(t *testing.T) {
@@ -615,9 +629,49 @@ func TestReadLoad1FromFiles(t *testing.T) {
 		valid         bool
 		want          float64
 	}{
-		{"valid", "0.75 0.40 0.20 1/123 42\n", true, 0.75}, {"zero", "0 0 0 1/2 3", true, 0},
-		{"empty", "", false, 0}, {"broken", "broken 1 2", false, 0}, {"nan", "NaN 1 2", false, 0},
-		{"inf", "+Inf 1 2", false, 0}, {"negative", "-0.1 1 2", false, 0}, {"missing", "", false, 0},
+		{"valid", "0.75 0.40 0.20 1/123 42\n", true, 0.75},
+		{"zero", "0 0 0 1/2 3", true, 0},
+		{"zero-processes-and-pid", "0 0 0 0/0 0", true, 0},
+		{"exponents", "7.5e-1 4e-1 2e-1 1/123 42", true, 0.75},
+		{"large-load", "1e100 0 0 1/2 3", true, 1e100},
+		{"unordered", "0.75 10 20 3/2 1", true, 0.75},
+		{"leading-zeroes", "0.75 0.40 0.20 01/002 003", true, 0.75},
+		{"large-counters", "0.75 0 0 18446744073709551616/18446744073709551617 18446744073709551618", true, 0.75},
+		{"whitespace", " \t0.75\t0.40  0.20 1/123 42\n", true, 0.75},
+		{"empty", "", false, 0},
+		{"broken", "broken 1 2 1/2 3", false, 0},
+		{"nan", "NaN 1 2 1/2 3", false, 0},
+		{"inf", "+Inf 1 2 1/2 3", false, 0},
+		{"negative", "-0.1 1 2 1/2 3", false, 0},
+		{"missing", "", false, 0},
+		{"single-number", "0.75", false, 0},
+		{"broken-continuation", "0.75 broken", false, 0},
+		{"four-fields", "0.75 0.40 0.20 1/123", false, 0},
+		{"six-fields", "0.75 0.40 0.20 1/123 42 extra", false, 0},
+		{"second-broken", "0.75 broken 0.20 1/123 42", false, 0},
+		{"second-nan", "0.75 NaN 0.20 1/123 42", false, 0},
+		{"second-inf", "0.75 +Inf 0.20 1/123 42", false, 0},
+		{"second-negative", "0.75 -0.40 0.20 1/123 42", false, 0},
+		{"third-broken", "0.75 0.40 broken 1/123 42", false, 0},
+		{"third-nan", "0.75 0.40 NaN 1/123 42", false, 0},
+		{"third-inf", "0.75 0.40 -Inf 1/123 42", false, 0},
+		{"third-negative", "0.75 0.40 -0.20 1/123 42", false, 0},
+		{"process-no-slash", "0.75 0.40 0.20 123 42", false, 0},
+		{"process-extra-slash", "0.75 0.40 0.20 1/2/3 42", false, 0},
+		{"process-empty-running", "0.75 0.40 0.20 /123 42", false, 0},
+		{"process-empty-total", "0.75 0.40 0.20 1/ 42", false, 0},
+		{"process-broken-running", "0.75 0.40 0.20 x/123 42", false, 0},
+		{"process-broken-total", "0.75 0.40 0.20 1/x 42", false, 0},
+		{"process-signed-running", "0.75 0.40 0.20 +1/123 42", false, 0},
+		{"process-signed-total", "0.75 0.40 0.20 1/-123 42", false, 0},
+		{"process-fraction", "0.75 0.40 0.20 1.0/123 42", false, 0},
+		{"process-exponent", "0.75 0.40 0.20 1/1e2 42", false, 0},
+		{"pid-broken", "0.75 0.40 0.20 1/123 broken", false, 0},
+		{"pid-positive-sign", "0.75 0.40 0.20 1/123 +42", false, 0},
+		{"pid-negative", "0.75 0.40 0.20 1/123 -42", false, 0},
+		{"pid-fraction", "0.75 0.40 0.20 1/123 42.0", false, 0},
+		{"pid-exponent", "0.75 0.40 0.20 1/123 4e2", false, 0},
+		{"pid-hex", "0.75 0.40 0.20 1/123 0x2a", false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "loadavg")
