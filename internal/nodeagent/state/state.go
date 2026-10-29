@@ -19,6 +19,8 @@ const (
 	stateFile      = "state.json"
 )
 
+var errNoDir = errors.New("state: каталог не задан")
+
 type Store struct{ Dir string }
 
 type Applied struct {
@@ -40,7 +42,7 @@ type NodeState struct {
 // администратора, поэтому «сгенерировать заново» — не восстановление, а поломка.
 func (s *Store) EnsureKey() (string, bool, error) {
 	if s.Dir == "" {
-		return "", false, errors.New("state: каталог не задан")
+		return "", false, errNoDir
 	}
 	path := filepath.Join(s.Dir, privateKeyFile)
 	if _, err := os.Stat(path); err == nil {
@@ -67,7 +69,7 @@ func (s *Store) EnsureKey() (string, bool, error) {
 
 func (s *Store) PrivateKey() (wgtypes.Key, error) {
 	if s.Dir == "" {
-		return wgtypes.Key{}, errors.New("state: каталог не задан")
+		return wgtypes.Key{}, errNoDir
 	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, privateKeyFile))
 	if err != nil {
@@ -85,7 +87,7 @@ func (s *Store) PrivateKey() (wgtypes.Key, error) {
 // отправить узел в enroll без bootstrap-токена и оставить без доступа.
 func (s *Store) Load() (NodeState, error) {
 	if s.Dir == "" {
-		return NodeState{}, errors.New("state: каталог не задан")
+		return NodeState{}, errNoDir
 	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, stateFile))
 	if errors.Is(err, os.ErrNotExist) {
@@ -103,7 +105,7 @@ func (s *Store) Load() (NodeState, error) {
 
 func (s *Store) Save(ns NodeState) error {
 	if s.Dir == "" {
-		return errors.New("state: каталог не задан")
+		return errNoDir
 	}
 	raw, err := json.Marshal(ns)
 	if err != nil {

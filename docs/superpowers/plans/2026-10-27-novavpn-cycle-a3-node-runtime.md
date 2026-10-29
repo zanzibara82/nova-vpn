@@ -1600,10 +1600,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 Состояние переживает рестарт и недоступность API: последний применённый набор и узловой
 токен лежат на диске. Потеря токена означает повторный enroll, а потеря ключа — новый
 публичный ключ и правку сервера у администратора, поэтому ключ не перевыпускается молча,
-а запись атомарная: оборванный процесс не оставляет половину файла. Права файлов `0600` и
-каталога `0700` ставятся и при создании, и при каждом обращении к существующему ключу,
-созданному с более широкими правами; пустой `Dir` отвергается, иначе `chmod` задел бы
-каталог, из которого запущен процесс.
+а запись атомарная: оборванный процесс не оставляет половину файла. Каталог ужесточается до
+`0700` при записи файлов, а существующий ключ — до `0600` при `EnsureKey`; пустой `Dir`
+отвергается, иначе `chmod` задел бы каталог, из которого запущен процесс.
 
 **Files:**
 - Create: `internal/nodeagent/state/state.go`
@@ -1624,6 +1623,7 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 package state
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1639,6 +1639,13 @@ func TestEnsureKeyCreatesOnceAndKeepsMode(t *testing.T) {
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() == 0o700 {
+		t.Fatal("исходный каталог уже 0700: проверка ужесточения не различает")
+	}
 	s := Store{Dir: dir}
 	pub, created, err := s.EnsureKey()
 	if err != nil || !created || pub == "" {
@@ -1648,11 +1655,11 @@ func TestEnsureKeyCreatesOnceAndKeepsMode(t *testing.T) {
 	if err != nil || created2 || pub2 != pub {
 		t.Fatalf("повторный вызов: ключ %q, создан %v, ошибка %v", pub2, created2, err)
 	}
-	info, err := os.Stat(filepath.Join(dir, "node.key"))
+	keyInfo, err := os.Stat(filepath.Join(dir, "node.key"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o600 {
+	if got := keyInfo.Mode().Perm(); got != 0o600 {
 		t.Fatalf("права ключа %o; ожидались 600", got)
 	}
 	dirInfo, err := os.Stat(dir)
@@ -1715,16 +1722,16 @@ func TestEnsureKeyTightensExistingKeyMode(t *testing.T) {
 
 func TestEmptyDirRejected(t *testing.T) {
 	s := Store{}
-	if _, _, err := s.EnsureKey(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+	if _, _, err := s.EnsureKey(); !errors.Is(err, errNoDir) {
 		t.Fatalf("EnsureKey: ошибка %v", err)
 	}
-	if _, err := s.PrivateKey(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+	if _, err := s.PrivateKey(); !errors.Is(err, errNoDir) {
 		t.Fatalf("PrivateKey: ошибка %v", err)
 	}
-	if _, err := s.Load(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+	if _, err := s.Load(); !errors.Is(err, errNoDir) {
 		t.Fatalf("Load: ошибка %v", err)
 	}
-	if err := s.Save(NodeState{}); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+	if err := s.Save(NodeState{}); !errors.Is(err, errNoDir) {
 		t.Fatalf("Save: ошибка %v", err)
 	}
 }
@@ -1848,6 +1855,8 @@ const (
 	stateFile      = "state.json"
 )
 
+var errNoDir = errors.New("state: каталог не задан")
+
 type Store struct{ Dir string }
 
 type Applied struct {
@@ -1869,7 +1878,7 @@ type NodeState struct {
 // администратора, поэтому «сгенерировать заново» — не восстановление, а поломка.
 func (s *Store) EnsureKey() (string, bool, error) {
 	if s.Dir == "" {
-		return "", false, errors.New("state: каталог не задан")
+		return "", false, errNoDir
 	}
 	path := filepath.Join(s.Dir, privateKeyFile)
 	if _, err := os.Stat(path); err == nil {
@@ -1896,7 +1905,7 @@ func (s *Store) EnsureKey() (string, bool, error) {
 
 func (s *Store) PrivateKey() (wgtypes.Key, error) {
 	if s.Dir == "" {
-		return wgtypes.Key{}, errors.New("state: каталог не задан")
+		return wgtypes.Key{}, errNoDir
 	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, privateKeyFile))
 	if err != nil {
@@ -1914,7 +1923,7 @@ func (s *Store) PrivateKey() (wgtypes.Key, error) {
 // отправить узел в enroll без bootstrap-токена и оставить без доступа.
 func (s *Store) Load() (NodeState, error) {
 	if s.Dir == "" {
-		return NodeState{}, errors.New("state: каталог не задан")
+		return NodeState{}, errNoDir
 	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, stateFile))
 	if errors.Is(err, os.ErrNotExist) {
@@ -1932,7 +1941,7 @@ func (s *Store) Load() (NodeState, error) {
 
 func (s *Store) Save(ns NodeState) error {
 	if s.Dir == "" {
-		return errors.New("state: каталог не задан")
+		return errNoDir
 	}
 	raw, err := json.Marshal(ns)
 	if err != nil {
