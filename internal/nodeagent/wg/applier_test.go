@@ -9,16 +9,27 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+type journal struct{ calls []string }
+
+func (j *journal) add(name string) { j.calls = append(j.calls, name) }
+
 type fakeLink struct {
 	links, addrs int
 	failLink     bool
 	failAddr     bool
-	calls        []string
+	log          *journal
+}
+
+func (f *fakeLink) record(name string) {
+	if f.log == nil {
+		f.log = &journal{}
+	}
+	f.log.add(name)
 }
 
 func (f *fakeLink) EnsureLink(string, int) error {
 	f.links++
-	f.calls = append(f.calls, "link")
+	f.record("link")
 	if f.failLink {
 		return errTest
 	}
@@ -27,7 +38,7 @@ func (f *fakeLink) EnsureLink(string, int) error {
 
 func (f *fakeLink) EnsureAddress(string, netip.Prefix) error {
 	f.addrs++
-	f.calls = append(f.calls, "address")
+	f.record("address")
 	if f.failAddr {
 		return errTest
 	}
@@ -41,12 +52,19 @@ type fakeDevice struct {
 	last          wgtypes.Config
 	failSnapshot  bool
 	failConfigure bool
-	calls         []string
+	log           *journal
+}
+
+func (f *fakeDevice) record(name string) {
+	if f.log == nil {
+		f.log = &journal{}
+	}
+	f.log.add(name)
 }
 
 func (f *fakeDevice) Snapshot(string) (LiveState, error) {
 	f.snapshots++
-	f.calls = append(f.calls, "snapshot")
+	f.record("snapshot")
 	if f.failSnapshot {
 		return LiveState{}, errTest
 	}
@@ -55,7 +73,7 @@ func (f *fakeDevice) Snapshot(string) (LiveState, error) {
 
 func (f *fakeDevice) Configure(_ string, cfg wgtypes.Config) error {
 	f.configure++
-	f.calls = append(f.calls, "configure")
+	f.record("configure")
 	f.last = cfg
 	if f.failConfigure {
 		return errTest
@@ -97,14 +115,15 @@ func TestApplyDoesNotTouchUnchangedPeers(t *testing.T) {
 	priv := newKey(t)
 	peer := newKey(t)
 	target := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
-	dev := &fakeDevice{state: LiveState{Peers: map[string]PeerState{
+	log := &journal{}
+	dev := &fakeDevice{log: log, state: LiveState{Peers: map[string]PeerState{
 		peer.PublicKey().String(): {
 			PublicKey:    peer.PublicKey().String(),
 			AllowedIPs:   []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
 			KeepaliveSec: 25,
 		},
 	}}}
-	link := &fakeLink{}
+	link := &fakeLink{log: log}
 	res, err := (&Applier{Link: link, Device: dev, Iface: "wg0"}).Apply(target)
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +134,7 @@ func TestApplyDoesNotTouchUnchangedPeers(t *testing.T) {
 	if link.links != 1 || link.addrs != 1 || dev.snapshots != 1 {
 		t.Fatalf("интерфейс %d, адрес %d, снимков %d; ожидалось 1/1/1", link.links, link.addrs, dev.snapshots)
 	}
-	if got := strings.Join(append(link.calls, dev.calls...), ","); got != "link,address,snapshot" {
+	if got := strings.Join(log.calls, ","); got != "link,address,snapshot" {
 		t.Fatalf("порядок вызовов %q; ожидался link,address,snapshot", got)
 	}
 }
@@ -124,13 +143,14 @@ func TestApplyRemovesAndAdds(t *testing.T) {
 	priv := newKey(t)
 	add := newKey(t)
 	drop := newKey(t)
-	dev := &fakeDevice{state: LiveState{Peers: map[string]PeerState{
+	log := &journal{}
+	dev := &fakeDevice{log: log, state: LiveState{Peers: map[string]PeerState{
 		drop.PublicKey().String(): {
 			PublicKey:  drop.PublicKey().String(),
 			AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.3/32")},
 		},
 	}}}
-	link := &fakeLink{}
+	link := &fakeLink{log: log}
 	res, err := (&Applier{Link: link, Device: dev, Iface: "wg0"}).
 		Apply(targetFor(priv, peerFrom(add, "10.99.0.2/32", 25)))
 	if err != nil {
@@ -139,7 +159,7 @@ func TestApplyRemovesAndAdds(t *testing.T) {
 	if res.Ops != 2 || dev.configure != 1 {
 		t.Fatalf("операций %d, configure %d; ожидалось 2/1", res.Ops, dev.configure)
 	}
-	if got := strings.Join(append(link.calls, dev.calls...), ","); got != "link,address,snapshot,configure" {
+	if got := strings.Join(log.calls, ","); got != "link,address,snapshot,configure" {
 		t.Fatalf("порядок вызовов %q; ожидался link,address,snapshot,configure", got)
 	}
 	if dev.last.ReplacePeers {
@@ -263,6 +283,10 @@ func TestApplyRejectsBrokenKeyWithEmptyDelta(t *testing.T) {
 			KeepaliveSec: 25,
 		},
 	}}}
+	ops, err := Diff(dev.state, target.Peers)
+	if err != nil || len(ops) != 0 {
+		t.Fatalf("предусловие нарушено: дельта %d операций, ошибка %v", len(ops), err)
+	}
 	res, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).Apply(target)
 	if err == nil {
 		t.Fatal("неверный ключ принят при пустой дельте")
