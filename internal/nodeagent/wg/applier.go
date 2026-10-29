@@ -20,6 +20,10 @@ type ApplyResult struct {
 	Ops    int
 }
 
+func (a *Applier) Snapshot() (LiveState, error) {
+	return a.Device.Snapshot(a.Iface)
+}
+
 func (a *Applier) Apply(t Target) (ApplyResult, error) {
 	if err := a.Link.EnsureLink(a.Iface, t.MTU); err != nil {
 		return ApplyResult{}, fmt.Errorf("wg: применение: интерфейс: %w", err)
@@ -42,7 +46,7 @@ func (a *Applier) Apply(t Target) (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("wg: применение: конфигурация: %w", err)
 	}
-	if len(ops) == 0 {
+	if len(ops) == 0 && before.PublicKey == cfg.PrivateKey.PublicKey().String() && before.ListenPort == *cfg.ListenPort {
 		return ApplyResult{Before: before}, nil
 	}
 	if err := a.Device.Configure(a.Iface, cfg); err != nil {

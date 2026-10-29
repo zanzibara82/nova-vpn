@@ -1179,7 +1179,7 @@ EOF
 
 ---
 
-### Task 5: Применение набора — порядок, снимок до изменений, ноль обращений при пустой дельте
+### Task 5: Применение набора — снимок до изменений и проверка параметров устройства
 
 **Files:**
 - Create: `internal/nodeagent/wg/applier.go`
@@ -1190,16 +1190,22 @@ EOF
 - Consumes: `wg.LinkManager`, `wg.DeviceClient`, `wg.Diff`, `wg.ConfigFor`.
 - Produces: `wg.Applier{Link LinkManager; Device DeviceClient; Iface string}`,
   `wg.ApplyResult{Before LiveState; Ops int}`,
-  `(*Applier).Apply(t Target) (ApplyResult, error)`.
+  `(*Applier).Apply(t Target) (ApplyResult, error)`, `(*Applier).Snapshot() (LiveState, error)`.
 
 Порядок шагов задан ADR-004: интерфейс и адрес, затем снимок, затем дельта, затем
 `Configure`. Снимок обязан быть до `Configure`, потому что пересоздание пиера
-обнуляет счётчики в ядре. Пустая дельта не вызывает `Configure` вовсе, но
-`ConfigFor` вызывается всегда: он проверяет приватный ключ и при неизменных пирах.
+обнуляет счётчики в ядре. По R6 пустая дельта пропускает `Configure` только при
+совпадении публичной половины приватного ключа и порта устройства. Иначе применяется
+конфигурация с пустым `Peers` и `ReplacePeers=false`; `Ops` остаётся числом операций
+пиеров и может быть нулём при вызове `Configure`. `ConfigFor` вызывается всегда.
+По R9 метод `Snapshot` делегирует `Device.Snapshot(Iface)` без `Link` и `Configure`.
 
 - [ ] **Step 1: Написать падающий тест**
 
-Используй ровно этот исходник `internal/nodeagent/wg/applier_test.go`:
+Базовые тесты `internal/nodeagent/wg/applier_test.go` приведены ниже. В Task 8 они
+дополнены `TestApplyConfiguresDeviceWithEmptyPeerDelta` (первый пустой набор, смена
+порта, смена ключа) и `TestApplierSnapshotDelegatesWithoutChanges` (снимок и ошибка,
+точное имя интерфейса, отсутствие изменений). Актуальный полный исходник — в файле.
 
 ```go
 package wg
@@ -1320,7 +1326,7 @@ func TestApplyDoesNotTouchUnchangedPeers(t *testing.T) {
 	peer := newKey(t)
 	target := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
 	log := &journal{}
-	dev := &fakeDevice{log: log, state: LiveState{Peers: map[string]PeerState{
+	dev := &fakeDevice{log: log, state: LiveState{PublicKey: priv.PublicKey().String(), ListenPort: 51820, Peers: map[string]PeerState{
 		peer.PublicKey().String(): {
 			PublicKey:    peer.PublicKey().String(),
 			AllowedIPs:   []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
@@ -1540,6 +1546,10 @@ type ApplyResult struct {
 	Ops    int
 }
 
+func (a *Applier) Snapshot() (LiveState, error) {
+	return a.Device.Snapshot(a.Iface)
+}
+
 func (a *Applier) Apply(t Target) (ApplyResult, error) {
 	if err := a.Link.EnsureLink(a.Iface, t.MTU); err != nil {
 		return ApplyResult{}, fmt.Errorf("wg: применение: интерфейс: %w", err)
@@ -1562,7 +1572,7 @@ func (a *Applier) Apply(t Target) (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("wg: применение: конфигурация: %w", err)
 	}
-	if len(ops) == 0 {
+	if len(ops) == 0 && before.PublicKey == cfg.PrivateKey.PublicKey().String() && before.ListenPort == *cfg.ListenPort {
 		return ApplyResult{Before: before}, nil
 	}
 	if err := a.Device.Configure(a.Iface, cfg); err != nil {
@@ -1578,8 +1588,9 @@ func (a *Applier) Apply(t Target) (ApplyResult, error) {
 - [ ] **Step 4: Прогнать тесты**
 
 Run: focused `make unit` по пакету с `-mod=readonly`, затем полные `unit` и `vet`.
-Expected: PASS, девять тестов `Applier`: проверены порядок вызовов, отказ адреса и
-отказ неверного ключа при пустой дельте; полный прогон без новых падений.
+Expected: PASS, 11 функций тестов `Applier`, включая два дополнения Task 8 с пятью
+подтестами R6/R9. Проверены порядок вызовов, отказ адреса, проверка неверного ключа
+при пустой дельте, параметры устройства и делегирование снимка.
 
 - [ ] **Step 5: Коммит**
 
@@ -2680,460 +2691,140 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 ### Task 8: Цикл узла — опрос, применение, отчёты, `stale`, ротация токена
 
+Актуальная семантика R6/R9/R33–R35 заменяет прежние шесть тестов и дословный блок.
+Полный исполняемый код и тесты находятся в файлах ниже, без второй копии исходников.
+
 **Files:**
 - Create: `internal/nodeagent/runtime/runner.go`, `internal/nodeagent/runtime/runner_test.go`
+- Modify: `internal/nodeagent/wg/applier.go`, `internal/nodeagent/wg/applier_test.go` — Snapshot и R6
+- Modify: этот план — только Task 5 и Task 8; `docs/testing-status.md` — три новых not-run
 
 **Interfaces:**
-- Consumes: `api.Client`, `wg.Applier`, `state.Store`.
-- Produces: `runtime.API`, `runtime.Applier`, `runtime.Store` (интерфейсы),
-  `runtime.Runner`, `(*Runner).Step(ctx) error`, `(*Runner).Run(ctx) error`.
-
-- [ ] **Step 1: Написать падающие тесты**
-
-`internal/nodeagent/runtime/runner_test.go` — fake-реализации и шесть сценариев:
 
 ```go
-package runtime
-
-import (
-	"context"
-	"errors"
-	"io"
-	"log/slog"
-	"testing"
-	"time"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"github.com/novavpn/novavpn/internal/nodeagent/api"
-	"github.com/novavpn/novavpn/internal/nodeagent/state"
-	"github.com/novavpn/novavpn/internal/nodeagent/wg"
-)
-
-type fakeAPI struct {
-	set         api.DesiredSet
-	etag        string
-	notModified bool
-	desiredErr  error
-	observed    int
-	heartbeats  []api.Heartbeat
-	rotated     int
-	etags       []string
-}
-
-func (f *fakeAPI) Desired(_ context.Context, _ string, etag string) (api.DesiredSet, string, bool, error) {
-	f.etags = append(f.etags, etag)
-	return f.set, f.etag, f.notModified, f.desiredErr
-}
-func (f *fakeAPI) Observed(context.Context, string, api.ObservedReport) error {
-	f.observed++
-	return nil
-}
-func (f *fakeAPI) Heartbeat(_ context.Context, _ string, hb api.Heartbeat) error {
-	f.heartbeats = append(f.heartbeats, hb)
-	return nil
-}
-func (f *fakeAPI) RotateToken(context.Context, string) (api.NodeToken, error) {
-	f.rotated++
-	return api.NodeToken{ServerID: "s", NodeToken: "new"}, nil
-}
-
-type fakeApplier struct {
-	calls int
-	err   error
-}
-
-func (f *fakeApplier) Apply(wg.Target) (wg.ApplyResult, error) {
-	f.calls++
-	return wg.ApplyResult{}, f.err
-}
-
-type fakeStore struct {
-	ns    state.NodeState
-	saves int
-}
-
-func (f *fakeStore) Load() (state.NodeState, error) { return f.ns, nil }
-func (f *fakeStore) Save(ns state.NodeState) error  { f.ns = ns; f.saves++; return nil }
-func (f *fakeStore) PrivateKey() (wgtypes.Key, error) {
-	return wgtypes.GeneratePrivateKey()
-}
-
-func newRunner(a *fakeAPI, ap *fakeApplier, s *fakeStore) *Runner {
-	return &Runner{
-		API: a, Applier: ap, Store: s, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Iface: "wg0", Interval: 25 * time.Second, TokenTTL: 24 * time.Hour,
-		Version: "test", Now: time.Now, started: time.Now(),
-	}
-}
-
-func validSet() api.DesiredSet {
-	return api.DesiredSet{
-		ServerID: "s", ConfigVersion: 7, MTU: 1420, ListenPort: 51820,
-		TunnelAddress: "10.99.0.1/24", DNSServers: []string{"10.99.0.1"}, KeepaliveSec: 25,
-		Peers: []api.DesiredPeer{{
-			PublicKey:  "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
-			AllowedIPs: []string{"10.99.0.2/32"}, State: "active",
-		}},
-	}
-}
-
-// TestStepFirstPollIgnoresStoredETag — сохранённый ETag относится к прошлому
-// запуску. После перезагрузки интерфейс пуст, и ответ 304 оставил бы узел без
-// пиеров до следующего изменения набора на сервере. Первый опрос обязан идти
-// без ETag, второй — с полученным.
-func TestStepFirstPollIgnoresStoredETag(t *testing.T) {
-	a := &fakeAPI{set: validSet(), etag: `"e2"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{
-		ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now(),
-		Applied: state.Applied{ConfigVersion: 6, ETag: `"e1"`},
-	}}
-	r := newRunner(a, ap, s)
-	for i := 0; i < 2; i++ {
-		if err := r.Step(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(a.etags) != 2 || a.etags[0] != "" || a.etags[1] != `"e2"` {
-		t.Fatalf("etags = %q, want [\"\", \"e2\"]", a.etags)
-	}
-	if ap.calls != 2 {
-		t.Fatalf("apply calls = %d, want 2: полный набор обязан примениться на первом опросе", ap.calls)
-	}
-}
-
-func TestStepAppliesAndSaves(t *testing.T) {
-	a := &fakeAPI{set: validSet(), etag: `"e1"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if ap.calls != 1 || a.observed != 1 || s.ns.Applied.ConfigVersion != 7 || s.ns.Applied.ETag != `"e1"` {
-		t.Fatalf("calls=%d observed=%d state=%+v", ap.calls, a.observed, s.ns.Applied)
-	}
-	if len(a.heartbeats) != 1 || a.heartbeats[0].Stale {
-		t.Fatalf("heartbeats = %+v", a.heartbeats)
-	}
-}
-
-func TestStepOnNotModifiedDoesNotTouchDevice(t *testing.T) {
-	a := &fakeAPI{notModified: true, etag: `"e1"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if ap.calls != 0 || a.observed != 0 || len(a.heartbeats) != 1 {
-		t.Fatalf("calls=%d observed=%d hb=%d", ap.calls, a.observed, len(a.heartbeats))
-	}
-}
-
-func TestStepReportsStaleWhenDesiredFails(t *testing.T) {
-	a := &fakeAPI{desiredErr: errors.New("нет сети")}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if ap.calls != 0 || len(a.heartbeats) != 1 || !a.heartbeats[0].Stale {
-		t.Fatalf("calls=%d heartbeats=%+v", ap.calls, a.heartbeats)
-	}
-}
-
-func TestStepDoesNotReportObservedWhenApplyFails(t *testing.T) {
-	a := &fakeAPI{set: validSet(), etag: `"e1"`}
-	ap := &fakeApplier{err: errors.New("нет прав")}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if a.observed != 0 || s.ns.Applied.ConfigVersion != 0 {
-		t.Fatalf("observed=%d state=%+v", a.observed, s.ns.Applied)
-	}
-}
-
-func TestStepRotatesTokenAfterTTL(t *testing.T) {
-	a := &fakeAPI{notModified: true, etag: `"e1"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "old", TokenIssuedAt: time.Now().Add(-25 * time.Hour)}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if a.rotated != 1 || s.ns.NodeToken != "new" {
-		t.Fatalf("rotated=%d token=%q", a.rotated, s.ns.NodeToken)
-	}
-}
-```
-
-- [ ] **Step 2: Прогнать и убедиться, что не компилируется**
-
-Run: `make unit`
-Expected: FAIL — `undefined: Runner`.
-
-- [ ] **Step 3: Реализовать `runner.go` (дословный исходник)**
-
-`delay` задаёт только ожидание между шагами: при 25 с и jitter ±10 % оно не превышает
-27,5 с. В бюджет 2,5 с для отзыва входят остаток текущего `Step`, доставка, обработка
-и применение следующего набора. Длительность `delay` не доказывает SLA: в runtime/E2E
-нужен сквозной замер от фиксации отзыва сразу после снимка desired до удаления пиера
-при максимальном jitter и контролируемых задержках ответа и применения (§4.3).
-
-```go
-// Package runtime — цикл жизни узла: получить desired set, применить дельту,
-// отчитаться, пережить недоступность API. Никакой сети и никакого netlink здесь
-// нет: оба спрятаны за интерфейсами, поэтому весь цикл проверяется на fake.
-package runtime
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"log/slog"
-	"math/rand/v2"
-	"net/netip"
-	"os"
-	"strconv"
-	"strings"
-	"time"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"github.com/novavpn/novavpn/internal/nodeagent/api"
-	"github.com/novavpn/novavpn/internal/nodeagent/state"
-	"github.com/novavpn/novavpn/internal/nodeagent/wg"
-)
-
 type API interface {
-	Desired(ctx context.Context, serverID, etag string) (api.DesiredSet, string, bool, error)
-	Observed(ctx context.Context, serverID string, rep api.ObservedReport) error
-	Heartbeat(ctx context.Context, serverID string, hb api.Heartbeat) error
-	RotateToken(ctx context.Context, serverID string) (api.NodeToken, error)
+    SetToken(string)
+    Desired(context.Context, string, string) (api.DesiredSet, string, bool, error)
+    Observed(context.Context, string, api.ObservedReport) error
+    Heartbeat(context.Context, string, api.Heartbeat) error
+    RotateToken(context.Context, string) (api.NodeToken, error)
 }
-
 type Applier interface {
-	Apply(t wg.Target) (wg.ApplyResult, error)
+    Apply(wg.Target) (wg.ApplyResult, error)
+    Snapshot() (wg.LiveState, error)
 }
-
 type Store interface {
-	Load() (state.NodeState, error)
-	Save(state.NodeState) error
-	PrivateKey() (wgtypes.Key, error)
-}
-
-type Runner struct {
-	API       API
-	Applier   Applier
-	Store     Store
-	Log       *slog.Logger
-	Iface     string
-	Interval  time.Duration
-	TokenTTL  time.Duration
-	Version   string
-	Now       func() time.Time
-	started   time.Time
-	// reconciled — набор уже применён в этом процессе. До первого применения
-	// сохранённый ETag не отправляется: он описывает прошлый запуск, а интерфейс
-	// после перезагрузки может быть пуст.
-	reconciled bool
-}
-
-func (r *Runner) Run(ctx context.Context) error {
-	if r.started.IsZero() {
-		r.started = r.Now()
-	}
-	for {
-		if err := r.Step(ctx); err != nil {
-			r.Log.Error("шаг узла не выполнен", "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(r.delay()):
-		}
-	}
-}
-
-// delay — ожидание 25 с ±10 %, до 27,5 с; это не сквозное время отзыва (§4.3).
-func (r *Runner) delay() time.Duration {
-	base := r.Interval
-	if base <= 0 {
-		base = 25 * time.Second
-	}
-	return base + time.Duration(rand.Int64N(int64(base)/5)) - base/10
-}
-
-func (r *Runner) Step(ctx context.Context) error {
-	st, err := r.Store.Load()
-	if err != nil {
-		return err
-	}
-	if st.ServerID == "" || st.NodeToken == "" {
-		return errors.New("runtime: узел не зарегистрирован: выполните enroll")
-	}
-	sentETag := st.Applied.ETag
-	if !r.reconciled {
-		sentETag = ""
-	}
-	set, etag, notModified, err := r.API.Desired(ctx, st.ServerID, sentETag)
-	if err != nil {
-		r.Log.Warn("desired set недоступен, держим последний набор", "error", err)
-		r.sendHeartbeat(ctx, st, true)
-		return nil
-	}
-	if notModified {
-		r.reconciled = true
-		r.sendHeartbeat(ctx, st, false)
-		return r.maybeRotate(ctx, &st)
-	}
-	key, err := r.Store.PrivateKey()
-	if err != nil {
-		return err
-	}
-	target, err := targetFrom(set, key.String())
-	if err != nil {
-		return err
-	}
-	res, err := r.Applier.Apply(target)
-	if err != nil {
-		r.Log.Error("применение набора не удалось", "error", err)
-		r.sendHeartbeat(ctx, st, false)
-		return nil
-	}
-	r.reconciled = true
-	st.Applied = state.Applied{
-		ConfigVersion: set.ConfigVersion, ETag: etag, AppliedAt: r.Now().UTC(), Peers: len(set.Peers),
-	}
-	if err := r.Store.Save(st); err != nil {
-		return err
-	}
-	if err := r.API.Observed(ctx, st.ServerID, report(set.ConfigVersion, res.Before)); err != nil {
-		r.Log.Warn("отчёт observed не принят", "error", err)
-	}
-	r.sendHeartbeat(ctx, st, false)
-	return r.maybeRotate(ctx, &st)
-}
-
-// maybeRotate меняет узловой токен заранее, а не после отказа: отозванный токен
-// не даёт выполнить ротацию, и узел остался бы без доступа до ручного enroll.
-func (r *Runner) maybeRotate(ctx context.Context, st *state.NodeState) error {
-	ttl := r.TokenTTL
-	if ttl <= 0 {
-		ttl = 24 * time.Hour
-	}
-	if r.Now().Sub(st.TokenIssuedAt) < ttl {
-		return nil
-	}
-	tok, err := r.API.RotateToken(ctx, st.ServerID)
-	if err != nil {
-		return fmt.Errorf("runtime: ротация токена: %w", err)
-	}
-	st.NodeToken = tok.NodeToken
-	st.TokenIssuedAt = r.Now().UTC()
-	return r.Store.Save(*st)
-}
-
-func (r *Runner) sendHeartbeat(ctx context.Context, st state.NodeState, stale bool) {
-	hb := api.Heartbeat{
-		AgentVersion: r.Version, AppliedConfigVersion: st.Applied.ConfigVersion, Stale: stale,
-		AgentUptimeSec: int64(r.Now().Sub(r.started).Seconds()),
-		Load1:          load1(),
-		// CPUPct остаётся null: честный процент требует окна между двумя замерами
-		// /proc/stat, а подставлять «примерно» запрещено ADR-006.
-	}
-	if err := r.API.Heartbeat(ctx, st.ServerID, hb); err != nil {
-		r.Log.Warn("heartbeat не принят", "error", err)
-	}
-}
-
-func targetFrom(set api.DesiredSet, privateKey string) (wg.Target, error) {
-	addr, err := netip.ParsePrefix(set.TunnelAddress)
-	if err != nil {
-		return wg.Target{}, fmt.Errorf("runtime: tunnel_address %q: %w", set.TunnelAddress, err)
-	}
-	peers := make([]wg.TargetPeer, 0, len(set.Peers))
-	for _, p := range set.Peers {
-		ips := make([]netip.Prefix, 0, len(p.AllowedIPs))
-		for _, raw := range p.AllowedIPs {
-			prefix, err := netip.ParsePrefix(raw)
-			if err != nil {
-				return wg.Target{}, fmt.Errorf("runtime: allowed ip %q: %w", raw, err)
-			}
-			ips = append(ips, prefix)
-		}
-		kind := wg.PeerKind(p.State)
-		if kind != wg.StateActive && kind != wg.StateRotatingOldKey {
-			return wg.Target{}, fmt.Errorf("runtime: пиер %s: неизвестное состояние %q", p.PublicKey, p.State)
-		}
-		peers = append(peers, wg.TargetPeer{
-			PublicKey: p.PublicKey, AllowedIPs: ips, KeepaliveSec: set.KeepaliveSec, State: kind,
-		})
-	}
-	return wg.Target{
-		PrivateKey: privateKey, ListenPort: set.ListenPort, MTU: set.MTU,
-		TunnelAddress: addr, Peers: peers,
-	}, nil
-}
-
-func report(version int64, before wg.LiveState) api.ObservedReport {
-	out := api.ObservedReport{
-		ConfigVersion: version, InterfaceRxBytes: before.IfaceRxBytes,
-		InterfaceTxBytes: before.IfaceTxBytes, Peers: make([]api.ObservedPeer, 0, len(before.Peers)),
-	}
-	for _, p := range before.Peers {
-		var hs *time.Time
-		if !p.LastHandshake.IsZero() {
-			t := p.LastHandshake.UTC()
-			hs = &t
-		}
-		out.Peers = append(out.Peers, api.ObservedPeer{
-			PublicKey: p.PublicKey, LatestHandshake: hs, RxBytes: p.RxBytes, TxBytes: p.TxBytes,
-		})
-	}
-	slices.SortFunc(out.Peers, func(a, b api.ObservedPeer) int { return strings.Compare(a.PublicKey, b.PublicKey) })
-	return out
-}
-
-func load1() *float64 {
-	raw, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return nil
-	}
-	fields := strings.Fields(string(raw))
-	if len(fields) == 0 {
-		return nil
-	}
-	v, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil {
-		return nil
-	}
-	return &v
+    Load() (state.NodeState, error)
+    Save(state.NodeState) error
+    PrivateKey() (wgtypes.Key, error)
 }
 ```
 
-Добавить импорт `slices` к списку выше; в блоке кода он пропущен намеренно, чтобы
-исполнитель не забыл: без него `report` не компилируется.
+`Runner` содержит `API`, `Applier`, `Store`, `Log *slog.Logger`, `Iface string`,
+`Interval/TokenTTL time.Duration`, `Version string`, `Now func() time.Time`,
+`started time.Time`, `reconciled bool`, `after func(time.Duration) <-chan time.Time`,
+`pendingState *state.NodeState`. Методы: `Step(context.Context) error` и
+`Run(context.Context) error`. Зависимости задаёт вызывающий; конструктор, проверки
+nil, отдельные горутины и общий планировщик не нужны. Runner и API принадлежат
+одной горутине. При nil `after` используется `time.After`.
 
-Остаточное ограничение, которое надо записать в задаче 13 (спецификация §13) и в
-`docs/testing-status.md` (задача 18), а не «починить» здесь: если набор на сервере не
-менялся, узел получает 304 и устройство не трогает. Внешняя правка интерфейса руками при
-живом агенте поэтому живёт до следующего изменения набора. Проверять живое состояние
-каждый цикл — это уже другой режим (полный опрос вместо ETag) и лишний netlink каждые
-25 с; в A-3 его нет.
+- [x] **Step 1: Написать тесты до реализации**
 
-- [ ] **Step 4: Прогнать тесты**
+В `runner_test.go` 25 функций тестов, помимо проверок совместимости интерфейсов при
+компиляции. Табличные случаи не подменяют проверку значений счётчиками вызовов:
 
-Run: `make unit`
-Expected: PASS, включая шесть тестов `Step`.
+- `TestStepAppliesFullSetAndReportsBefore`, `TestStepAcceptsEmptySetAndZeroVersion`:
+  первый ETag пуст, следующий сохранён; точные Target, Applied, Before и heartbeat.
+- `TestStep304UsesFreshSnapshotWithoutApplying`, `TestStepRejectsUnconditional304`,
+  `TestStepSnapshotFailureDoesNotReportZeros`: свежие счётчики, запрет Apply/Save,
+  отказ холодного 304 и условного запроса без ETag, отсутствие отчёта при ошибке снимка.
+- `TestStepDesiredFailurePreservesStateAndSkipsRotation`,
+  `TestStepRejectsForeignOrUnusableSet`, `TestStepStopsOnLoadOrRegistrationFailure`:
+  отказы desired, чужой узел, неверные адреса/состояние, ошибки чтения и регистрации.
+- `TestStepApplyFailureDoesNotAcknowledgeNewETag`,
+  `TestStepAppliedSaveFailureForcesFullRetry`,
+  `TestStepReportingFailuresDoNotBlockHeartbeatOrRotation`: сохранение прежней версии,
+  полный повтор после ошибки записи, независимые отказы отчётов.
+- `TestTokenRotationThresholdAndNextDesiredToken`, `TestTokenRotationOn304`,
+  `TestTokenRotationRejectsAPIErrorAndInvalidResponses`,
+  `TestTokenSaveRetryPrecedesAnyHTTPAndNeverReloadsOldToken`: границы TTL, проверка
+  токена следующего запроса, неверный ответ, активация до Save и восстановление записи.
+- `TestTargetFromPreservesHostAndPeerStates`, `TestTargetFromErrorsDoNotQuoteInput`,
+  `TestReportSortsCountersAndEncodesUnknownHandshake`: адрес хоста, несколько адресов,
+  состояния пиров, сортировка, разные счётчики, UTC, JSON null и пустой массив.
+- `TestHeartbeatUsesActualProcLoad`, `TestReadLoad1FromFiles`: настоящий /proc,
+  временные файлы, пустой/испорченный/отсутствующий файл, NaN/Inf/отрицательная нагрузка.
+- `TestStepHonorsCancellationBeforeAllWork`,
+  `TestRunHonorsCancellationBeforeStepAndDuringWait`,
+  `TestRunContinuesAfterErrorAndSubtractsStepDuration`, `TestDelayBoundsAndTinyIntervals`:
+  отмена, продолжение после отказа, последовательность, вычитание времени шага,
+  длинный шаг без наверстывания и малые интервалы без sleep.
+- `TestRunnerLogsNeverIncludeDependencySecrets`: безопасная диагностика всех
+  зависимостей и Run; ключи и тестовые токены создаются во время выполнения.
 
-- [ ] **Step 5: Коммит**
+Дополнения `applier_test.go` описаны в Task 5: два новых теста с пятью подтестами.
+Проверка фактической нагрузки добавлена как положительная проверка уже работающего
+поведения; искусственного RED для неё нет.
 
-```bash
-git add internal/nodeagent/runtime
-git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
-  commit -m "feat(a3): цикл узла — опрос 25 с, применение, stale и ротация токена"
-```
+- [x] **Step 2: Зафиксировать RED**
+
+Сначала focused `make unit` для всех пакетов `internal/nodeagent`: три случая
+параметров устройства падают из-за отсутствия Configure, два случая снимка — из-за
+отсутствия Snapshot. После исправления R6/R9 — GREEN. Затем тесты нового runtime
+дают ожидаемые ошибки `undefined: Runner`, интерфейсов и функций преобразования.
+Старые журналы содержат FAIL и `make: Error 1`, но не сохраняют итоговый exit_code
+обёртки. Это ограничение доказательств отмечено в отчёте; свежие проверки сохраняют
+код исходной команды и не заменяют прежние журналы.
+
+- [x] **Step 3: Реализовать `runner.go`**
+
+1. Step проверяет отмену до работы и инициализирует started через Now. Отложенная
+   запись токена повторяется до Load и HTTP. Незарегистрированное состояние — ошибка.
+2. Перед desired вызывается SetToken. Сохранённый ETag отправляется лишь после
+   успешных Apply и Save в этом процессе. Ошибка desired сохраняет состояние,
+   отправляет stale=true и не запускает применение или ротацию.
+3. 304 без reconciled и непустого отправленного ETag отвергается. Корректный 304
+   вызывает только Snapshot; отчёт свежий, версия сохранённая, Configure запрещён.
+   Ошибка снимка возвращается без Observed, heartbeat остаётся stale=false.
+4. Полный набор проверяется на свой ServerID до ключа и Apply. Нулевая версия и
+   пустой набор допустимы. targetFrom принимает wgtypes.Key, сохраняет адрес хоста
+   и переносит параметры пиров; ошибки безопасные, непригодный набор даёт stale=true.
+5. При ошибке Apply нет нового Applied/ETag и Observed, heartbeat сообщает прежнюю
+   версию со stale=false. При успехе Save пишет Applied с UTC; ошибка записи сбрасывает
+   reconciled, возвращается без отчёта об успехе, следующий запрос снова полный.
+6. Observed берёт Before, сортирует пиеров по PublicKey, передаёт UTC/null для
+   handshake и [] для пустого списка. Его ошибка не мешает heartbeat и ротации.
+   Heartbeat передаёт uptime, версию и фактический load1; cpu_pct всегда null.
+7. Ротация после успешного цикла: TTL по умолчанию 24 часа при значении <=0,
+   порог включителен. Непустой токен прежнего узла активируется через SetToken до Save.
+   При отказе записи новый NodeState остаётся в pendingState; повтор не загружает
+   старый токен и не выполняет HTTP до успешной записи.
+8. Run делает первый Step сразу. Следующее ожидание равно max(0, interval с jitter
+   ±10% минус время Step). Базовый интервал 25 с при значении <=0. Нет перекрытия,
+   наверстывания пропущенных интервалов или остановки на обычной ошибке Step.
+   Отмена проверяется перед шагом и во время ожидания. Журнал не получает сырые ошибки.
+
+Ограничения: свежий Snapshot на 304 не исправляет внешнюю правку ядра при неизменном
+ETag; авария процесса между серверным отзывом старого токена и записью нового не
+устранена. Сквозной срок отзыва <=30 с требует живого runtime/E2E замера в задаче 13,
+а не только проверки jitter. Все три сценария отмечены отдельно в testing-status.
+
+- [x] **Step 4: Полные ворота перед коммитом**
+
+Свежий focused `make unit` проверил все четыре пакета узла; итоговые `make unit` и
+`make vet` выполнены по всему репозиторию с `GOFLAGS=-mod=readonly`, `CGO_ENABLED=0`
+и образом `golang:1.25-alpine`. Коды выхода 0 сохранены в task-8-finish-focused.log,
+task-8-finish-unit.log и task-8-finish-vet.log рядом с постановкой. Проверены gofmt,
+diff/index, неизменность go.mod/go.sum и алфавит новых строк. Живые проверки и старые
+статусы не выдаются за свежие прогоны.
+
+- [x] **Step 5: Один локальный коммит**
+
+В коммит включены только перечисленные шесть файлов кода, тестов и документов.
+Автор и коммитер заданы через GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL и
+GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL (NovaVPN Dev, dev@novavpn.local), сообщение
+через HEREDOC. Git config не меняется; amend, push и merge не выполняются.
+Полный отчёт с хешем коммита — task-8-report.md рядом с постановкой.
 
 ---
 
