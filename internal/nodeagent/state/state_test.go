@@ -17,6 +17,9 @@ func TestEnsureKeyCreatesOnceAndKeepsMode(t *testing.T) {
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	info, err := os.Stat(dir)
 	if err != nil {
 		t.Fatal(err)
