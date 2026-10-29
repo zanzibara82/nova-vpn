@@ -174,10 +174,19 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var hb telemetry.Heartbeat
-	if !h.decode(w, r, &hb, reportMaxBody) {
+	var input struct {
+		telemetry.Heartbeat
+		Stale *bool `json:"stale"`
+	}
+	if !h.decode(w, r, &input, reportMaxBody) {
 		return
 	}
+	if input.Stale == nil {
+		h.reportRefused(w, r, telemetry.ErrInvalidReport, "heartbeat")
+		return
+	}
+	hb := input.Heartbeat
+	hb.Stale = *input.Stale
 	if err := h.tel.IngestHeartbeat(r.Context(), cred.serverID, hb, time.Now().UTC()); err != nil {
 		h.reportRefused(w, r, err, "heartbeat")
 		return

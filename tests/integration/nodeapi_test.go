@@ -843,7 +843,7 @@ func TestNodeDesiredETagAndFieldNames(t *testing.T) {
 	if !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) || len(etag) < 3 {
 		t.Fatalf("ETag %q не в кавычках по RFC 9110", etag)
 	}
-	if got, want := keyNames(t, set), []string{"config_version", "dns_servers", "keepalive_sec", "listen_port", "measured_at", "mtu", "peers", "server_id"}; !slices.Equal(got, want) {
+	if got, want := keyNames(t, set), []string{"config_version", "dns_servers", "keepalive_sec", "listen_port", "measured_at", "mtu", "peers", "server_id", "tunnel_address"}; !slices.Equal(got, want) {
 		t.Errorf("имена полей desired = %v, want %v", got, want)
 	}
 	if got, want := peerKeyNames(t, set), []string{"allowed_ips", "expires_at", "public_key", "state"}; !slices.Equal(got, want) {

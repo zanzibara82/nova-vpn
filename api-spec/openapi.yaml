@@ -1867,6 +1867,7 @@ components:
         - config_version
         - mtu
         - listen_port
+        - tunnel_address
         - dns_servers
         - keepalive_sec
         - peers
@@ -1876,6 +1877,9 @@ components:
         config_version: { type: integer, format: int64 }
         mtu: { type: integer }
         listen_port: { type: integer }
+        tunnel_address:
+          type: string
+          description: "Адрес узла в туннеле с маской пула, например 10.99.7.1/24"
         dns_servers:
           type: array
           items: { type: string }
@@ -1914,10 +1918,15 @@ components:
         tx_bytes: { type: integer, format: int64, maximum: 1125899906842624 }
     Heartbeat:
       type: object
-      required: [agent_version, agent_uptime_sec, load1, cpu_pct, applied_config_version]
+      required: [agent_version, agent_uptime_sec, load1, cpu_pct, applied_config_version, stale]
       properties:
         agent_version: { type: string }
         agent_uptime_sec: { type: integer, format: int64 }
         load1: { type: ["number", "null"], description: "null — не измеряли" }
         cpu_pct: { type: ["number", "null"], description: "null — не измеряли" }
         applied_config_version: { type: integer, format: int64 }
+        stale:
+          type: boolean
+          description: >
+            true — последний desired set не удалось получить дольше интервала опроса;
+            узел продолжает обслуживать текущих клиентов на последнем применённом наборе.

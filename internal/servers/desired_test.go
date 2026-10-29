@@ -16,6 +16,19 @@ import (
 	"github.com/novavpn/novavpn/internal/db"
 )
 
+func TestTunnelAddressUsesPoolMask(t *testing.T) {
+	for _, tc := range []struct{ pool, want string }{
+		{"10.99.7.0/24", "10.99.7.1/24"},
+		{"10.99.8.0/29", "10.99.8.1/29"},
+	} {
+		t.Run(tc.pool, func(t *testing.T) {
+			if got := TunnelAddress(netip.MustParsePrefix(tc.pool)); got != tc.want {
+				t.Fatalf("TunnelAddress(%s) = %q, ожидался %q", tc.pool, got, tc.want)
+			}
+		})
+	}
+}
+
 func desiredCandidate(i int, now time.Time) candidate {
 	return candidate{
 		ProfileID: uuid.MustParse(fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1)),

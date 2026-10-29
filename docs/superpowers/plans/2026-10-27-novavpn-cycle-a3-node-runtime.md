@@ -63,8 +63,10 @@ egress = адрес узла), **4** (отзыв снимает пиера ≤ 3
   снимаются **до** применения (ADR-004). Неизменённый пиер не попадает в netlink.
 - Desired set содержит только `state` равный `active` или `rotating_old_key`; просроченный и
   отозванный отсутствует всегда (§4.1).
-- Интервал опроса узла — **25 с** с jitter ±10 % (правка §4.3спеки в задаче 1): худший
-  случай 27,5 с, поэтому критерий «отзыв ≤ 30 с» выполняется, а не почти выполняется.
+- Интервал опроса узла — **25 с** с jitter ±10 % (§4.3 спецификации): ожидание до 27,5 с
+  оставляет бюджет 2,5 с на доставку, обработку и применение, включая остаток текущего шага
+  и планирование. Критерий «отзыв ≤ 30 с» требует доступного API и соблюдения бюджета;
+  до сквозного замера от фиксации отзыва до удаления пиера в runtime/E2E SLA не подтверждён.
 - Неизмеренные величины — `null`, никогда `0` (ADR-006, §13.4). `load1`/`cpu_pct` при
   недоступном `/proc` — `null`.
 - Содержимое трафика и DNS-запросы не пишутся ни в одну базу и ни в один журнал; unbound
@@ -168,10 +170,11 @@ docs/testing-status.md                                  # закрытые и н
 **Files:**
 - Modify: `api-spec/openapi.yaml` (схемы `DesiredSet`, `Heartbeat`)
 - Modify: `internal/servers/desired.go`, `internal/servers/desired_test.go`
-- Modify: `internal/telemetry/service.go`
-- Modify: `internal/db/query/telemetry.sql`; регенерация `internal/db/telemetry.sql.go`
+- Modify: `internal/telemetry/service.go`, `internal/nodeapi/handlers.go`
+- Modify: `internal/db/query/telemetry.sql`; регенерация `internal/db/telemetry.sql.go` и `internal/db/querier.go`
 - Modify: `tests/integration/desired_test.go`, `tests/integration/telemetry_test.go`,
-  `tests/integration/contract_test.go`
+  `tests/integration/contract_test.go`; при необходимости `nodeapi_test.go`, `sweeper_test.go`
+  и корректные фикстуры `matrix_test.go`
 - Modify: `docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md` (§4.1, §4.3)
 
 **Interfaces:**
@@ -258,43 +261,40 @@ Expected: PASS, включая `TestTunnelAddressUsesPoolMask`.
 ```
 
 В спецификации §4.1 в примере ответа добавить `"tunnel_address": "10.99.7.1/24"` после
-`listen_port`; в §4.3 заменить «Интервал desired-poll — 30 с» на «Интервал desired-poll —
-25 с» и добавить причину: «худший случай с jitter ±10 % — 27,5 с, поэтому отзыв
-укладывается в критерий ≤ 30 с; при 30 с верхняя граница была бы 33 с».
+`listen_port`; в §4.3 установить интервал desired-poll 25 с с jitter ±10 %.
+Ожидание до 27,5 с оставляет бюджет 2,5 с на доставку, обработку и применение,
+включая остаток текущего шага и планирование. При интервале 30 с ожидание достигало бы 33 с.
+Не объявлять критерий «отзыв ≤ 30 с» выполненным до runtime/E2E-замера от фиксации
+отзыва до удаления пиера при доступном API: отзыв сразу после снимка desired,
+максимальный jitter, контролируемые задержки ответа и применения. Здесь меняется
+формулировка контракта, а не реализуются будущие задачи.
 
 - [ ] **Step 6: Написать падающий тест `stale` в телеметрии**
 
-В `tests/integration/telemetry_test.go` добавить (использовать существующие хелперы файла:
-`newEnv`, `env.server`, `env.adminToken` — имена взять из файла, не выдумывать):
+В `tests/integration/telemetry_test.go` использовать существующие `newEnv`, `env.server`,
+`env.node`, `raw`, `authHdr`, `nodePath` из `matrix_test.go` и `env.q.ServerHealthOf`.
+Не добавлять обёртки `postNode`/`healthStatus`.
 
-```go
-func TestHeartbeatStaleMarksHealthStale(t *testing.T) {
-	env := newEnv(t)
-	srv := env.server(t)
-	hb := map[string]any{
-		"agent_version": "test", "agent_uptime_sec": 10,
-		"load1": nil, "cpu_pct": nil, "applied_config_version": 0, "stale": true,
-	}
-	env.postNode(t, srv, "/internal/v1/nodes/"+srv.ID.String()+"/heartbeat", hb, http.StatusNoContent)
-	if got := env.healthStatus(t, srv.ID); got != "stale" {
-		t.Fatalf("health = %q, want stale", got)
-	}
-	hb["stale"] = false
-	env.postNode(t, srv, "/internal/v1/nodes/"+srv.ID.String()+"/heartbeat", hb, http.StatusNoContent)
-	if got := env.healthStatus(t, srv.ID); got != "ok" {
-		t.Fatalf("health = %q, want ok", got)
-	}
-}
-```
+Через настоящий HTTP и БД проверить:
+- `heartbeat(true)` устанавливает `stale`; следующий `observed` обновляет ненулевые
+  счётчики и применённую версию, но сохраняет `stale`, нагрузку, версию агента и uptime;
+  только `heartbeat(false)` возвращает `ok`, сохраняя счётчики observed.
+- Устаревший `observed_at` и штатный `connections.Store.SweepStale` устанавливают `stale`;
+  свежий `observed` его не снимает, `heartbeat(false)` восстанавливает `ok`.
+- После `heartbeat(true)` тела без `stale`, с `null` и неверным типом дают HTTP 400
+  `invalid_request`, не меняя ни одного поля health, включая `observed_at`.
+  Явные `true` и `false` принимаются с HTTP 204.
 
-Если хелперов `postNode`/`healthStatus` нет — добавить их в `tests/integration/helpers_test.go`
-по образцу существующих запросов: `postNode` шлёт JSON с узловым токеном и проверяет код,
-`healthStatus` читает `server_health.status` через пул БД.
+Сохранить исходную проверку взаимного сохранения полей
+`TestTelemetryHeartbeatPreservesObservedAndViceVersa`: heartbeat владеет нагрузкой,
+версией агента, uptime и статусом, observed — счётчиками; применённая версия и время
+обновляются каждым корректным отчётом. Корректные HTTP-фикстуры обязаны передавать `stale`.
 
 - [ ] **Step 7: Прогнать и убедиться, что падает**
 
 Run: `make integration`
-Expected: FAIL — поле `stale` не декодируется / статус остаётся `ok`.
+Expected: FAIL — отсутствие реализации `stale`, observed снимает установленный `stale`
+или heartbeat без boolean принимается и изменяет health. Новые регрессии сначала RED.
 
 - [ ] **Step 8: Реализовать `stale`**
 
@@ -314,6 +314,17 @@ Expected: FAIL — поле `stale` не декодируется / статус
 ```
 
 и передать `Status: status` в `db.MarkServerHealthParams`.
+
+В `internal/nodeapi/handlers.go` декодировать heartbeat в локальный HTTP DTO с
+`Stale *bool` и остальными полями отчёта. До вызова сервиса отклонять `nil` существующим
+путём `invalid_report`/`invalid_request` с HTTP 400; неверный тип отклоняет декодер.
+После проверки передать `*Stale` в `telemetry.Heartbeat.Stale`, сохранив его тип `bool`.
+Не ослаблять обязательность boolean в OpenAPI.
+
+В `internal/db/query/telemetry.sql` у `MarkObservedHealth` убрать присвоение `status`
+из `ON CONFLICT DO UPDATE`, сохранив вставку с `ok` и обновление измеренных полей.
+Восстановлением статуса владеет `heartbeat(false)`, в том числе после sweeper;
+закрепить это одной короткой строкой SQL-комментария. Generated-файлы менять только sqlc.
 
 В `internal/db/query/telemetry.sql` заменить `MarkServerHealth`:
 
@@ -385,16 +396,15 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `wg.Diff(live LiveState, target []TargetPeer) ([]Op, error)`, `wg.ErrDuplicatePeer`,
   `wg.ErrDuplicateAddress`, `wg.ErrUnknownPeerState`.
 
-- [ ] **Step 1: Добавить зависимость**
+- [ ] **Step 1: Отложить неиспользуемую зависимость до задачи 3**
 
-В `go.mod` в первый блок `require` добавить:
-
-```
-	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
-```
+Чистая дельта не использует `wgctrl`: `go mod tidy` удалит эту зависимость.
+Не добавлять фиктивный blank import. Закрепить `wgctrl` версии
+`v0.0.0-20241231184526-a9ab2273dd10` в Task 3 Step 1 вместе с `netlink`
+и первым реальным использованием `wgtypes`.
 
 Run: `make mod`
-Expected: `go.sum` дополнен; команда завершилась с кодом 0.
+Expected: код 0; `go.mod` и `go.sum` могут остаться без изменений.
 
 - [ ] **Step 2: Написать падающий тест дельты**
 
@@ -781,16 +791,18 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `EnsureAddress(name string, addr netip.Prefix) error`), `wg.Netlink`,
   `wg.Target`, `wg.ConfigFor(t Target, ops []Op) (wgtypes.Config, error)`.
 
-- [ ] **Step 1: Добавить зависимость**
+- [ ] **Step 1: Добавить зависимости вместе с первым использованием**
 
-В `go.mod`:
+В `go.mod` одновременно с первым реальным использованием `wgtypes` и `netlink`
+добавить обе зависимости (закрепление `wgctrl` перенесено из задачи 2):
 
 ```
 	github.com/vishvananda/netlink v1.3.1
+	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 ```
 
-Run: `make mod`
-Expected: код 0; `go.sum` дополнен.
+Run: `make mod` после появления реальных импортов; фиктивный blank import запрещён.
+Expected: код 0; обе зависимости сохранены в `go.mod`, `go.sum` дополнен.
 
 - [ ] **Step 2: Написать падающий тест сборки конфига**
 
@@ -935,12 +947,15 @@ func toIPNets(prefixes []netip.Prefix) []net.IPNet {
 
 Требования к `Netlink`:
 
-- `EnsureLink(name, mtu)`: если устройство есть — сравнить MTU и при отличии вызвать
-  `netlink.LinkSetMTU`; если нет — `netlink.LinkAdd(&netlink.Wireguard{LinkAttrs:
-  netlink.LinkAttrs{Name: name, MTU: mtu}})`. Любая иная ошибка поиска — вернуть с
-  контекстом, а не создавать второй интерфейс.
-- `EnsureAddress(name, addr)`: найти устройство, `netlink.ParseAddr(addr.String())`,
-  `netlink.AddrReplace` (идемпотентно; `AddrAdd` на существующем адресе дал бы EEXIST).
+- `EnsureLink(name, mtu)`: найденное устройство сначала проверить на тип `wireguard`;
+  чужой тип с тем же именем — ошибка без изменений. Затем сравнить MTU и при отличии
+  вызвать `netlink.LinkSetMTU`. Только `netlink.LinkNotFoundError` разрешает создание
+  через `netlink.LinkAdd(&netlink.Wireguard{LinkAttrs:
+  netlink.LinkAttrs{Name: name, MTU: mtu}})`; прочие ошибки поиска вернуть с контекстом.
+  Новый или существующий интерфейс без флага UP поднять через `netlink.LinkSetUp`.
+- `EnsureAddress(name, addr)`: найти устройство, проверить тип `wireguard` до изменений,
+  затем `netlink.ParseAddr(addr.String())` и `netlink.AddrReplace` (идемпотентно;
+  `AddrAdd` на существующем адресе дал бы EEXIST).
 - Свойства: ни одного `os/exec`, ни одной строки shell; маршрут для пула не добавляется —
   адрес с маской создаёт connected route, а лишний маршрут дублировал бы его.
 - Методы — на значении (`func (Netlink) EnsureLink(...)`, `func (Netlink)
@@ -994,12 +1009,37 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 **Files:**
 - Create: `internal/nodeagent/wg/device.go`
+- Create: `internal/nodeagent/wg/device_test.go`
+- Modify: `go.mod`, `go.sum` — корневой пакет `wgctrl` импортируется впервые,
+  `make mod` добавляет косвенные `mdlayher/netlink`, `mdlayher/genetlink`,
+  `mdlayher/socket`, `josharian/native`, `golang.org/x/net`,
+  `golang.zx2c4.com/wireguard`, `github.com/google/go-cmp` (R23)
 
 **Interfaces:**
 - Produces: `wg.DeviceClient` (`Snapshot(iface string) (LiveState, error)`,
   `Configure(iface string, cfg wgtypes.Config) error`), `wg.WG`, `wg.Open() (*WG, error)`.
 
-- [ ] **Step 1: Реализовать `device.go` (дословный исходник)**
+- [x] **Step 1: Написать тесты вспомогательных функций и получить RED**
+
+`device_test.go`: ошибка чтения (нет файла, вместо файла каталог), пустое,
+неверное, отрицательное и переполненное значение счётчика с различимостью
+`strconv.ErrSyntax` и `strconv.ErrRange` через `errors.Is`; настоящий ноль,
+пробелы и максимальный `int64`. Ошибка содержит путь и русский контекст.
+Преобразование адресов: IPv4 в 4 и 16 байтах, IPv6, `/0`, host-биты,
+обратное преобразование через `toIPNets`, отсутствие мутаций входа.
+Неподдерживаемые адреса и маски пропускаются; порядок и повторы сохраняются.
+При 32-битной маске IPv4 преобразуется через `Unmap`; при 128-битной маске
+сохраняется семейство IPv6, включая mapped-префиксы.
+Сосредоточенный запуск через `run-make.sh unit`: переопределить `DOCKER_FLAGS`
+с `-w /src/internal/nodeagent/wg` и фильтром `TestReadCounter|TestFromIPNets`.
+
+- [x] **Step 2: Реализовать `device.go`**
+
+R5: `readCounter` возвращает `(int64, error)`, ошибка не является нулевым
+измерением. `Snapshot` возвращает полный снимок только после успешного чтения
+обоих интерфейсных счётчиков. Любой отказ возвращает `LiveState{}` и ошибку
+с контекстом; интерфейс и пиры не изменяются, `Configure` не вызывается.
+Сбой sysfs приостанавливает применение, не меняя форму отчёта API.
 
 ```go
 package wg
@@ -1016,8 +1056,6 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
-// DeviceClient — граница с ядром. Интерфейс нужен не ради тестов ради тестов:
-// Applier проверяется на fake-клиенте, а настоящий путь остаётся тонким.
 type DeviceClient interface {
 	Snapshot(iface string) (LiveState, error)
 	Configure(iface string, cfg wgtypes.Config) error
@@ -1028,26 +1066,37 @@ type WG struct{ c *wgctrl.Client }
 func Open() (*WG, error) {
 	c, err := wgctrl.New()
 	if err != nil {
-		return nil, fmt.Errorf("wg: control socket: %w", err)
+		return nil, fmt.Errorf("wg: управляющий сокет: %w", err)
 	}
 	return &WG{c: c}, nil
 }
 
-func (w *WG) Close() error { return w.c.Close() }
+func (w *WG) Close() error {
+	if err := w.c.Close(); err != nil {
+		return fmt.Errorf("wg: закрытие управляющего сокета: %w", err)
+	}
+	return nil
+}
 
-// Snapshot читает устройство целиком. Ошибка здесь означает, что применять
-// нельзя: без живого состояния дельта была бы равна всему набору, то есть
-// каждый цикл пересоздавал бы пиеров — ровно то, что запрещает ADR-004.
+// Snapshot не возвращает частичный снимок: без обоих счётчиков применение приостанавливается (R5).
 func (w *WG) Snapshot(iface string) (LiveState, error) {
 	dev, err := w.c.Device(iface)
 	if err != nil {
-		return LiveState{}, fmt.Errorf("wg: device %s: %w", iface, err)
+		return LiveState{}, fmt.Errorf("wg: устройство %s: %w", iface, err)
+	}
+	rx, err := readCounter("/sys/class/net/" + iface + "/statistics/rx_bytes")
+	if err != nil {
+		return LiveState{}, fmt.Errorf("wg: снимок %s: %w", iface, err)
+	}
+	tx, err := readCounter("/sys/class/net/" + iface + "/statistics/tx_bytes")
+	if err != nil {
+		return LiveState{}, fmt.Errorf("wg: снимок %s: %w", iface, err)
 	}
 	out := LiveState{
 		PublicKey:    dev.PublicKey.String(),
 		ListenPort:   dev.ListenPort,
-		IfaceRxBytes: readCounter("/sys/class/net/" + iface + "/statistics/rx_bytes"),
-		IfaceTxBytes: readCounter("/sys/class/net/" + iface + "/statistics/tx_bytes"),
+		IfaceRxBytes: rx,
+		IfaceTxBytes: tx,
 		Peers:        make(map[string]PeerState, len(dev.Peers)),
 	}
 	for _, p := range dev.Peers {
@@ -1055,7 +1104,7 @@ func (w *WG) Snapshot(iface string) (LiveState, error) {
 		out.Peers[key] = PeerState{
 			PublicKey:     key,
 			AllowedIPs:    fromIPNets(p.AllowedIPs),
-			KeepaliveSec:  int(p.PersistentKeepalive.Seconds()),
+			KeepaliveSec:  int(p.PersistentKeepaliveInterval.Seconds()),
 			RxBytes:       p.ReceiveBytes,
 			TxBytes:       p.TransmitBytes,
 			LastHandshake: p.LastHandshakeTime,
@@ -1066,7 +1115,7 @@ func (w *WG) Snapshot(iface string) (LiveState, error) {
 
 func (w *WG) Configure(iface string, cfg wgtypes.Config) error {
 	if err := w.c.ConfigureDevice(iface, cfg); err != nil {
-		return fmt.Errorf("wg: configure %s: %w", iface, err)
+		return fmt.Errorf("wg: настройка %s: %w", iface, err)
 	}
 	return nil
 }
@@ -1078,95 +1127,167 @@ func fromIPNets(nets []net.IPNet) []netip.Prefix {
 		if !ok {
 			continue
 		}
-		bits, _ := n.Mask.Size()
-		out = append(out, netip.PrefixFrom(addr, bits).Masked())
+		ones, bits := n.Mask.Size()
+		if bits == 32 {
+			addr = addr.Unmap()
+		}
+		if bits != addr.BitLen() {
+			continue
+		}
+		out = append(out, netip.PrefixFrom(addr, ones).Masked())
 	}
 	return out
 }
 
-// readCounter читает счётчик интерфейса. Ноль при ошибке — не «трафика не было»,
-// а «счётчик недоступен»: значение не участвует в тарифе (он считается по
-// пиерным счётчикам) и попадает только в health, где ошибка видна по нулю у
-// живого интерфейса. Возвращать ошибку отсюда нельзя: без sysfs узел не должен
-// терять способность применять набор.
-func readCounter(path string) int64 {
+func readCounter(path string) (int64, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("wg: чтение счётчика %s: %w", path, err)
 	}
 	v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		return 0
+		return 0, fmt.Errorf("wg: неверный счётчик %s: %w", path, err)
 	}
-	return v
+	if v < 0 {
+		return 0, fmt.Errorf("wg: отрицательный счётчик %s", path)
+	}
+	return v, nil
 }
 ```
 
-- [ ] **Step 2: Проверить сборку**
+- [ ] **Step 3: Проверить сборку и тесты**
 
-Run: `make unit && make vet`
-Expected: PASS. Настоящий снимок проверяется в E2E: без загруженного модуля
-`wireguard` он невозможен, и это ограничение стенда, а не кода.
+Run: `run-make.sh mod`, затем `run-make.sh unit` и `run-make.sh vet` из каталога постановки.
+Expected: PASS, включая повторный строгий прогон с `-mod=readonly`: модульные
+файлы полны, `go mod tidy` больше ничего не меняет. Сосредоточенный GREEN
+не заменяет полные unit/vet.
+Настоящий путь `Snapshot`/`Configure` проверяется в E2E задачи 11;
+до этого он отмечается `not-run`, компиляция не считается запуском туннеля.
 
-- [ ] **Step 3: Коммит**
+- [x] **Step 4: Коммит**
 
 ```bash
-git add internal/nodeagent/wg/device.go
-git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
-  commit -m "feat(a3): клиент wgctrl — снимок и применение конфигурации"
+git add internal/nodeagent/wg/device.go internal/nodeagent/wg/device_test.go \
+  go.mod go.sum docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md
+GIT_AUTHOR_NAME='NovaVPN Dev' GIT_AUTHOR_EMAIL='dev@novavpn.local' \
+GIT_COMMITTER_NAME='NovaVPN Dev' GIT_COMMITTER_EMAIL='dev@novavpn.local' \
+git commit -m "$(cat <<'EOF'
+feat(a3): не подменять ошибки снимка WireGuard нулевыми измерениями
+EOF
+)"
 ```
 
 ---
 
-### Task 5: Применение набора — порядок, снимок до изменений, ноль обращений при пустой дельте
+### Task 5: Применение набора — снимок до изменений и проверка параметров устройства
 
 **Files:**
-- Create: `internal/nodeagent/wg/applier.go`, `internal/nodeagent/wg/applier_test.go`
+- Create: `internal/nodeagent/wg/applier.go`
+- Create: `internal/nodeagent/wg/applier_test.go`
+- Modify: `docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md` — только фрагмент Task 5
 
 **Interfaces:**
 - Consumes: `wg.LinkManager`, `wg.DeviceClient`, `wg.Diff`, `wg.ConfigFor`.
 - Produces: `wg.Applier{Link LinkManager; Device DeviceClient; Iface string}`,
   `wg.ApplyResult{Before LiveState; Ops int}`,
-  `(*Applier).Apply(t Target) (ApplyResult, error)`.
+  `(*Applier).Apply(t Target) (ApplyResult, error)`, `(*Applier).Snapshot() (LiveState, error)`.
+
+Порядок шагов задан ADR-004: интерфейс и адрес, затем снимок, затем дельта, затем
+`Configure`. Снимок обязан быть до `Configure`, потому что пересоздание пиера
+обнуляет счётчики в ядре. По R6 пустая дельта пропускает `Configure` только при
+совпадении публичной половины приватного ключа и порта устройства. Иначе применяется
+конфигурация с пустым `Peers` и `ReplacePeers=false`; `Ops` остаётся числом операций
+пиеров и может быть нулём при вызове `Configure`. `ConfigFor` вызывается всегда.
+По R9 метод `Snapshot` делегирует `Device.Snapshot(Iface)` без `Link` и `Configure`.
 
 - [ ] **Step 1: Написать падающий тест**
 
-`internal/nodeagent/wg/applier_test.go`:
+Базовые тесты `internal/nodeagent/wg/applier_test.go` приведены ниже. В Task 8 они
+дополнены `TestApplyConfiguresDeviceWithEmptyPeerDelta` (первый пустой набор, смена
+порта, смена ключа) и `TestApplierSnapshotDelegatesWithoutChanges` (снимок и ошибка,
+точное имя интерфейса, отсутствие изменений). Актуальный полный исходник — в файле.
 
 ```go
 package wg
 
 import (
+	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
+type journal struct{ calls []string }
+
+func (j *journal) add(name string) { j.calls = append(j.calls, name) }
+
 type fakeLink struct {
 	links, addrs int
 	failLink     bool
+	failAddr     bool
+	log          *journal
+}
+
+func (f *fakeLink) record(name string) {
+	if f.log == nil {
+		f.log = &journal{}
+	}
+	f.log.add(name)
 }
 
 func (f *fakeLink) EnsureLink(string, int) error {
 	f.links++
+	f.record("link")
 	if f.failLink {
 		return errTest
 	}
 	return nil
 }
-func (f *fakeLink) EnsureAddress(string, netip.Prefix) error { f.addrs++; return nil }
 
-type fakeDevice struct {
-	state     LiveState
-	configure int
-	last      wgtypes.Config
+func (f *fakeLink) EnsureAddress(string, netip.Prefix) error {
+	f.addrs++
+	f.record("address")
+	if f.failAddr {
+		return errTest
+	}
+	return nil
 }
 
-func (f *fakeDevice) Snapshot(string) (LiveState, error) { return f.state, nil }
+type fakeDevice struct {
+	state         LiveState
+	snapshots     int
+	configure     int
+	last          wgtypes.Config
+	failSnapshot  bool
+	failConfigure bool
+	log           *journal
+}
+
+func (f *fakeDevice) record(name string) {
+	if f.log == nil {
+		f.log = &journal{}
+	}
+	f.log.add(name)
+}
+
+func (f *fakeDevice) Snapshot(string) (LiveState, error) {
+	f.snapshots++
+	f.record("snapshot")
+	if f.failSnapshot {
+		return LiveState{}, errTest
+	}
+	return f.state, nil
+}
+
 func (f *fakeDevice) Configure(_ string, cfg wgtypes.Config) error {
 	f.configure++
+	f.record("configure")
 	f.last = cfg
+	if f.failConfigure {
+		return errTest
+	}
 	return nil
 }
 
@@ -1176,144 +1297,312 @@ func (testError) Error() string { return "boom" }
 
 var errTest = testError{}
 
-func TestApplyDoesNotTouchUnchangedPeers(t *testing.T) {
-	pub := "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
-	dev := &fakeDevice{state: LiveState{Peers: map[string]PeerState{
-		pub: {PublicKey: pub, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")}, KeepaliveSec: 25},
-	}}}
-	link := &fakeLink{}
-	a := Applier{Link: link, Device: dev, Iface: "wg0"}
-	target := Target{
-		PrivateKey: "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=", ListenPort: 51820, MTU: 1420,
-		TunnelAddress: netip.MustParsePrefix("10.99.0.1/24"),
-		Peers: []TargetPeer{{PublicKey: pub, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
-			KeepaliveSec: 25, State: StateActive}},
+func newKey(t *testing.T) wgtypes.Key {
+	t.Helper()
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
 	}
-	res, err := a.Apply(target)
+	return key
+}
+
+func peerFrom(key wgtypes.Key, prefix string, keepalive int) TargetPeer {
+	return TargetPeer{
+		PublicKey:    key.PublicKey().String(),
+		AllowedIPs:   []netip.Prefix{netip.MustParsePrefix(prefix)},
+		KeepaliveSec: keepalive, State: StateActive,
+	}
+}
+
+func targetFor(private wgtypes.Key, peers ...TargetPeer) Target {
+	return Target{
+		PrivateKey: private.String(), ListenPort: 51820, MTU: 1420,
+		TunnelAddress: netip.MustParsePrefix("10.99.0.1/24"), Peers: peers,
+	}
+}
+
+func TestApplyDoesNotTouchUnchangedPeers(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	target := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
+	log := &journal{}
+	dev := &fakeDevice{log: log, state: LiveState{PublicKey: priv.PublicKey().String(), ListenPort: 51820, Peers: map[string]PeerState{
+		peer.PublicKey().String(): {
+			PublicKey:    peer.PublicKey().String(),
+			AllowedIPs:   []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
+			KeepaliveSec: 25,
+		},
+	}}}
+	link := &fakeLink{log: log}
+	res, err := (&Applier{Link: link, Device: dev, Iface: "wg0"}).Apply(target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Ops != 0 || dev.configure != 0 {
-		t.Fatalf("ops = %d, configure calls = %d, want 0/0", res.Ops, dev.configure)
+		t.Fatalf("операций %d, вызовов configure %d; ожидалось 0/0", res.Ops, dev.configure)
 	}
-	if len(link.links) == 0 || link.addrs == 0 {
-		t.Fatal("link or address was not ensured")
+	if link.links != 1 || link.addrs != 1 || dev.snapshots != 1 {
+		t.Fatalf("интерфейс %d, адрес %d, снимков %d; ожидалось 1/1/1", link.links, link.addrs, dev.snapshots)
+	}
+	if got := strings.Join(log.calls, ","); got != "link,address,snapshot" {
+		t.Fatalf("порядок вызовов %q; ожидался link,address,snapshot", got)
 	}
 }
 
 func TestApplyRemovesAndAdds(t *testing.T) {
-	add := "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
-	drop := "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="
-	dev := &fakeDevice{state: LiveState{Peers: map[string]PeerState{
-		drop: {PublicKey: drop, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.3/32")}},
+	priv := newKey(t)
+	add := newKey(t)
+	drop := newKey(t)
+	log := &journal{}
+	dev := &fakeDevice{log: log, state: LiveState{Peers: map[string]PeerState{
+		drop.PublicKey().String(): {
+			PublicKey:  drop.PublicKey().String(),
+			AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.3/32")},
+		},
 	}}}
-	a := Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}
-	target := Target{
-		PrivateKey: drop, ListenPort: 51820, MTU: 1420,
-		TunnelAddress: netip.MustParsePrefix("10.99.0.1/24"),
-		Peers: []TargetPeer{{PublicKey: add, AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
-			KeepaliveSec: 25, State: StateActive}},
-	}
-	res, err := a.Apply(target)
+	link := &fakeLink{log: log}
+	res, err := (&Applier{Link: link, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(priv, peerFrom(add, "10.99.0.2/32", 25)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.Ops != 2 || dev.configure != 1 {
-		t.Fatalf("ops = %d, configure = %d, want 2/1", res.Ops, dev.configure)
+		t.Fatalf("операций %d, configure %d; ожидалось 2/1", res.Ops, dev.configure)
+	}
+	if got := strings.Join(log.calls, ","); got != "link,address,snapshot,configure" {
+		t.Fatalf("порядок вызовов %q; ожидался link,address,snapshot,configure", got)
 	}
 	if dev.last.ReplacePeers {
-		t.Fatal("ReplacePeers must stay false")
+		t.Fatal("ReplacePeers должен оставаться false")
 	}
-	if len(dev.last.Peers) != 2 || !dev.last.Peers[0].Remove && !dev.last.Peers[1].Remove {
-		t.Fatalf("peers = %+v", dev.last.Peers)
+	if len(dev.last.Peers) != 2 {
+		t.Fatalf("пиров в конфигурации %d; ожидалось 2", len(dev.last.Peers))
+	}
+	removed := 0
+	for _, p := range dev.last.Peers {
+		if p.Remove {
+			removed++
+		}
+	}
+	if removed != 1 {
+		t.Fatalf("снятых пиров %d; ожидался 1", removed)
 	}
 }
 
 func TestApplyStopsBeforeKernelWhenLinkFails(t *testing.T) {
 	dev := &fakeDevice{}
-	a := Applier{Link: &fakeLink{failLink: true}, Device: dev, Iface: "wg0"}
-	_, err := a.Apply(Target{PrivateKey: "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk="})
+	link := &fakeLink{failLink: true}
+	_, err := (&Applier{Link: link, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(newKey(t)))
 	if err == nil {
-		t.Fatal("link failure ignored")
+		t.Fatal("отказ интерфейса проигнорирован")
+	}
+	if link.addrs != 0 || dev.snapshots != 0 || dev.configure != 0 {
+		t.Fatalf("адресов %d, снимков %d, configure %d; ожидалось 0/0/0", link.addrs, dev.snapshots, dev.configure)
+	}
+}
+
+func TestApplyStopsOnAddressFailure(t *testing.T) {
+	dev := &fakeDevice{}
+	_, err := (&Applier{Link: &fakeLink{failAddr: true}, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(newKey(t)))
+	if err == nil {
+		t.Fatal("отказ адреса проигнорирован")
+	}
+	if dev.snapshots != 0 || dev.configure != 0 {
+		t.Fatalf("снимков %d, configure %d; ожидалось 0/0", dev.snapshots, dev.configure)
+	}
+}
+
+func TestApplyStopsOnSnapshotFailure(t *testing.T) {
+	dev := &fakeDevice{failSnapshot: true}
+	res, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(newKey(t)))
+	if err == nil {
+		t.Fatal("отказ снимка проигнорирован")
+	}
+	if dev.configure != 0 || res.Ops != 0 {
+		t.Fatalf("configure %d, операций %d; ожидалось 0/0", dev.configure, res.Ops)
+	}
+}
+
+func TestApplyStopsOnDiffFailure(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	dev := &fakeDevice{}
+	dup := peerFrom(peer, "10.99.0.2/32", 25)
+	_, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).
+		Apply(targetFor(priv, dup, dup))
+	if err == nil {
+		t.Fatal("повтор ключа в целевом наборе проигнорирован")
+	}
+	if !errors.Is(err, ErrDuplicatePeer) {
+		t.Fatalf("ожидалась ErrDuplicatePeer, получено %v", err)
 	}
 	if dev.configure != 0 {
-		t.Fatal("configure called after link failure")
+		t.Fatal("configure вызван после ошибки дельты")
+	}
+}
+
+func TestApplyStopsOnConfigFailure(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	dev := &fakeDevice{}
+	bad := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
+	bad.PrivateKey = "не-ключ"
+	_, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).Apply(bad)
+	if err == nil {
+		t.Fatal("неверный приватный ключ проигнорирован")
+	}
+	if dev.configure != 0 {
+		t.Fatal("configure вызван после ошибки конфигурации")
+	}
+}
+
+func TestApplyReportsConfigureFailureWithBefore(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	target := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
+	dev := &fakeDevice{
+		state: LiveState{Peers: map[string]PeerState{
+			peer.PublicKey().String(): {
+				PublicKey:  peer.PublicKey().String(),
+				AllowedIPs: []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
+			},
+		}},
+		failConfigure: true,
+	}
+	res, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).Apply(target)
+	if err == nil {
+		t.Fatal("отказ configure проигнорирован")
+	}
+	if res.Ops != 1 || res.Before.Peers == nil {
+		t.Fatalf("операций %d, снимок %v; ожидался 1 и непустой Before", res.Ops, res.Before.Peers)
+	}
+}
+
+func TestApplyRejectsBrokenKeyWithEmptyDelta(t *testing.T) {
+	priv := newKey(t)
+	peer := newKey(t)
+	target := targetFor(priv, peerFrom(peer, "10.99.0.2/32", 25))
+	target.PrivateKey = "не-ключ"
+	dev := &fakeDevice{state: LiveState{Peers: map[string]PeerState{
+		peer.PublicKey().String(): {
+			PublicKey:    peer.PublicKey().String(),
+			AllowedIPs:   []netip.Prefix{netip.MustParsePrefix("10.99.0.2/32")},
+			KeepaliveSec: 25,
+		},
+	}}}
+	ops, err := Diff(dev.state, target.Peers)
+	if err != nil || len(ops) != 0 {
+		t.Fatalf("предусловие нарушено: дельта %d операций, ошибка %v", len(ops), err)
+	}
+	res, err := (&Applier{Link: &fakeLink{}, Device: dev, Iface: "wg0"}).Apply(target)
+	if err == nil {
+		t.Fatal("неверный ключ принят при пустой дельте")
+	}
+	if dev.configure != 0 || res.Ops != 0 {
+		t.Fatalf("configure %d, операций %d; ожидалось 0/0", dev.configure, res.Ops)
 	}
 }
 ```
 
-Исправить очевидную опечатку условия в `TestApplyRemovesAndAdds` при наборе: проверка
-должна быть `(!dev.last.Peers[0].Remove && !dev.last.Peers[1].Remove)`; тест обязан
-содержать хотя бы одного снятого пиера.
+Ключи генерируются при выполнении через `wgtypes.GeneratePrivateKey`; литеральных
+ключей в тесте нет. Оба фейка пишут в один общий журнал `journal`, поэтому сверка
+`link,address,snapshot` и `link,address,snapshot,configure` доказывает взаимный
+порядок вызовов интерфейса и устройства, а не только порядок внутри каждого фейка.
+Тест отказа адреса доказывает, что `EnsureAddress` останавливает применение до
+снимка. Тест пустой дельты сначала проверяет предусловие через `Diff`: дельта
+обязана быть пустой, иначе падение на ключе ничего не доказывает.
 
 - [ ] **Step 2: Прогнать и убедиться, что не компилируется**
 
-Run: `make unit`
-Expected: FAIL — `undefined: Applier`.
+Run: focused `make unit` по пакету `internal/nodeagent/wg` с `-mod=readonly`.
+Expected: FAIL — `undefined: Applier`, `undefined: Target` уже существует, поэтому
+ошибка должна быть именно про `Applier` и `ApplyResult`.
 
-- [ ] **Step 3: Реализовать `applier.go` (дословный исходник)**
+- [ ] **Step 3: Реализовать `applier.go`**
 
 ```go
 package wg
 
 import "fmt"
 
-// Applier — единственное место, где порядок шагов задан явно: устройство и адрес,
-// затем снимок, затем дельта. Снимок обязан быть до Configure: пересоздание пиера
-// обнуляет счётчики в ядре, и отчёт, снятый после применения, потерял бы байты
-// (ADR-004, правило 4).
+// Applier задаёт порядок шагов явно: интерфейс и адрес, снимок, дельта.
+// Снимок обязан быть до Configure: пересоздание пиера обнуляет счётчики в ядре,
+// и отчёт, снятый после применения, потерял бы байты (ADR-004, правило 4).
 type Applier struct {
 	Link   LinkManager
 	Device DeviceClient
 	Iface  string
 }
 
+// ApplyResult — что известно после вызова. Before это снимок ядра до изменений,
+// он значим и при ошибке настройки. Ops — число операций дельты: при ошибке
+// настройки ядро могло измениться, поэтому непустой Ops нельзя прочитать как
+// «набор применён».
 type ApplyResult struct {
 	Before LiveState
 	Ops    int
 }
 
+func (a *Applier) Snapshot() (LiveState, error) {
+	return a.Device.Snapshot(a.Iface)
+}
+
 func (a *Applier) Apply(t Target) (ApplyResult, error) {
 	if err := a.Link.EnsureLink(a.Iface, t.MTU); err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: link: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: интерфейс: %w", err)
 	}
 	if err := a.Link.EnsureAddress(a.Iface, t.TunnelAddress); err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: address: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: адрес: %w", err)
 	}
 	before, err := a.Device.Snapshot(a.Iface)
 	if err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: snapshot: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: снимок: %w", err)
 	}
 	ops, err := Diff(before, t.Peers)
 	if err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: diff: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: дельта: %w", err)
 	}
-	if len(ops) == 0 {
-		return ApplyResult{Before: before}, nil
-	}
+	// ConfigFor проверяет приватный ключ, поэтому вызывается и при пустой дельте:
+	// иначе один и тот же Target принимался бы по-разному в зависимости от того,
+	// совпали ли пиры, а ошибка ключа всплыла бы только на первом изменении.
 	cfg, err := ConfigFor(t, ops)
 	if err != nil {
-		return ApplyResult{}, fmt.Errorf("apply: config: %w", err)
+		return ApplyResult{}, fmt.Errorf("wg: применение: конфигурация: %w", err)
+	}
+	if len(ops) == 0 && before.PublicKey == cfg.PrivateKey.PublicKey().String() && before.ListenPort == *cfg.ListenPort {
+		return ApplyResult{Before: before}, nil
 	}
 	if err := a.Device.Configure(a.Iface, cfg); err != nil {
-		return ApplyResult{Before: before, Ops: len(ops)}, fmt.Errorf("apply: configure: %w", err)
+		return ApplyResult{Before: before, Ops: len(ops)}, fmt.Errorf("wg: применение: настройка: %w", err)
 	}
 	return ApplyResult{Before: before, Ops: len(ops)}, nil
 }
 ```
 
+Тексты ошибок в пакете `wg` русские; префикс `wg: применение: ...` согласован
+с `device.go` и `link.go`.
+
 - [ ] **Step 4: Прогнать тесты**
 
-Run: `make unit`
-Expected: PASS, включая три теста `Applier`.
+Run: focused `make unit` по пакету с `-mod=readonly`, затем полные `unit` и `vet`.
+Expected: PASS, 11 функций тестов `Applier`, включая два дополнения Task 8 с пятью
+подтестами R6/R9. Проверены порядок вызовов, отказ адреса, проверка неверного ключа
+при пустой дельте, параметры устройства и делегирование снимка.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/nodeagent/wg/applier.go internal/nodeagent/wg/applier_test.go
+git add internal/nodeagent/wg/applier.go internal/nodeagent/wg/applier_test.go \
+  docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(a3): применение набора — снимок до изменений и пустая дельта без netlink"
 ```
+
+Один новый локальный коммит, без amend и push. `go.mod`/`go.sum` меняться не должны:
+новых импортов нет.
 
 ---
 
@@ -1321,11 +1610,15 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 Состояние переживает рестарт и недоступность API: последний применённый набор и узловой
 токен лежат на диске. Потеря токена означает повторный enroll, а потеря ключа — новый
-публичный ключ и правку сервера у администратора, поэтому запись атомарная: оборванный
-процесс не оставляет половину файла.
+публичный ключ и правку сервера у администратора, поэтому ключ не перевыпускается молча,
+а запись атомарная: оборванный процесс не оставляет половину файла. Каталог ужесточается до
+`0700` при записи файлов, а существующий ключ — до `0600` при `EnsureKey`; пустой `Dir`
+отвергается, иначе `chmod` задел бы каталог, из которого запущен процесс.
 
 **Files:**
-- Create: `internal/nodeagent/state/state.go`, `internal/nodeagent/state/state_test.go`
+- Create: `internal/nodeagent/state/state.go`
+- Create: `internal/nodeagent/state/state_test.go`
+- Modify: `docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md` — только фрагмент Task 6
 
 **Interfaces:**
 - Produces: `state.Store{Dir string}`, `state.NodeState`, `state.Applied`,
@@ -1335,35 +1628,125 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 
 - [ ] **Step 1: Написать падающий тест**
 
-`internal/nodeagent/state/state_test.go`:
+Используй ровно этот исходник `internal/nodeagent/state/state_test.go`:
 
 ```go
 package state
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestEnsureKeyCreatesOnceAndKeepsMode(t *testing.T) {
-	dir := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(root, "node")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() == 0o700 {
+		t.Fatal("исходный каталог уже 0700: проверка ужесточения не различает")
+	}
 	s := Store{Dir: dir}
 	pub, created, err := s.EnsureKey()
 	if err != nil || !created || pub == "" {
-		t.Fatalf("first: pub=%q created=%v err=%v", pub, created, err)
+		t.Fatalf("первый вызов: ключ %q, создан %v, ошибка %v", pub, created, err)
 	}
 	pub2, created2, err := s.EnsureKey()
 	if err != nil || created2 || pub2 != pub {
-		t.Fatalf("second: pub=%q created=%v err=%v", pub2, created2, err)
+		t.Fatalf("повторный вызов: ключ %q, создан %v, ошибка %v", pub2, created2, err)
 	}
-	info, err := os.Stat(filepath.Join(dir, "node.key"))
+	keyInfo, err := os.Stat(filepath.Join(dir, "node.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := keyInfo.Mode().Perm(); got != 0o600 {
+		t.Fatalf("права ключа %o; ожидались 600", got)
+	}
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("права каталога %o; ожидались 700", got)
+	}
+}
+
+func TestEnsureKeyDoesNotRegenerateBrokenKey(t *testing.T) {
+	dir := t.TempDir()
+	s := Store{Dir: dir}
+	path := filepath.Join(dir, "node.key")
+	if err := os.WriteFile(path, []byte("не-ключ"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.EnsureKey(); err == nil {
+		t.Fatal("испорченный ключ молча перевыпущен")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "не-ключ" {
+		t.Fatal("файл ключа изменён при отказе")
+	}
+}
+
+func TestEnsureKeyTightensExistingKeyMode(t *testing.T) {
+	dir := t.TempDir()
+	s := Store{Dir: dir}
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "node.key")
+	if err := os.WriteFile(path, []byte(key.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub, created, err := s.EnsureKey()
+	if err != nil || created {
+		t.Fatalf("существующий ключ: создан %v, ошибка %v", created, err)
+	}
+	if want := key.PublicKey().String(); pub != want {
+		t.Fatal("публичный ключ не совпал с существующим")
+	}
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("mode = %o, want 600", got)
+		t.Fatalf("права ключа %o; ожидались 600", got)
+	}
+}
+
+func TestEmptyDirRejected(t *testing.T) {
+	s := Store{}
+	if _, _, err := s.EnsureKey(); !errors.Is(err, errNoDir) {
+		t.Fatalf("EnsureKey: ошибка %v", err)
+	}
+	if _, err := s.PrivateKey(); !errors.Is(err, errNoDir) {
+		t.Fatalf("PrivateKey: ошибка %v", err)
+	}
+	if _, err := s.Load(); !errors.Is(err, errNoDir) {
+		t.Fatalf("Load: ошибка %v", err)
+	}
+	if err := s.Save(NodeState{}); !errors.Is(err, errNoDir) {
+		t.Fatalf("Save: ошибка %v", err)
 	}
 }
 
@@ -1373,7 +1756,17 @@ func TestSaveAndLoadRoundTripWithoutPrivateKey(t *testing.T) {
 	if _, _, err := s.EnsureKey(); err != nil {
 		t.Fatal(err)
 	}
-	want := NodeState{ServerID: "8f0c0000-0000-4000-8000-000000000001", NodeToken: "tok", Applied: Applied{ConfigVersion: 7, ETag: `"x"`, Peers: 2}}
+	want := NodeState{
+		ServerID:      "8f0c0000-0000-4000-8000-000000000001",
+		NodeToken:     "tok",
+		TokenIssuedAt: time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC),
+		Applied: Applied{
+			ConfigVersion: 7,
+			ETag:          `"x"`,
+			AppliedAt:     time.Date(2026, 10, 27, 11, 30, 0, 0, time.UTC),
+			Peers:         2,
+		},
+	}
 	if err := s.Save(want); err != nil {
 		t.Fatal(err)
 	}
@@ -1381,8 +1774,33 @@ func TestSaveAndLoadRoundTripWithoutPrivateKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ServerID != want.ServerID || got.NodeToken != want.NodeToken || got.Applied.ConfigVersion != 7 {
-		t.Fatalf("loaded = %+v", got)
+	if got.ServerID != want.ServerID {
+		t.Fatalf("ServerID %q; ожидался %q", got.ServerID, want.ServerID)
+	}
+	if got.NodeToken != want.NodeToken {
+		t.Fatal("узловой токен не совпал с сохранённым")
+	}
+	if got.Applied.ConfigVersion != want.Applied.ConfigVersion {
+		t.Fatalf("версия конфигурации %d; ожидалась %d", got.Applied.ConfigVersion, want.Applied.ConfigVersion)
+	}
+	if got.Applied.ETag != want.Applied.ETag {
+		t.Fatalf("ETag %q; ожидался %q", got.Applied.ETag, want.Applied.ETag)
+	}
+	if got.Applied.Peers != want.Applied.Peers {
+		t.Fatalf("пиеров %d; ожидалось %d", got.Applied.Peers, want.Applied.Peers)
+	}
+	if !got.Applied.AppliedAt.Equal(want.Applied.AppliedAt) {
+		t.Fatalf("время применения %v; ожидалось %v", got.Applied.AppliedAt, want.Applied.AppliedAt)
+	}
+	if !got.TokenIssuedAt.Equal(want.TokenIssuedAt) {
+		t.Fatalf("время выдачи токена %v; ожидалось %v", got.TokenIssuedAt, want.TokenIssuedAt)
+	}
+	info, err := os.Stat(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("права состояния %o; ожидались 600", got)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if err != nil {
@@ -1393,7 +1811,14 @@ func TestSaveAndLoadRoundTripWithoutPrivateKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(raw), key.String()) {
-		t.Fatal("private key leaked into state.json")
+		t.Fatal("приватный ключ попал в state.json")
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("временные файлы остались: %v", leftovers)
 	}
 }
 
@@ -1401,7 +1826,7 @@ func TestLoadMissingReturnsEmptyAndBrokenReturnsError(t *testing.T) {
 	s := Store{Dir: t.TempDir()}
 	got, err := s.Load()
 	if err != nil || got.ServerID != "" {
-		t.Fatalf("missing: %+v %v", got, err)
+		t.Fatalf("отсутствующий файл: %+v %v", got, err)
 	}
 	if _, _, err := s.EnsureKey(); err != nil {
 		t.Fatal(err)
@@ -1410,14 +1835,14 @@ func TestLoadMissingReturnsEmptyAndBrokenReturnsError(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.Load(); err == nil {
-		t.Fatal("broken state accepted: узел молча потерял бы токен")
+		t.Fatal("испорченное состояние принято: узел молча потерял бы токен")
 	}
 }
 ```
 
 - [ ] **Step 2: Прогнать и убедиться, что не компилируется**
 
-Run: `make unit`
+Run: focused `make unit` по пакету `internal/nodeagent/state` с `-mod=readonly`.
 Expected: FAIL — `undefined: Store`.
 
 - [ ] **Step 3: Реализовать `state.go` (дословный исходник)**
@@ -1444,6 +1869,8 @@ const (
 	stateFile      = "state.json"
 )
 
+var errNoDir = errors.New("state: каталог не задан")
+
 type Store struct{ Dir string }
 
 type Applied struct {
@@ -1464,7 +1891,14 @@ type NodeState struct {
 // Повторный вызов не перевыпускает ключ: смена ключа требует правки сервера у
 // администратора, поэтому «сгенерировать заново» — не восстановление, а поломка.
 func (s *Store) EnsureKey() (string, bool, error) {
-	if _, err := os.Stat(filepath.Join(s.Dir, privateKeyFile)); err == nil {
+	if s.Dir == "" {
+		return "", false, errNoDir
+	}
+	path := filepath.Join(s.Dir, privateKeyFile)
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return "", false, fmt.Errorf("state: права ключа: %w", err)
+		}
 		key, err := s.PrivateKey()
 		if err != nil {
 			return "", false, err
@@ -1477,13 +1911,16 @@ func (s *Store) EnsureKey() (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("state: генерация ключа: %w", err)
 	}
-	if err := writeAtomic(filepath.Join(s.Dir, privateKeyFile), []byte(key.String())); err != nil {
+	if err := writeAtomic(path, []byte(key.String())); err != nil {
 		return "", false, err
 	}
 	return key.PublicKey().String(), true, nil
 }
 
 func (s *Store) PrivateKey() (wgtypes.Key, error) {
+	if s.Dir == "" {
+		return wgtypes.Key{}, errNoDir
+	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, privateKeyFile))
 	if err != nil {
 		return wgtypes.Key{}, fmt.Errorf("state: чтение ключа: %w", err)
@@ -1499,6 +1936,9 @@ func (s *Store) PrivateKey() (wgtypes.Key, error) {
 // и ошибку, если файл испорчен. Второе важно: молча начать с нуля значило бы
 // отправить узел в enroll без bootstrap-токена и оставить без доступа.
 func (s *Store) Load() (NodeState, error) {
+	if s.Dir == "" {
+		return NodeState{}, errNoDir
+	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, stateFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return NodeState{}, nil
@@ -1514,6 +1954,9 @@ func (s *Store) Load() (NodeState, error) {
 }
 
 func (s *Store) Save(ns NodeState) error {
+	if s.Dir == "" {
+		return errNoDir
+	}
 	raw, err := json.Marshal(ns)
 	if err != nil {
 		return fmt.Errorf("state: сериализация: %w", err)
@@ -1562,13 +2005,14 @@ func writeAtomic(path string, data []byte) error {
 
 - [ ] **Step 4: Прогнать тесты**
 
-Run: `make unit`
-Expected: PASS.
+Run: focused `make unit` по пакету с `-mod=readonly`, затем полные `unit` и `vet`.
+Expected: PASS, шесть тестов `state`; полный прогон без новых падений.
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/nodeagent/state
+git add internal/nodeagent/state \
+  docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(a3): состояние узла — ключ 0600 и атомарная запись"
 ```
@@ -1578,7 +2022,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 ### Task 7: HTTPS-клиент узла — enroll, desired с ETag, отчёты, ротация
 
 **Files:**
-- Create: `internal/nodeagent/api/client.go`, `internal/nodeagent/api/client_test.go`
+- Create: `internal/nodeagent/api/client.go`
+- Create: `internal/nodeagent/api/client_test.go`
+- Modify: `docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md` — только фрагмент Task 7
 
 **Interfaces:**
 - Produces: `api.Config{BaseURL, CAFile, Env string; AllowInsecure bool; Timeout time.Duration}`,
@@ -1588,98 +2034,34 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `(*Client).Observed(ctx, serverID string, rep ObservedReport) error`,
   `(*Client).Heartbeat(ctx, serverID string, hb Heartbeat) error`,
   `(*Client).RotateToken(ctx, serverID string) (NodeToken, error)`,
-  `api.StatusError`, `api.DesiredSet`, `api.ObservedReport`, `api.Heartbeat`, `api.NodeToken`.
+  `api.StatusError`, `api.DesiredSet`, `api.DesiredPeer`, `api.EnrollRequest`, `api.ObservedReport`,
+  `api.ObservedPeer`, `api.Heartbeat`, `api.NodeToken`.
+
+Узел разговаривает с сервером только по документированному контракту `/internal/v1`
+(`api-spec/openapi.yaml`). Клиент обязан проверять сертификат в проде, различать 304 от
+ошибки, не читать бесконечное тело и не превращать неизмеренное в ноль.
 
 - [ ] **Step 1: Написать падающие тесты**
 
-`internal/nodeagent/api/client_test.go`:
+Используй ровно этот исходник `internal/nodeagent/api/client_test.go` (R30):
 
 ```go
 package api
 
 import (
 	"context"
-	"crypto/x509"
+	"crypto/tls"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
-
-func TestDesiredDistinguishesNotModified(t *testing.T) {
-	var gotETag string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotETag = r.Header.Get("If-None-Match")
-		if gotETag == `"abc"` {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		w.Header().Set("ETag", `"abc"`)
-		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,
-			"tunnel_address":"10.99.0.1/24","dns_servers":["10.99.0.1"],"keepalive_sec":25,
-			"peers":[],"measured_at":"2026-10-27T10:00:00Z"}`))
-	}))
-	defer srv.Close()
-	c, err := New(Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	set, etag, notModified, err := c.Desired(context.Background(), "s", "")
-	if err != nil || notModified || etag != `"abc"` || set.TunnelAddress != "10.99.0.1/24" {
-		t.Fatalf("first: set=%+v etag=%q nm=%v err=%v", set, etag, notModified, err)
-	}
-	_, etag, notModified, err = c.Desired(context.Background(), "s", `"abc"`)
-	if err != nil || !notModified || etag != `"abc"` {
-		t.Fatalf("second: etag=%q nm=%v err=%v", etag, notModified, err)
-	}
-}
-
-func TestStatusErrorCarriesCode(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"нет"}}`))
-	}))
-	defer srv.Close()
-	c, _ := New(Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
-	_, _, _, err := c.Desired(context.Background(), "s", "")
-	var se *StatusError
-	if !errors.As(err, &se) || se.Status != 401 || se.Code != "unauthenticated" {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestTLSVerificationAndCAFile(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,
-			"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[],
-			"measured_at":"2026-10-27T10:00:00Z"}`))
-	}))
-	defer srv.Close()
-	if _, _, _, err := mustClient(t, Config{BaseURL: srv.URL, Env: "prod"}).Desired(context.Background(), "s", ""); err == nil {
-		t.Fatal("self-signed certificate accepted without CA")
-	}
-	dir := t.TempDir()
-	ca := filepath.Join(dir, "ca.pem")
-	block := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
-	if err := os.WriteFile(ca, block, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c := mustClient(t, Config{BaseURL: srv.URL, Env: "prod", CAFile: ca})
-	if _, _, _, err := c.Desired(context.Background(), "s", ""); err != nil {
-		t.Fatalf("CA file ignored: %v", err)
-	}
-	_ = x509.NewCertPool()
-}
-
-func TestInsecureRefusedOutsideDev(t *testing.T) {
-	if _, err := New(Config{BaseURL: "https://example.com", Env: "prod", AllowInsecure: true}); err == nil {
-		t.Fatal("insecure transport accepted in prod")
-	}
-}
 
 func mustClient(t *testing.T, cfg Config) *Client {
 	t.Helper()
@@ -1692,51 +2074,578 @@ func mustClient(t *testing.T, cfg Config) *Client {
 	}
 	return c
 }
+
+func TestNewValidatesConfig(t *testing.T) {
+	bad := []struct {
+		name string
+		cfg  Config
+	}{
+		{"пустой адрес", Config{Env: "dev", AllowInsecure: true}},
+		{"http вне dev", Config{BaseURL: "http://example.com", Env: "prod"}},
+		{"пропуск проверки вне dev", Config{BaseURL: "https://example.com", Env: "prod", AllowInsecure: true}},
+		{"пропуск проверки без окружения", Config{BaseURL: "https://example.com", AllowInsecure: true}},
+		{"адрес без хоста", Config{BaseURL: "https:///x", Env: "prod"}},
+		{"неподдерживаемая схема", Config{BaseURL: "ftp://example.com", Env: "prod"}},
+		{"http в dev без пропуска проверки", Config{BaseURL: "http://127.0.0.1:1", Env: "dev"}},
+		{"параметры в адресе", Config{BaseURL: "https://example.com/?a=1", Env: "prod"}},
+		{"пустой запрос в адресе", Config{BaseURL: "https://example.com?", Env: "prod"}},
+		{"фрагмент в адресе", Config{BaseURL: "https://example.com/#f", Env: "prod"}},
+		{"учётные данные в адресе", Config{BaseURL: "https://user:pass@example.com", Env: "prod"}},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := New(tc.cfg); err == nil {
+				t.Fatal("недопустимая конфигурация принята")
+			}
+		})
+	}
+	if _, err := New(Config{BaseURL: "http://127.0.0.1:1", Env: "dev", AllowInsecure: true}); err != nil {
+		t.Fatalf("dev-стенд по http отвергнут: %v", err)
+	}
+}
+
+func TestNewDefaultsAndTrimsBaseURL(t *testing.T) {
+	c, err := New(Config{BaseURL: "https://example.com/", Env: "prod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.baseURL != "https://example.com" {
+		t.Fatalf("базовый адрес %q; ожидался без завершающей косой черты", c.baseURL)
+	}
+	if c.hc.Timeout != 15*time.Second {
+		t.Fatalf("таймаут %s; ожидалось 15s", c.hc.Timeout)
+	}
+	tr, ok := c.hc.Transport.(*http.Transport)
+	if !ok || tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatal("минимальная версия TLS не 1.2")
+	}
+	c, err = New(Config{BaseURL: "https://example.com", Env: "prod", Timeout: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.hc.Timeout != 3*time.Second {
+		t.Fatalf("таймаут %s; ожидалось 3s", c.hc.Timeout)
+	}
+}
+
+func TestNewRejectsCAFileWithoutCertificates(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(ca, []byte("не сертификат"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Config{BaseURL: "https://example.com", Env: "prod", CAFile: ca}); err == nil {
+		t.Fatal("файл CA без сертификатов принят")
+	}
+	if _, err := New(Config{BaseURL: "https://example.com", Env: "prod", CAFile: filepath.Join(dir, "нет.pem")}); err == nil {
+		t.Fatal("отсутствующий файл CA принят")
+	}
+}
+
+func TestDesiredDistinguishesNotModified(t *testing.T) {
+	var gotETag, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotETag = r.Header.Get("If-None-Match")
+		gotAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/internal/v1/nodes/s/desired" {
+			t.Errorf("путь запроса %q", r.URL.Path)
+		}
+		w.Header().Set("ETag", `"abc"`)
+		if gotETag == `"abc"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":["10.99.0.1"],"keepalive_sec":25,` +
+			`"peers":[{"public_key":"k","allowed_ips":["10.99.0.2/32"],` +
+			`"expires_at":"2026-11-27T10:00:00Z","state":"active"}],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("токен-узла")
+	set, etag, notModified, err := c.Desired(context.Background(), "s", "")
+	if err != nil || notModified || etag != `"abc"` || set.TunnelAddress != "10.99.0.1/24" {
+		t.Fatalf("первый ответ: набор %+v, etag %q, notModified %v, ошибка %v", set, etag, notModified, err)
+	}
+	if gotETag != "" {
+		t.Fatalf("первый запрос отправлен с If-None-Match %q", gotETag)
+	}
+	if gotAuth != "Bearer токен-узла" {
+		t.Fatal("запрос отправлен без токена узла")
+	}
+	if set.ConfigVersion != 1 || set.MTU != 1420 || set.ListenPort != 51820 || set.KeepaliveSec != 25 {
+		t.Fatalf("числовые поля набора: %+v", set)
+	}
+	if len(set.DNSServers) != 1 || set.DNSServers[0] != "10.99.0.1" {
+		t.Fatalf("DNS-серверы %v", set.DNSServers)
+	}
+	if len(set.Peers) != 1 || set.Peers[0].State != "active" || set.Peers[0].PublicKey != "k" {
+		t.Fatalf("пиры %+v", set.Peers)
+	}
+	if set.MeasuredAt.IsZero() || set.MeasuredAt.UTC().Format(time.RFC3339) != "2026-10-27T10:00:00Z" {
+		t.Fatalf("measured_at %s", set.MeasuredAt)
+	}
+	_, etag, notModified, err = c.Desired(context.Background(), "s", `"abc"`)
+	if err != nil || !notModified || etag != `"abc"` {
+		t.Fatalf("второй ответ: etag %q, notModified %v, ошибка %v", etag, notModified, err)
+	}
+	if gotETag != `"abc"` {
+		t.Fatalf("второй запрос отправлен с If-None-Match %q", gotETag)
+	}
+}
+
+func TestDesiredRejectsBrokenJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"server_id":`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	if _, _, _, err := c.Desired(context.Background(), "s", ""); err == nil {
+		t.Fatal("битый JSON принят за набор")
+	}
+}
+
+func TestDesiredRequiresOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != http.StatusNoContent {
+		t.Fatalf("204 принят за пустой набор: %v", err)
+	}
+}
+
+func TestDesiredRejectsIncompleteSet(t *testing.T) {
+	bodies := []string{
+		`null`,
+		`{}`,
+		`{"server_id":"s","config_version":0,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"","dns_servers":[],"keepalive_sec":25,"peers":[],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`,
+		`{"server_id":"s","config_version":0,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[]}`,
+	}
+	for _, body := range bodies {
+		body := body
+		t.Run(body, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"abc"`)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+			_, _, _, err := c.Desired(context.Background(), "s", "")
+			if err == nil {
+				t.Fatal("неполный набор принят")
+			}
+			var se *StatusError
+			if errors.As(err, &se) {
+				t.Fatalf("неполный набор выдан за отказ сервера: %v", err)
+			}
+		})
+	}
+}
+
+func TestStatusErrorCarriesCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"нет"}}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != 401 || se.Code != "unauthenticated" {
+		t.Fatalf("ошибка %v; ожидался StatusError 401 unauthenticated", err)
+	}
+}
+
+func TestTLSVerificationAndCAFile(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`))
+	}))
+	defer srv.Close()
+	if _, _, _, err := mustClient(t, Config{BaseURL: srv.URL, Env: "prod"}).Desired(context.Background(), "s", ""); err == nil {
+		t.Fatal("самоподписанный сертификат принят без CA")
+	}
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	block := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(ca, block, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "prod", CAFile: ca})
+	if _, _, _, err := c.Desired(context.Background(), "s", ""); err != nil {
+		t.Fatalf("файл CA не применён: %v", err)
+	}
+}
+
+func TestEnrollSendsNoToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/nodes/enroll" {
+			t.Errorf("запрос %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "" {
+			t.Error("enroll отправлен с заголовком авторизации")
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("Content-Type enroll %q", r.Header.Get("Content-Type"))
+		}
+		if r.Header.Get("Accept") != "application/json" {
+			t.Errorf("Accept enroll %q", r.Header.Get("Accept"))
+		}
+		var in struct {
+			BootstrapToken string `json:"bootstrap_token"`
+			PublicKey      string `json:"public_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			t.Errorf("тело enroll не разобрано: %v", err)
+		}
+		if in.BootstrapToken != "стартовый" || in.PublicKey != "ключ" {
+			t.Errorf("тело enroll: стартовый токен %q, ключ %q", in.BootstrapToken, in.PublicKey)
+		}
+		_, _ = w.Write([]byte(`{"server_id":"srv","node_token":"новый-токен"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("прежний-токен")
+	nt, err := c.Enroll(context.Background(), "стартовый", "ключ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nt.ServerID != "srv" || nt.NodeToken != "новый-токен" {
+		t.Fatalf("ответ enroll: сервер %q", nt.ServerID)
+	}
+}
+
+func TestReportExpects204(t *testing.T) {
+	status := http.StatusNoContent
+	var seen []string
+	var hb, obs map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer токен-узла" {
+			t.Error("отчёт отправлен без токена узла")
+		}
+		if r.URL.Path == "/internal/v1/nodes/srv/heartbeat" {
+			if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
+				t.Errorf("тело heartbeat не разобрано: %v", err)
+			}
+		}
+		if r.URL.Path == "/internal/v1/nodes/srv/observed" {
+			if err := json.NewDecoder(r.Body).Decode(&obs); err != nil {
+				t.Errorf("тело observed не разобрано: %v", err)
+			}
+		}
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("токен-узла")
+	rep := ObservedReport{
+		ConfigVersion: 3,
+		Peers:         []ObservedPeer{{PublicKey: "k", RxBytes: 1, TxBytes: 2}},
+	}
+	if err := c.Observed(context.Background(), "srv", rep); err != nil {
+		t.Fatalf("отчёт отклонён: %v", err)
+	}
+	if len(seen) != 1 || seen[0] != "POST /internal/v1/nodes/srv/observed" {
+		t.Fatalf("запросы %v", seen)
+	}
+	peers, ok := obs["peers"].([]any)
+	if !ok || len(peers) != 1 {
+		t.Fatalf("пиры observed %v; ожидался массив из одного элемента", obs["peers"])
+	}
+	peer, ok := peers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("пиер observed %v", peers[0])
+	}
+	if hs, exists := peer["latest_handshake"]; !exists || hs != nil {
+		t.Fatalf("latest_handshake %v; ожидался ключ со значением null", hs)
+	}
+	load := 0.5
+	if err := c.Heartbeat(context.Background(), "srv", Heartbeat{
+		AgentVersion: "1.0", AgentUptimeSec: 60, Load1: &load, AppliedConfigVersion: 3,
+	}); err != nil {
+		t.Fatalf("heartbeat отклонён: %v", err)
+	}
+	if len(seen) != 2 || seen[1] != "POST /internal/v1/nodes/srv/heartbeat" {
+		t.Fatalf("запросы %v", seen)
+	}
+	if _, ok := hb["cpu_pct"]; !ok || hb["cpu_pct"] != nil {
+		t.Fatalf("cpu_pct %v; ожидался ключ со значением null", hb["cpu_pct"])
+	}
+	if hb["load1"] != 0.5 {
+		t.Fatalf("load1 %v; ожидалось 0.5", hb["load1"])
+	}
+	status = http.StatusOK
+	err := c.Heartbeat(context.Background(), "srv", Heartbeat{
+		AgentVersion: "1.0", AgentUptimeSec: 60, Load1: &load, AppliedConfigVersion: 3,
+	})
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != 200 {
+		t.Fatalf("ответ 200 принят за успешный heartbeat: %v", err)
+	}
+	if err.Error() != "api: отказ 200" {
+		t.Fatalf("текст ошибки %q; ожидался %q", err.Error(), "api: отказ 200")
+	}
+	err = c.Observed(context.Background(), "srv", rep)
+	if !errors.As(err, &se) || se.Status != 200 {
+		t.Fatalf("ответ 200 принят за успешный отчёт: %v", err)
+	}
+}
+
+func TestRotateTokenSendsCurrentToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/nodes/srv/token/rotate" {
+			t.Errorf("запрос %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"server_id":"srv","node_token":"следующий"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("текущий")
+	nt, err := c.RotateToken(context.Background(), "srv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nt.ServerID != "srv" || nt.NodeToken != "следующий" {
+		t.Fatalf("ответ ротации: сервер %q, токен %q", nt.ServerID, nt.NodeToken)
+	}
+	if gotAuth != "Bearer текущий" {
+		t.Fatal("ротация отправлена не с текущим токеном")
+	}
+}
+
+func TestResponseBodyLimit(t *testing.T) {
+	big := strings.Repeat("а", 1<<20)
+	status := http.StatusOK
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"server_id":"` + big + `"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	if _, _, _, err := c.Desired(context.Background(), "s", ""); err == nil {
+		t.Fatal("тело больше 1 МиБ принято")
+	}
+	status = http.StatusUnauthorized
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	if err == nil || !strings.Contains(err.Error(), "больше") {
+		t.Fatalf("ошибка ошибочного ответа %v; ожидалось превышение предела", err)
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		t.Fatalf("предел тела подменён StatusError: %v", err)
+	}
+}
+
+func TestDesiredEscapesServerID(t *testing.T) {
+	var escaped string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escaped = r.URL.EscapedPath()
+		w.Header().Set("ETag", `"abc"`)
+		_, _ = w.Write([]byte(`{"server_id":"a/b","config_version":1,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	if _, _, _, err := c.Desired(context.Background(), "a/b", ""); err != nil {
+		t.Fatal(err)
+	}
+	if escaped != "/internal/v1/nodes/a%2Fb/desired" {
+		t.Fatalf("путь запроса %q; идентификатор сервера не закодирован", escaped)
+	}
+}
+
+func TestRedirectRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:1/other", http.StatusFound)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != http.StatusFound {
+		t.Fatalf("перенаправление не отвергнуто: %v", err)
+	}
+}
+
+func TestTokenEndpointsRequireOK(t *testing.T) {
+	status := http.StatusNoContent
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("текущий")
+	var se *StatusError
+	if _, err := c.Enroll(context.Background(), "стартовый", "ключ"); !errors.As(err, &se) || se.Status != http.StatusNoContent {
+		t.Fatalf("enroll принял 204: %v", err)
+	}
+	if _, err := c.RotateToken(context.Background(), "srv"); !errors.As(err, &se) || se.Status != http.StatusNoContent {
+		t.Fatalf("ротация приняла 204: %v", err)
+	}
+	status = http.StatusNotModified
+	if _, err := c.Enroll(context.Background(), "стартовый", "ключ"); !errors.As(err, &se) || se.Status != http.StatusNotModified {
+		t.Fatalf("enroll принял 304: %v", err)
+	}
+	if _, err := c.RotateToken(context.Background(), "srv"); !errors.As(err, &se) || se.Status != http.StatusNotModified {
+		t.Fatalf("ротация приняла 304: %v", err)
+	}
+}
 ```
+
+R30: диагностика тестов в плане была английской; здесь она русская. Строка
+`_ = x509.NewCertPool()` и импорт `crypto/x509` из плана удалены: пул там создавался и
+выбрасывался, то есть ничего не проверял. Литеральных ключей WireGuard в этом пакете нет.
 
 - [ ] **Step 2: Прогнать и убедиться, что не компилируется**
 
-Run: `make unit`
-Expected: FAIL — `undefined: New`.
+Run: сосредоточенный `make unit` по пакету `internal/nodeagent/api` с `-mod=readonly`.
+Expected: FAIL — `undefined: New`, `undefined: Config`, `undefined: Client`.
 
-- [ ] **Step 3: Реализовать `client.go` (схема; ключевые функции дословно)**
+- [ ] **Step 3: Реализовать `client.go`**
 
-Требования:
+Требования к `New` (R31):
 
-- `New`: `BaseURL` обязателен, завершающий `/` срезается. `MinVersion: tls.VersionTLS12`.
-  `AllowInsecure` при `Env != "dev"` — ошибка конфигурации. `CAFile` читается, пул без
-  сертификатов — ошибка. `Timeout` по умолчанию 15 с. Тело ответа ограничено 1 MiB.
-- `do(ctx, method, path string, in, out any, token string) (int, http.Header, error)`:
-  JSON-тело, `Authorization: Bearer <token>` при непустом токене, `Accept:
-  application/json`, `Content-Type: application/json`; при статусе ≥ 400 разбирает
-  `{"error":{"code":…}}` в `*StatusError`; 304 не ошибка и тела не читает.
-- `Desired` возвращает `(set, etag, notModified, err)`; `etag` берётся из заголовка и при
-  304 тоже (сервер его присылает).
-- Типы ответов повторяют JSON сервера один в один: `DesiredSet{ServerID, ConfigVersion, MTU,
-  ListenPort, TunnelAddress string, DNSServers []string, KeepaliveSec int, Peers []DesiredPeer,
-  MeasuredAt time.Time}` и `DesiredPeer{PublicKey string, AllowedIPs []string, ExpiresAt
-  time.Time, State string}` с тегами `server_id`, `config_version`, `mtu`, `listen_port`,
-  `tunnel_address`, `dns_servers`, `keepalive_sec`, `peers`, `measured_at`, `public_key`,
-  `allowed_ips`, `expires_at`, `state`. `State` не отбрасывается: сервер уже отдаёт его
-  (`internal/servers/desired.go`), а без него узел не может отдать адрес активному ключу
-  при ротации (задача 2). Поле `DeviceID` API узлу не отдаёт и узел не заводит.
-- `Enroll` — POST без токена, ответ `NodeToken`, `Cache-Control` не проверяется.
-- Остальные типы — поле в поле со схемами `api-spec/openapi.yaml`, с дословными именами
-  Go и тегами JSON: их использует цикл (задача 8), поэтому переименование здесь ломает
-  соседнюю задачу. `LatestHandshake` — указатель, а не `time.Time`: «рукопожатия не
-  было» приходит как `null`, и нулевое время в отчёте означало бы 1970 год.
+- `BaseURL` обязателен; разбирается через `url.Parse`; завершающая `/` срезается.
+- Адрес не должен содержать query (включая пустой `?`, `ForceQuery`), fragment или
+  userinfo: такой `BaseURL` — ошибка.
+- Редиректы не выполняются: `CheckRedirect` возвращает `http.ErrUseLastResponse`;
+  ответ `3xx` — `*StatusError`.
+- Вне dev допустим только `https`: `http` принимается лишь при `Env == "dev"` и
+  `AllowInsecure == true`.
+- `AllowInsecure == true` при `Env != "dev"` — ошибка конфигурации.
+- `CAFile`: файл читается, `x509.NewCertPool` + `AppendCertsFromPEM`; `false` — ошибка.
+  Отсутствующий файл — ошибка с `%w`.
+- `MinVersion: tls.VersionTLS12`; `AllowInsecure` ставит `InsecureSkipVerify`.
+- `Timeout` по умолчанию 15 с (при `<= 0`).
+
+Дословно — тип клиента, конфигурация и тип ошибки:
 
 ```go
+// maxBody ограничивает ответ: сломанный сервер не вынудит узел вычитать гигабайты.
+const maxBody = 1 << 20
+
+const defaultTimeout = 15 * time.Second
+
+type Config struct {
+	BaseURL       string
+	CAFile        string
+	Env           string
+	AllowInsecure bool
+	Timeout       time.Duration
+}
+
+type Client struct {
+	baseURL string
+	token   string
+	hc      *http.Client
+}
+
+type StatusError struct {
+	Status int
+	Code   string
+}
+
+func (e *StatusError) Error() string {
+	if e.Code == "" {
+		return fmt.Sprintf("api: отказ %d", e.Status)
+	}
+	return fmt.Sprintf("api: отказ %d (%s)", e.Status, e.Code)
+}
+```
+
+`SetToken` сохраняет токен для последующих запросов; вызывается из одного горутины
+цикла (задача 8), поэтому мьютекс не нужен.
+
+`do` (R32):
+
+```go
+func (c *Client) do(ctx context.Context, method, path string, in, out any, token string, header http.Header) (int, http.Header, error)
+```
+
+- Тело `in` кодируется JSON; заголовки `Accept: application/json`,
+  `Content-Type: application/json` при теле, `Authorization: Bearer <token>` при непустом
+  токене, затем заголовки из `header`.
+- Ответ читается через `io.LimitReader` не более чем `maxBody+1` байт; больше
+  `maxBody` — ошибка, тело не разбирается.
+- `304` — не ошибка: статус и заголовки возвращаются, тело не читается и `out` не
+  разбирается.
+- `204` — тело не читается: статус и заголовки возвращаются, `out` не разбирается.
+- Статус `>= 300` (кроме обработанного выше `304`) — `*StatusError`; `Code` берётся из
+  `{"error":{"code":...}}`, при неразбираемом теле остаётся пустым.
+- Иной статус с `out != nil` — разбор JSON; ошибка разбора возвращается, а не глотается.
+
+Методы:
+
+- `Enroll`: `POST /internal/v1/nodes/enroll`, тело `EnrollRequest`, токен не передаётся
+  (даже если `SetToken` уже вызывался), ответ — `NodeToken`; требуется ровно `200`,
+  иной код — `*StatusError`.
+- `Desired`: `GET /internal/v1/nodes/{server_id}/desired`; при непустом `etag` —
+  заголовок `If-None-Match`; при 304 — `(DesiredSet{}, etag из заголовка, true, nil)`;
+  иначе требуется ровно `200`, иной код (включая 204) — `*StatusError` без etag; при 200 —
+  разобранный набор и `etag` из заголовка. Набор с пустым `server_id`, пустым
+  `tunnel_address` или нулевым `measured_at` отвергается ошибкой `api: неполный набор: нет …`
+  с перечнем отсутствующих полей (значения тела в текст не попадают); `config_version`
+  не проверяется.
+- `Observed`, `Heartbeat`: `POST` соответственно `/observed` и `/heartbeat` с текущим
+  токеном; ожидается ровно `204`; другой успешный код — `*StatusError` с пустым `Code`.
+- `RotateToken`: `POST /internal/v1/nodes/{server_id}/token/rotate` с текущим токеном,
+  ответ `NodeToken`; требуется ровно `200`, иной код — `*StatusError`; сам клиент токен
+  не подменяет — это решение цикла (задача 8).
+- `serverID` в пути кодируется `url.PathEscape`.
+
+Типы ответов повторяют JSON сервера один в один:
+
+```go
+type EnrollRequest struct {
+	BootstrapToken string `json:"bootstrap_token"`
+	PublicKey      string `json:"public_key"`
+}
+
 type NodeToken struct {
 	ServerID  string `json:"server_id"`
 	NodeToken string `json:"node_token"`
 }
 
+type DesiredSet struct {
+	ServerID      string        `json:"server_id"`
+	ConfigVersion int64         `json:"config_version"`
+	MTU           int           `json:"mtu"`
+	ListenPort    int           `json:"listen_port"`
+	TunnelAddress string        `json:"tunnel_address"`
+	DNSServers    []string      `json:"dns_servers"`
+	KeepaliveSec  int           `json:"keepalive_sec"`
+	Peers         []DesiredPeer `json:"peers"`
+	MeasuredAt    time.Time     `json:"measured_at"`
+}
+
+type DesiredPeer struct {
+	PublicKey  string    `json:"public_key"`
+	AllowedIPs []string  `json:"allowed_ips"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	State      string    `json:"state"`
+}
+
 type ObservedReport struct {
-	ConfigVersion     int64          `json:"config_version"`
-	InterfaceRxBytes  int64          `json:"interface_rx_bytes"`
-	InterfaceTxBytes  int64          `json:"interface_tx_bytes"`
-	Peers             []ObservedPeer `json:"peers"`
+	ConfigVersion    int64          `json:"config_version"`
+	InterfaceRxBytes int64          `json:"interface_rx_bytes"`
+	InterfaceTxBytes int64          `json:"interface_tx_bytes"`
+	Peers            []ObservedPeer `json:"peers"`
 }
 
 type ObservedPeer struct {
@@ -1755,491 +2664,188 @@ type Heartbeat struct {
 	Stale                bool     `json:"stale"`
 }
 ```
-- `Observed` и `Heartbeat` ожидают 204; иной успешный код — `StatusError`.
-- `RotateToken` — POST `/internal/v1/nodes/{id}/token/rotate` с текущим токеном.
 
-Дословно — тип ошибки и подпись `do`:
-
-```go
-type StatusError struct {
-	Status int
-	Code   string
-}
-
-func (e *StatusError) Error() string {
-	return fmt.Sprintf("api: отказ %d (%s)", e.Status, e.Code)
-}
-
-func (c *Client) do(ctx context.Context, method, path string, in, out any, token string) (int, http.Header, error)
-```
+`State` в `DesiredPeer` не отбрасывается: сервер его отдаёт, и без него узел не отличит
+активный ключ от старого при ротации (задача 2). `LatestHandshake`, `Load1`, `CPUPct` —
+указатели: «не измеряли» приходит как `null`, и ноль вместо `null` был бы ложью
+(ADR-006). Тексты ошибок русские с префиксом `api:`; токен и содержимое файлов в тексты
+ошибок не попадают.
 
 - [ ] **Step 4: Прогнать тесты**
 
-Run: `make unit`
-Expected: PASS, включая TLS-тесты.
+Run: сосредоточенный `make unit` по пакету, затем полные `unit` и `vet`.
+Expected: PASS, шестнадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
+не менялись (новых внешних зависимостей нет).
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/nodeagent/api
+git add internal/nodeagent/api docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(a3): HTTPS-клиент узла с ETag, отчётами и проверкой сертификата"
 ```
+
+Один новый локальный коммит, без amend и push.
 
 ---
 
 ### Task 8: Цикл узла — опрос, применение, отчёты, `stale`, ротация токена
 
+Актуальная семантика R6/R9/R33–R36 заменяет прежние шесть тестов и дословный блок.
+Полный исполняемый код и тесты находятся в файлах ниже, без второй копии исходников.
+
 **Files:**
 - Create: `internal/nodeagent/runtime/runner.go`, `internal/nodeagent/runtime/runner_test.go`
+- Modify: `internal/nodeagent/wg/applier.go`, `internal/nodeagent/wg/applier_test.go` — Snapshot и R6
+- Modify: этот план — только Task 5 и Task 8; `docs/testing-status.md` — три новых not-run
 
 **Interfaces:**
-- Consumes: `api.Client`, `wg.Applier`, `state.Store`.
-- Produces: `runtime.API`, `runtime.Applier`, `runtime.Store` (интерфейсы),
-  `runtime.Runner`, `(*Runner).Step(ctx) error`, `(*Runner).Run(ctx) error`.
-
-- [ ] **Step 1: Написать падающие тесты**
-
-`internal/nodeagent/runtime/runner_test.go` — fake-реализации и шесть сценариев:
 
 ```go
-package runtime
-
-import (
-	"context"
-	"errors"
-	"io"
-	"log/slog"
-	"testing"
-	"time"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"github.com/novavpn/novavpn/internal/nodeagent/api"
-	"github.com/novavpn/novavpn/internal/nodeagent/state"
-	"github.com/novavpn/novavpn/internal/nodeagent/wg"
-)
-
-type fakeAPI struct {
-	set         api.DesiredSet
-	etag        string
-	notModified bool
-	desiredErr  error
-	observed    int
-	heartbeats  []api.Heartbeat
-	rotated     int
-	etags       []string
-}
-
-func (f *fakeAPI) Desired(_ context.Context, _ string, etag string) (api.DesiredSet, string, bool, error) {
-	f.etags = append(f.etags, etag)
-	return f.set, f.etag, f.notModified, f.desiredErr
-}
-func (f *fakeAPI) Observed(context.Context, string, api.ObservedReport) error {
-	f.observed++
-	return nil
-}
-func (f *fakeAPI) Heartbeat(_ context.Context, _ string, hb api.Heartbeat) error {
-	f.heartbeats = append(f.heartbeats, hb)
-	return nil
-}
-func (f *fakeAPI) RotateToken(context.Context, string) (api.NodeToken, error) {
-	f.rotated++
-	return api.NodeToken{ServerID: "s", NodeToken: "new"}, nil
-}
-
-type fakeApplier struct {
-	calls int
-	err   error
-}
-
-func (f *fakeApplier) Apply(wg.Target) (wg.ApplyResult, error) {
-	f.calls++
-	return wg.ApplyResult{}, f.err
-}
-
-type fakeStore struct {
-	ns    state.NodeState
-	saves int
-}
-
-func (f *fakeStore) Load() (state.NodeState, error) { return f.ns, nil }
-func (f *fakeStore) Save(ns state.NodeState) error  { f.ns = ns; f.saves++; return nil }
-func (f *fakeStore) PrivateKey() (wgtypes.Key, error) {
-	return wgtypes.GeneratePrivateKey()
-}
-
-func newRunner(a *fakeAPI, ap *fakeApplier, s *fakeStore) *Runner {
-	return &Runner{
-		API: a, Applier: ap, Store: s, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Iface: "wg0", Interval: 25 * time.Second, TokenTTL: 24 * time.Hour,
-		Version: "test", Now: time.Now, started: time.Now(),
-	}
-}
-
-func validSet() api.DesiredSet {
-	return api.DesiredSet{
-		ServerID: "s", ConfigVersion: 7, MTU: 1420, ListenPort: 51820,
-		TunnelAddress: "10.99.0.1/24", DNSServers: []string{"10.99.0.1"}, KeepaliveSec: 25,
-		Peers: []api.DesiredPeer{{
-			PublicKey:  "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
-			AllowedIPs: []string{"10.99.0.2/32"}, State: "active",
-		}},
-	}
-}
-
-// TestStepFirstPollIgnoresStoredETag — сохранённый ETag относится к прошлому
-// запуску. После перезагрузки интерфейс пуст, и ответ 304 оставил бы узел без
-// пиеров до следующего изменения набора на сервере. Первый опрос обязан идти
-// без ETag, второй — с полученным.
-func TestStepFirstPollIgnoresStoredETag(t *testing.T) {
-	a := &fakeAPI{set: validSet(), etag: `"e2"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{
-		ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now(),
-		Applied: state.Applied{ConfigVersion: 6, ETag: `"e1"`},
-	}}
-	r := newRunner(a, ap, s)
-	for i := 0; i < 2; i++ {
-		if err := r.Step(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if len(a.etags) != 2 || a.etags[0] != "" || a.etags[1] != `"e2"` {
-		t.Fatalf("etags = %q, want [\"\", \"e2\"]", a.etags)
-	}
-	if ap.calls != 2 {
-		t.Fatalf("apply calls = %d, want 2: полный набор обязан примениться на первом опросе", ap.calls)
-	}
-}
-
-func TestStepAppliesAndSaves(t *testing.T) {
-	a := &fakeAPI{set: validSet(), etag: `"e1"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if ap.calls != 1 || a.observed != 1 || s.ns.Applied.ConfigVersion != 7 || s.ns.Applied.ETag != `"e1"` {
-		t.Fatalf("calls=%d observed=%d state=%+v", ap.calls, a.observed, s.ns.Applied)
-	}
-	if len(a.heartbeats) != 1 || a.heartbeats[0].Stale {
-		t.Fatalf("heartbeats = %+v", a.heartbeats)
-	}
-}
-
-func TestStepOnNotModifiedDoesNotTouchDevice(t *testing.T) {
-	a := &fakeAPI{notModified: true, etag: `"e1"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if ap.calls != 0 || a.observed != 0 || len(a.heartbeats) != 1 {
-		t.Fatalf("calls=%d observed=%d hb=%d", ap.calls, a.observed, len(a.heartbeats))
-	}
-}
-
-func TestStepReportsStaleWhenDesiredFails(t *testing.T) {
-	a := &fakeAPI{desiredErr: errors.New("нет сети")}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if ap.calls != 0 || len(a.heartbeats) != 1 || !a.heartbeats[0].Stale {
-		t.Fatalf("calls=%d heartbeats=%+v", ap.calls, a.heartbeats)
-	}
-}
-
-func TestStepDoesNotReportObservedWhenApplyFails(t *testing.T) {
-	a := &fakeAPI{set: validSet(), etag: `"e1"`}
-	ap := &fakeApplier{err: errors.New("нет прав")}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "t", TokenIssuedAt: time.Now()}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if a.observed != 0 || s.ns.Applied.ConfigVersion != 0 {
-		t.Fatalf("observed=%d state=%+v", a.observed, s.ns.Applied)
-	}
-}
-
-func TestStepRotatesTokenAfterTTL(t *testing.T) {
-	a := &fakeAPI{notModified: true, etag: `"e1"`}
-	ap := &fakeApplier{}
-	s := &fakeStore{ns: state.NodeState{ServerID: "s", NodeToken: "old", TokenIssuedAt: time.Now().Add(-25 * time.Hour)}}
-	if err := newRunner(a, ap, s).Step(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if a.rotated != 1 || s.ns.NodeToken != "new" {
-		t.Fatalf("rotated=%d token=%q", a.rotated, s.ns.NodeToken)
-	}
-}
-```
-
-- [ ] **Step 2: Прогнать и убедиться, что не компилируется**
-
-Run: `make unit`
-Expected: FAIL — `undefined: Runner`.
-
-- [ ] **Step 3: Реализовать `runner.go` (дословный исходник)**
-
-```go
-// Package runtime — цикл жизни узла: получить desired set, применить дельту,
-// отчитаться, пережить недоступность API. Никакой сети и никакого netlink здесь
-// нет: оба спрятаны за интерфейсами, поэтому весь цикл проверяется на fake.
-package runtime
-
-import (
-	"context"
-	"errors"
-	"fmt"
-	"log/slog"
-	"math/rand/v2"
-	"net/netip"
-	"os"
-	"strconv"
-	"strings"
-	"time"
-
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
-
-	"github.com/novavpn/novavpn/internal/nodeagent/api"
-	"github.com/novavpn/novavpn/internal/nodeagent/state"
-	"github.com/novavpn/novavpn/internal/nodeagent/wg"
-)
-
 type API interface {
-	Desired(ctx context.Context, serverID, etag string) (api.DesiredSet, string, bool, error)
-	Observed(ctx context.Context, serverID string, rep api.ObservedReport) error
-	Heartbeat(ctx context.Context, serverID string, hb api.Heartbeat) error
-	RotateToken(ctx context.Context, serverID string) (api.NodeToken, error)
+    SetToken(string)
+    Desired(context.Context, string, string) (api.DesiredSet, string, bool, error)
+    Observed(context.Context, string, api.ObservedReport) error
+    Heartbeat(context.Context, string, api.Heartbeat) error
+    RotateToken(context.Context, string) (api.NodeToken, error)
 }
-
 type Applier interface {
-	Apply(t wg.Target) (wg.ApplyResult, error)
+    Apply(wg.Target) (wg.ApplyResult, error)
+    Snapshot() (wg.LiveState, error)
 }
-
 type Store interface {
-	Load() (state.NodeState, error)
-	Save(state.NodeState) error
-	PrivateKey() (wgtypes.Key, error)
-}
-
-type Runner struct {
-	API       API
-	Applier   Applier
-	Store     Store
-	Log       *slog.Logger
-	Iface     string
-	Interval  time.Duration
-	TokenTTL  time.Duration
-	Version   string
-	Now       func() time.Time
-	started   time.Time
-	// reconciled — набор уже применён в этом процессе. До первого применения
-	// сохранённый ETag не отправляется: он описывает прошлый запуск, а интерфейс
-	// после перезагрузки может быть пуст.
-	reconciled bool
-}
-
-func (r *Runner) Run(ctx context.Context) error {
-	if r.started.IsZero() {
-		r.started = r.Now()
-	}
-	for {
-		if err := r.Step(ctx); err != nil {
-			r.Log.Error("шаг узла не выполнен", "error", err)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(r.delay()):
-		}
-	}
-}
-
-// delay — 25 с ±10 %. Симметричный разброс разводит узлы по фазе, не растягивая
-// верхнюю границу: при базе 25 с худший случай 27,5 с, поэтому отзыв укладывается
-// в критерий «≤ 30 с» (спецификация §4.3).
-func (r *Runner) delay() time.Duration {
-	base := r.Interval
-	if base <= 0 {
-		base = 25 * time.Second
-	}
-	return base + time.Duration(rand.Int64N(int64(base)/5)) - base/10
-}
-
-func (r *Runner) Step(ctx context.Context) error {
-	st, err := r.Store.Load()
-	if err != nil {
-		return err
-	}
-	if st.ServerID == "" || st.NodeToken == "" {
-		return errors.New("runtime: узел не зарегистрирован: выполните enroll")
-	}
-	sentETag := st.Applied.ETag
-	if !r.reconciled {
-		sentETag = ""
-	}
-	set, etag, notModified, err := r.API.Desired(ctx, st.ServerID, sentETag)
-	if err != nil {
-		r.Log.Warn("desired set недоступен, держим последний набор", "error", err)
-		r.sendHeartbeat(ctx, st, true)
-		return nil
-	}
-	if notModified {
-		r.reconciled = true
-		r.sendHeartbeat(ctx, st, false)
-		return r.maybeRotate(ctx, &st)
-	}
-	key, err := r.Store.PrivateKey()
-	if err != nil {
-		return err
-	}
-	target, err := targetFrom(set, key.String())
-	if err != nil {
-		return err
-	}
-	res, err := r.Applier.Apply(target)
-	if err != nil {
-		r.Log.Error("применение набора не удалось", "error", err)
-		r.sendHeartbeat(ctx, st, false)
-		return nil
-	}
-	r.reconciled = true
-	st.Applied = state.Applied{
-		ConfigVersion: set.ConfigVersion, ETag: etag, AppliedAt: r.Now().UTC(), Peers: len(set.Peers),
-	}
-	if err := r.Store.Save(st); err != nil {
-		return err
-	}
-	if err := r.API.Observed(ctx, st.ServerID, report(set.ConfigVersion, res.Before)); err != nil {
-		r.Log.Warn("отчёт observed не принят", "error", err)
-	}
-	r.sendHeartbeat(ctx, st, false)
-	return r.maybeRotate(ctx, &st)
-}
-
-// maybeRotate меняет узловой токен заранее, а не после отказа: отозванный токен
-// не даёт выполнить ротацию, и узел остался бы без доступа до ручного enroll.
-func (r *Runner) maybeRotate(ctx context.Context, st *state.NodeState) error {
-	ttl := r.TokenTTL
-	if ttl <= 0 {
-		ttl = 24 * time.Hour
-	}
-	if r.Now().Sub(st.TokenIssuedAt) < ttl {
-		return nil
-	}
-	tok, err := r.API.RotateToken(ctx, st.ServerID)
-	if err != nil {
-		return fmt.Errorf("runtime: ротация токена: %w", err)
-	}
-	st.NodeToken = tok.NodeToken
-	st.TokenIssuedAt = r.Now().UTC()
-	return r.Store.Save(*st)
-}
-
-func (r *Runner) sendHeartbeat(ctx context.Context, st state.NodeState, stale bool) {
-	hb := api.Heartbeat{
-		AgentVersion: r.Version, AppliedConfigVersion: st.Applied.ConfigVersion, Stale: stale,
-		AgentUptimeSec: int64(r.Now().Sub(r.started).Seconds()),
-		Load1:          load1(),
-		// CPUPct остаётся null: честный процент требует окна между двумя замерами
-		// /proc/stat, а подставлять «примерно» запрещено ADR-006.
-	}
-	if err := r.API.Heartbeat(ctx, st.ServerID, hb); err != nil {
-		r.Log.Warn("heartbeat не принят", "error", err)
-	}
-}
-
-func targetFrom(set api.DesiredSet, privateKey string) (wg.Target, error) {
-	addr, err := netip.ParsePrefix(set.TunnelAddress)
-	if err != nil {
-		return wg.Target{}, fmt.Errorf("runtime: tunnel_address %q: %w", set.TunnelAddress, err)
-	}
-	peers := make([]wg.TargetPeer, 0, len(set.Peers))
-	for _, p := range set.Peers {
-		ips := make([]netip.Prefix, 0, len(p.AllowedIPs))
-		for _, raw := range p.AllowedIPs {
-			prefix, err := netip.ParsePrefix(raw)
-			if err != nil {
-				return wg.Target{}, fmt.Errorf("runtime: allowed ip %q: %w", raw, err)
-			}
-			ips = append(ips, prefix)
-		}
-		kind := wg.PeerKind(p.State)
-		if kind != wg.StateActive && kind != wg.StateRotatingOldKey {
-			return wg.Target{}, fmt.Errorf("runtime: пиер %s: неизвестное состояние %q", p.PublicKey, p.State)
-		}
-		peers = append(peers, wg.TargetPeer{
-			PublicKey: p.PublicKey, AllowedIPs: ips, KeepaliveSec: set.KeepaliveSec, State: kind,
-		})
-	}
-	return wg.Target{
-		PrivateKey: privateKey, ListenPort: set.ListenPort, MTU: set.MTU,
-		TunnelAddress: addr, Peers: peers,
-	}, nil
-}
-
-func report(version int64, before wg.LiveState) api.ObservedReport {
-	out := api.ObservedReport{
-		ConfigVersion: version, InterfaceRxBytes: before.IfaceRxBytes,
-		InterfaceTxBytes: before.IfaceTxBytes, Peers: make([]api.ObservedPeer, 0, len(before.Peers)),
-	}
-	for _, p := range before.Peers {
-		var hs *time.Time
-		if !p.LastHandshake.IsZero() {
-			t := p.LastHandshake.UTC()
-			hs = &t
-		}
-		out.Peers = append(out.Peers, api.ObservedPeer{
-			PublicKey: p.PublicKey, LatestHandshake: hs, RxBytes: p.RxBytes, TxBytes: p.TxBytes,
-		})
-	}
-	slices.SortFunc(out.Peers, func(a, b api.ObservedPeer) int { return strings.Compare(a.PublicKey, b.PublicKey) })
-	return out
-}
-
-func load1() *float64 {
-	raw, err := os.ReadFile("/proc/loadavg")
-	if err != nil {
-		return nil
-	}
-	fields := strings.Fields(string(raw))
-	if len(fields) == 0 {
-		return nil
-	}
-	v, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil {
-		return nil
-	}
-	return &v
+    Load() (state.NodeState, error)
+    Save(state.NodeState) error
+    PrivateKey() (wgtypes.Key, error)
 }
 ```
 
-Добавить импорт `slices` к списку выше; в блоке кода он пропущен намеренно, чтобы
-исполнитель не забыл: без него `report` не компилируется.
+`Runner` содержит `API`, `Applier`, `Store`, `Log *slog.Logger`, `Iface string`,
+`Interval/TokenTTL time.Duration`, `Version string`, `Now func() time.Time`,
+`started time.Time`, `reconciled bool`, `after func(time.Duration) <-chan time.Time`,
+`pendingState *state.NodeState`. Методы: `Step(context.Context) error` и
+`Run(context.Context) error`. Зависимости задаёт вызывающий; конструктор, проверки
+nil, отдельные горутины и общий планировщик не нужны. Runner и API принадлежат
+одной горутине. При nil `after` используется `time.After`.
 
-Остаточное ограничение, которое надо записать в задаче 13 (спецификация §13) и в
-`docs/testing-status.md` (задача 18), а не «починить» здесь: если набор на сервере не
-менялся, узел получает 304 и устройство не трогает. Внешняя правка интерфейса руками при
-живом агенте поэтому живёт до следующего изменения набора. Проверять живое состояние
-каждый цикл — это уже другой режим (полный опрос вместо ETag) и лишний netlink каждые
-25 с; в A-3 его нет.
+- [x] **Step 1: Написать тесты до реализации**
 
-- [ ] **Step 4: Прогнать тесты**
+В `runner_test.go` 25 функций тестов, помимо проверок совместимости интерфейсов при
+компиляции. Табличные случаи не подменяют проверку значений счётчиками вызовов:
 
-Run: `make unit`
-Expected: PASS, включая шесть тестов `Step`.
+- `TestStepAppliesFullSetAndReportsBefore`, `TestStepAcceptsEmptySetAndZeroVersion`:
+  первый ETag пуст, следующий сохранён; точные Target, Applied, Before и heartbeat.
+- `TestStep304UsesFreshSnapshotWithoutApplying`, `TestStepRejectsUnconditional304`,
+  `TestStepSnapshotFailureDoesNotReportZeros`: свежие счётчики, запрет Apply/Save,
+  отказ холодного 304 и условного запроса без ETag, отсутствие отчёта при ошибке снимка.
+- `TestStepDesiredFailurePreservesStateAndSkipsRotation`,
+  `TestStepRejectsForeignOrUnusableSet`, `TestStepStopsOnLoadOrRegistrationFailure`:
+  отказы desired, чужой узел, неверные адреса/состояние, ошибки чтения и регистрации.
+- `TestStepApplyFailureDoesNotAcknowledgeNewETag`,
+  `TestStepAppliedSaveFailureForcesFullRetry`,
+  `TestStepReportingFailuresDoNotBlockHeartbeatOrRotation`: сохранение прежней версии,
+  полный повтор после ошибки записи, независимые отказы отчётов.
+- `TestTokenRotationThresholdAndNextDesiredToken`, `TestTokenRotationOn304`,
+  `TestTokenRotationRejectsAPIErrorAndInvalidResponses`,
+  `TestTokenSaveRetryPrecedesAnyHTTPAndNeverReloadsOldToken`: границы TTL, проверка
+  токена следующего запроса, неверный ответ, активация до Save и восстановление записи.
+- `TestTargetFromPreservesHostAndPeerStates`, `TestTargetFromErrorsDoNotQuoteInput`,
+  `TestReportSortsCountersAndEncodesUnknownHandshake`: адрес хоста, несколько адресов,
+  состояния пиров, сортировка, разные счётчики, UTC, JSON null и пустой массив.
+- `TestHeartbeatUsesActualProcLoad`: настоящий /proc; максимум три попытки без sleep.
+  Монотонное окно before/Step/after меньше 1 с допускает точное сравнение с соседними
+  замерами; три окна >=1 с дают явный русский Skip только живого теста. nil, NaN/Inf
+  и отрицательный heartbeat отвергаются независимо от длительности окна.
+- `TestReadLoad1FromFiles`: 43 точных случая; полная запись с нулём, экспоненты,
+  отсутствие ограничений на соотношения и величину счётчиков; пустой/недоступный файл,
+  усечённые/лишние поля, неверные показатели, пара процессов и PID дают nil.
+  NaN/Inf/отрицательные показатели проверяются в полных пятичастных записях.
+- `TestStepHonorsCancellationBeforeAllWork`,
+  `TestRunHonorsCancellationBeforeStepAndDuringWait`,
+  `TestRunContinuesAfterErrorAndSubtractsStepDuration`, `TestDelayBoundsAndTinyIntervals`:
+  отмена, продолжение после отказа, последовательность, вычитание времени шага,
+  длинный шаг без наверстывания и малые интервалы без sleep.
+- `TestRunnerLogsNeverIncludeDependencySecrets`: безопасная диагностика всех
+  зависимостей и Run; ключи и тестовые токены создаются во время выполнения.
 
-- [ ] **Step 5: Коммит**
+Дополнения `applier_test.go` описаны в Task 5: два новых теста с пятью подтестами.
+Проверка фактической нагрузки добавлена как положительная проверка уже работающего
+поведения; искусственного RED для неё нет.
 
-```bash
-git add internal/nodeagent/runtime
-git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
-  commit -m "feat(a3): цикл узла — опрос 25 с, применение, stale и ротация токена"
-```
+- [x] **Step 2: Зафиксировать RED**
+
+Сначала focused `make unit` для всех пакетов `internal/nodeagent`: три случая
+параметров устройства падают из-за отсутствия Configure, два случая снимка — из-за
+отсутствия Snapshot. После исправления R6/R9 — GREEN. Затем тесты нового runtime
+дают ожидаемые ошибки `undefined: Runner`, интерфейсов и функций преобразования.
+Старые журналы содержат FAIL и `make: Error 1`, но не сохраняют итоговый exit_code
+обёртки. Это ограничение доказательств отмечено в отчёте; свежие проверки сохраняют
+код исходной команды и не заменяют прежние журналы.
+
+Исправление R36: task-8-fix1-red.log фиксирует 28 падений повреждённых записей
+на старом readLoad1 (exit_code=2); task-8-fix1-green-m1.log — GREEN (0).
+Ограничение окна живого теста не имеет искусственного RED для паузы хоста.
+
+- [x] **Step 3: Реализовать `runner.go`**
+
+1. Step проверяет отмену до работы и инициализирует started через Now. Отложенная
+   запись токена повторяется до Load и HTTP. Незарегистрированное состояние — ошибка.
+2. Перед desired вызывается SetToken. Сохранённый ETag отправляется лишь после
+   успешных Apply и Save в этом процессе. Ошибка desired сохраняет состояние,
+   отправляет stale=true и не запускает применение или ротацию.
+3. 304 без reconciled и непустого отправленного ETag отвергается. Корректный 304
+   вызывает только Snapshot; отчёт свежий, версия сохранённая, Configure запрещён.
+   Ошибка снимка возвращается без Observed, heartbeat остаётся stale=false.
+4. Полный набор проверяется на свой ServerID до ключа и Apply. Нулевая версия и
+   пустой набор допустимы. targetFrom принимает wgtypes.Key, сохраняет адрес хоста
+   и переносит параметры пиров; ошибки безопасные, непригодный набор даёт stale=true.
+5. При ошибке Apply нет нового Applied/ETag и Observed, heartbeat сообщает прежнюю
+   версию со stale=false. При успехе Save пишет Applied с UTC; ошибка записи сбрасывает
+   reconciled, возвращается без отчёта об успехе, следующий запрос снова полный.
+6. Observed берёт Before, сортирует пиеров по PublicKey, передаёт UTC/null для
+   handshake и [] для пустого списка. Его ошибка не мешает heartbeat и ротации.
+   Heartbeat передаёт uptime, версию и фактический load1; cpu_pct всегда null.
+   readLoad1 принимает ровно пять полей: три конечных неотрицательных float64,
+   два непустых десятичных беззнаковых целых через единственный / и десятичный
+   беззнаковый PID. Возвращает первый показатель только после всех проверок;
+   недоступный файл или неверный формат дают nil. Ограничений на соотношения,
+   максимум нагрузки, экспоненты или обязательную положительность PID нет.
+7. Ротация после успешного цикла: TTL по умолчанию 24 часа при значении <=0,
+   порог включителен. Непустой токен прежнего узла активируется через SetToken до Save.
+   При отказе записи новый NodeState остаётся в pendingState; повтор не загружает
+   старый токен и не выполняет HTTP до успешной записи.
+8. Run делает первый Step сразу. Следующее ожидание равно max(0, interval с jitter
+   ±10% минус время Step). Базовый интервал 25 с при значении <=0. Нет перекрытия,
+   наверстывания пропущенных интервалов или остановки на обычной ошибке Step.
+   Отмена проверяется перед шагом и во время ожидания. Журнал не получает сырые ошибки.
+
+Ограничения: свежий Snapshot на 304 не исправляет внешнюю правку ядра при неизменном
+ETag; авария процесса между серверным отзывом старого токена и записью нового не
+устранена. Сквозной срок отзыва <=30 с требует живого runtime/E2E замера в задаче 13,
+а не только проверки jitter. Все три сценария отмечены отдельно в testing-status.
+
+- [x] **Step 4: Полные ворота перед коммитом**
+
+Свежий focused `make unit` проверил все четыре пакета узла; итоговые `make unit` и
+`make vet` выполнены по всему репозиторию с `GOFLAGS=-mod=readonly`, `CGO_ENABLED=0`
+и образом `golang:1.25-alpine`. Коды выхода 0 сохранены в task-8-finish-focused.log,
+task-8-finish-unit.log и task-8-finish-vet.log рядом с постановкой. Проверены gofmt,
+diff/index, неизменность go.mod/go.sum и алфавит новых строк. Живые проверки и старые
+статусы не выдаются за свежие прогоны.
+
+Раунд исправления 1: focused runtime с `GOFLAGS=-mod=readonly -v`, затем полный
+unit и vet последовательно — task-8-fix1-green.log, task-8-fix1-unit.log и
+task-8-fix1-vet.log (все exit_code=0). Живой /proc-тест в focused GREEN прошёл
+с первой попытки, окно 167,31 мкс; Skip не было. Полный integration не запускался.
+
+- [x] **Step 5: Один локальный коммит**
+
+Первоначальный коммит включает шесть файлов, перечисленных выше; исправление
+раунда 1 — только runner.go, runner_test.go и Task 8 этого плана.
+Автор и коммитер заданы через GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL и
+GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL (NovaVPN Dev, dev@novavpn.local), сообщение
+через HEREDOC. Git config не меняется; amend, push и merge не выполняются.
+Полный отчёт с хешем коммита — task-8-report.md рядом с постановкой.
 
 ---
 
