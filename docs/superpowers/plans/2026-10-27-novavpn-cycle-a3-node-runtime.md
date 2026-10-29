@@ -2039,6 +2039,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -2072,6 +2073,12 @@ func TestNewValidatesConfig(t *testing.T) {
 		{"http вне dev", Config{BaseURL: "http://example.com", Env: "prod"}},
 		{"пропуск проверки вне dev", Config{BaseURL: "https://example.com", Env: "prod", AllowInsecure: true}},
 		{"пропуск проверки без окружения", Config{BaseURL: "https://example.com", AllowInsecure: true}},
+		{"адрес без хоста", Config{BaseURL: "https:///x", Env: "prod"}},
+		{"неподдерживаемая схема", Config{BaseURL: "ftp://example.com", Env: "prod"}},
+		{"http в dev без пропуска проверки", Config{BaseURL: "http://127.0.0.1:1", Env: "dev"}},
+		{"параметры в адресе", Config{BaseURL: "https://example.com/?a=1", Env: "prod"}},
+		{"фрагмент в адресе", Config{BaseURL: "https://example.com/#f", Env: "prod"}},
+		{"учётные данные в адресе", Config{BaseURL: "https://user:pass@example.com", Env: "prod"}},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2095,6 +2102,10 @@ func TestNewDefaultsAndTrimsBaseURL(t *testing.T) {
 	}
 	if c.hc.Timeout != 15*time.Second {
 		t.Fatalf("таймаут %s; ожидалось 15s", c.hc.Timeout)
+	}
+	tr, ok := c.hc.Transport.(*http.Transport)
+	if !ok || tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatal("минимальная версия TLS не 1.2")
 	}
 	c, err = New(Config{BaseURL: "https://example.com", Env: "prod", Timeout: 3 * time.Second})
 	if err != nil {
@@ -2228,6 +2239,12 @@ func TestEnrollSendsNoToken(t *testing.T) {
 		if r.Header.Get("Authorization") != "" {
 			t.Error("enroll отправлен с заголовком авторизации")
 		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("Content-Type enroll %q", r.Header.Get("Content-Type"))
+		}
+		if r.Header.Get("Accept") != "application/json" {
+			t.Errorf("Accept enroll %q", r.Header.Get("Accept"))
+		}
 		var in struct {
 			BootstrapToken string `json:"bootstrap_token"`
 			PublicKey      string `json:"public_key"`
@@ -2255,7 +2272,7 @@ func TestEnrollSendsNoToken(t *testing.T) {
 func TestReportExpects204(t *testing.T) {
 	status := http.StatusNoContent
 	var seen []string
-	var hb map[string]any
+	var hb, obs map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, r.Method+" "+r.URL.Path)
 		if r.Header.Get("Authorization") != "Bearer токен-узла" {
@@ -2264,6 +2281,11 @@ func TestReportExpects204(t *testing.T) {
 		if r.URL.Path == "/internal/v1/nodes/srv/heartbeat" {
 			if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
 				t.Errorf("тело heartbeat не разобрано: %v", err)
+			}
+		}
+		if r.URL.Path == "/internal/v1/nodes/srv/observed" {
+			if err := json.NewDecoder(r.Body).Decode(&obs); err != nil {
+				t.Errorf("тело observed не разобрано: %v", err)
 			}
 		}
 		w.WriteHeader(status)
@@ -2281,6 +2303,17 @@ func TestReportExpects204(t *testing.T) {
 	if len(seen) != 1 || seen[0] != "POST /internal/v1/nodes/srv/observed" {
 		t.Fatalf("запросы %v", seen)
 	}
+	peers, ok := obs["peers"].([]any)
+	if !ok || len(peers) != 1 {
+		t.Fatalf("пиры observed %v; ожидался массив из одного элемента", obs["peers"])
+	}
+	peer, ok := peers[0].(map[string]any)
+	if !ok {
+		t.Fatalf("пиер observed %v", peers[0])
+	}
+	if hs, exists := peer["latest_handshake"]; !exists || hs != nil {
+		t.Fatalf("latest_handshake %v; ожидался ключ со значением null", hs)
+	}
 	load := 0.5
 	if err := c.Heartbeat(context.Background(), "srv", Heartbeat{
 		AgentVersion: "1.0", AgentUptimeSec: 60, Load1: &load, AppliedConfigVersion: 3,
@@ -2297,8 +2330,17 @@ func TestReportExpects204(t *testing.T) {
 		t.Fatalf("load1 %v; ожидалось 0.5", hb["load1"])
 	}
 	status = http.StatusOK
-	err := c.Observed(context.Background(), "srv", rep)
+	err := c.Heartbeat(context.Background(), "srv", Heartbeat{
+		AgentVersion: "1.0", AgentUptimeSec: 60, Load1: &load, AppliedConfigVersion: 3,
+	})
 	var se *StatusError
+	if !errors.As(err, &se) || se.Status != 200 {
+		t.Fatalf("ответ 200 принят за успешный heartbeat: %v", err)
+	}
+	if err.Error() != "api: отказ 200" {
+		t.Fatalf("текст ошибки %q; ожидался %q", err.Error(), "api: отказ 200")
+	}
+	err = c.Observed(context.Background(), "srv", rep)
 	if !errors.As(err, &se) || se.Status != 200 {
 		t.Fatalf("ответ 200 принят за успешный отчёт: %v", err)
 	}
@@ -2316,8 +2358,12 @@ func TestRotateTokenSendsCurrentToken(t *testing.T) {
 	defer srv.Close()
 	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
 	c.SetToken("текущий")
-	if _, err := c.RotateToken(context.Background(), "srv"); err != nil {
+	nt, err := c.RotateToken(context.Background(), "srv")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if nt.ServerID != "srv" || nt.NodeToken != "следующий" {
+		t.Fatalf("ответ ротации: сервер %q, токен %q", nt.ServerID, nt.NodeToken)
 	}
 	if gotAuth != "Bearer текущий" {
 		t.Fatal("ротация отправлена не с текущим токеном")
@@ -2326,14 +2372,73 @@ func TestRotateTokenSendsCurrentToken(t *testing.T) {
 
 func TestResponseBodyLimit(t *testing.T) {
 	big := strings.Repeat("а", 1<<20)
+	status := http.StatusOK
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", `"abc"`)
+		w.WriteHeader(status)
 		_, _ = w.Write([]byte(`{"server_id":"` + big + `"}`))
 	}))
 	defer srv.Close()
 	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
 	if _, _, _, err := c.Desired(context.Background(), "s", ""); err == nil {
 		t.Fatal("тело больше 1 МиБ принято")
+	}
+	status = http.StatusUnauthorized
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	if err == nil || !strings.Contains(err.Error(), "больше") {
+		t.Fatalf("ошибка ошибочного ответа %v; ожидалось превышение предела", err)
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		t.Fatalf("предел тела подменён StatusError: %v", err)
+	}
+}
+
+func TestDesiredEscapesServerID(t *testing.T) {
+	var escaped string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		escaped = r.URL.EscapedPath()
+		w.Header().Set("ETag", `"abc"`)
+		_, _ = w.Write([]byte(`{"server_id":"a/b","config_version":1,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	if _, _, _, err := c.Desired(context.Background(), "a/b", ""); err != nil {
+		t.Fatal(err)
+	}
+	if escaped != "/internal/v1/nodes/a%2Fb/desired" {
+		t.Fatalf("путь запроса %q; идентификатор сервера не закодирован", escaped)
+	}
+}
+
+func TestRedirectRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://127.0.0.1:1/other", http.StatusFound)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != http.StatusFound {
+		t.Fatalf("перенаправление не отвергнуто: %v", err)
+	}
+}
+
+func TestTokenEndpointsRequireOK(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("текущий")
+	var se *StatusError
+	if _, err := c.Enroll(context.Background(), "стартовый", "ключ"); !errors.As(err, &se) || se.Status != http.StatusNoContent {
+		t.Fatalf("enroll принял 204: %v", err)
+	}
+	if _, err := c.RotateToken(context.Background(), "srv"); !errors.As(err, &se) || se.Status != http.StatusNoContent {
+		t.Fatalf("ротация приняла 204: %v", err)
 	}
 }
 ```
@@ -2352,6 +2457,9 @@ Expected: FAIL — `undefined: New`, `undefined: Config`, `undefined: Client`.
 Требования к `New` (R31):
 
 - `BaseURL` обязателен; разбирается через `url.Parse`; завершающая `/` срезается.
+- Адрес не должен содержать query, fragment или userinfo: такой `BaseURL` — ошибка.
+- Редиректы не выполняются: `CheckRedirect` возвращает `http.ErrUseLastResponse`;
+  ответ `3xx` — `*StatusError`.
 - Вне dev допустим только `https`: `http` принимается лишь при `Env == "dev"` и
   `AllowInsecure == true`.
 - `AllowInsecure == true` при `Env != "dev"` — ошибка конфигурации.
@@ -2363,9 +2471,10 @@ Expected: FAIL — `undefined: New`, `undefined: Config`, `undefined: Client`.
 Дословно — тип клиента, конфигурация и тип ошибки:
 
 ```go
-// maxBody ограничивает тело ответа: сломанный или враждебный сервер не имеет
-// права заставить узел вычитать гигабайты в память.
+// maxBody ограничивает ответ: сломанный сервер не вынудит узел вычитать гигабайты.
 const maxBody = 1 << 20
+
+const defaultTimeout = 15 * time.Second
 
 type Config struct {
 	BaseURL       string
@@ -2410,21 +2519,24 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, token
   `maxBody` — ошибка, тело не разбирается.
 - `304` — не ошибка: статус и заголовки возвращаются, тело не читается и `out` не
   разбирается.
-- Статус `>= 400` — `*StatusError`; `Code` берётся из `{"error":{"code":...}}`, при
-  неразбираемом теле остаётся пустым.
+- `204` — тело не читается: статус и заголовки возвращаются, `out` не разбирается.
+- Статус `>= 300` (кроме обработанного выше `304`) — `*StatusError`; `Code` берётся из
+  `{"error":{"code":...}}`, при неразбираемом теле остаётся пустым.
 - Иной статус с `out != nil` — разбор JSON; ошибка разбора возвращается, а не глотается.
 
 Методы:
 
 - `Enroll`: `POST /internal/v1/nodes/enroll`, тело `EnrollRequest`, токен не передаётся
-  (даже если `SetToken` уже вызывался), ответ — `NodeToken`.
+  (даже если `SetToken` уже вызывался), ответ — `NodeToken`; требуется ровно `200`,
+  иной код — `*StatusError`.
 - `Desired`: `GET /internal/v1/nodes/{server_id}/desired`; при непустом `etag` —
   заголовок `If-None-Match`; при 304 — `(DesiredSet{}, etag из заголовка, true, nil)`,
   иначе разобранный набор и `etag` из заголовка.
 - `Observed`, `Heartbeat`: `POST` соответственно `/observed` и `/heartbeat` с текущим
   токеном; ожидается ровно `204`; другой успешный код — `*StatusError` с пустым `Code`.
 - `RotateToken`: `POST /internal/v1/nodes/{server_id}/token/rotate` с текущим токеном,
-  ответ `NodeToken`; сам клиент токен не подменяет — это решение цикла (задача 8).
+  ответ `NodeToken`; требуется ровно `200`, иной код — `*StatusError`; сам клиент токен
+  не подменяет — это решение цикла (задача 8).
 - `serverID` в пути кодируется `url.PathEscape`.
 
 Типы ответов повторяют JSON сервера один в один:
@@ -2492,7 +2604,7 @@ type Heartbeat struct {
 - [ ] **Step 4: Прогнать тесты**
 
 Run: сосредоточенный `make unit` по пакету, затем полные `unit` и `vet`.
-Expected: PASS, одиннадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
+Expected: PASS, четырнадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
 не менялись (новых внешних зависимостей нет).
 
 - [ ] **Step 5: Коммит**

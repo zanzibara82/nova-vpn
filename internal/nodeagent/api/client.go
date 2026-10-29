@@ -54,6 +54,15 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("api: базовый адрес: %w", err)
 	}
+	if u.RawQuery != "" {
+		return nil, fmt.Errorf("api: базовый адрес не должен содержать параметры")
+	}
+	if u.Fragment != "" {
+		return nil, fmt.Errorf("api: базовый адрес не должен содержать фрагмент")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("api: базовый адрес не должен содержать учётные данные")
+	}
 	if u.Host == "" {
 		return nil, fmt.Errorf("api: базовый адрес без хоста")
 	}
@@ -95,6 +104,9 @@ func New(cfg Config) (*Client, error) {
 		hc: &http.Client{
 			Timeout:   timeout,
 			Transport: &http.Transport{TLSClientConfig: tlsCfg},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}, nil
 }
@@ -106,8 +118,12 @@ func (c *Client) SetToken(token string) {
 func (c *Client) Enroll(ctx context.Context, bootstrap, publicKey string) (NodeToken, error) {
 	var out NodeToken
 	req := EnrollRequest{BootstrapToken: bootstrap, PublicKey: publicKey}
-	if _, _, err := c.do(ctx, http.MethodPost, "/internal/v1/nodes/enroll", req, &out, "", nil); err != nil {
+	status, _, err := c.do(ctx, http.MethodPost, "/internal/v1/nodes/enroll", req, &out, "", nil)
+	if err != nil {
 		return NodeToken{}, err
+	}
+	if status != http.StatusOK {
+		return NodeToken{}, &StatusError{Status: status}
 	}
 	return out, nil
 }
@@ -153,8 +169,12 @@ func (c *Client) Heartbeat(ctx context.Context, serverID string, hb Heartbeat) e
 
 func (c *Client) RotateToken(ctx context.Context, serverID string) (NodeToken, error) {
 	var out NodeToken
-	if _, _, err := c.do(ctx, http.MethodPost, "/internal/v1/nodes/"+url.PathEscape(serverID)+"/token/rotate", nil, &out, c.token, nil); err != nil {
+	status, _, err := c.do(ctx, http.MethodPost, "/internal/v1/nodes/"+url.PathEscape(serverID)+"/token/rotate", nil, &out, c.token, nil)
+	if err != nil {
 		return NodeToken{}, err
+	}
+	if status != http.StatusOK {
+		return NodeToken{}, &StatusError{Status: status}
 	}
 	return out, nil
 }
@@ -193,6 +213,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, token
 	if resp.StatusCode == http.StatusNotModified {
 		return resp.StatusCode, resp.Header, nil
 	}
+	if resp.StatusCode == http.StatusNoContent {
+		return resp.StatusCode, resp.Header, nil
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return resp.StatusCode, resp.Header, fmt.Errorf("api: чтение ответа: %w", err)
@@ -200,7 +223,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, token
 	if len(raw) > maxBody {
 		return resp.StatusCode, resp.Header, fmt.Errorf("api: ответ больше %d байт", maxBody)
 	}
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= 300 {
 		var env struct {
 			Error struct {
 				Code string `json:"code"`
