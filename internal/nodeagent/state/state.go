@@ -39,7 +39,14 @@ type NodeState struct {
 // Повторный вызов не перевыпускает ключ: смена ключа требует правки сервера у
 // администратора, поэтому «сгенерировать заново» — не восстановление, а поломка.
 func (s *Store) EnsureKey() (string, bool, error) {
-	if _, err := os.Stat(filepath.Join(s.Dir, privateKeyFile)); err == nil {
+	if s.Dir == "" {
+		return "", false, errors.New("state: каталог не задан")
+	}
+	path := filepath.Join(s.Dir, privateKeyFile)
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return "", false, fmt.Errorf("state: права ключа: %w", err)
+		}
 		key, err := s.PrivateKey()
 		if err != nil {
 			return "", false, err
@@ -52,13 +59,16 @@ func (s *Store) EnsureKey() (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("state: генерация ключа: %w", err)
 	}
-	if err := writeAtomic(filepath.Join(s.Dir, privateKeyFile), []byte(key.String())); err != nil {
+	if err := writeAtomic(path, []byte(key.String())); err != nil {
 		return "", false, err
 	}
 	return key.PublicKey().String(), true, nil
 }
 
 func (s *Store) PrivateKey() (wgtypes.Key, error) {
+	if s.Dir == "" {
+		return wgtypes.Key{}, errors.New("state: каталог не задан")
+	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, privateKeyFile))
 	if err != nil {
 		return wgtypes.Key{}, fmt.Errorf("state: чтение ключа: %w", err)
@@ -74,6 +84,9 @@ func (s *Store) PrivateKey() (wgtypes.Key, error) {
 // и ошибку, если файл испорчен. Второе важно: молча начать с нуля значило бы
 // отправить узел в enroll без bootstrap-токена и оставить без доступа.
 func (s *Store) Load() (NodeState, error) {
+	if s.Dir == "" {
+		return NodeState{}, errors.New("state: каталог не задан")
+	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, stateFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return NodeState{}, nil
@@ -89,6 +102,9 @@ func (s *Store) Load() (NodeState, error) {
 }
 
 func (s *Store) Save(ns NodeState) error {
+	if s.Dir == "" {
+		return errors.New("state: каталог не задан")
+	}
 	raw, err := json.Marshal(ns)
 	if err != nil {
 		return fmt.Errorf("state: сериализация: %w", err)

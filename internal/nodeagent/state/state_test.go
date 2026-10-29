@@ -5,10 +5,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestEnsureKeyCreatesOnceAndKeepsMode(t *testing.T) {
-	dir := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(root, "node")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	s := Store{Dir: dir}
 	pub, created, err := s.EnsureKey()
 	if err != nil || !created || pub == "" {
@@ -53,13 +60,69 @@ func TestEnsureKeyDoesNotRegenerateBrokenKey(t *testing.T) {
 	}
 }
 
+func TestEnsureKeyTightensExistingKeyMode(t *testing.T) {
+	dir := t.TempDir()
+	s := Store{Dir: dir}
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "node.key")
+	if err := os.WriteFile(path, []byte(key.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub, created, err := s.EnsureKey()
+	if err != nil || created {
+		t.Fatalf("существующий ключ: создан %v, ошибка %v", created, err)
+	}
+	if want := key.PublicKey().String(); pub != want {
+		t.Fatal("публичный ключ не совпал с существующим")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("права ключа %o; ожидались 600", got)
+	}
+}
+
+func TestEmptyDirRejected(t *testing.T) {
+	s := Store{}
+	if _, _, err := s.EnsureKey(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("EnsureKey: ошибка %v", err)
+	}
+	if _, err := s.PrivateKey(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("PrivateKey: ошибка %v", err)
+	}
+	if _, err := s.Load(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("Load: ошибка %v", err)
+	}
+	if err := s.Save(NodeState{}); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("Save: ошибка %v", err)
+	}
+}
+
 func TestSaveAndLoadRoundTripWithoutPrivateKey(t *testing.T) {
 	dir := t.TempDir()
 	s := Store{Dir: dir}
 	if _, _, err := s.EnsureKey(); err != nil {
 		t.Fatal(err)
 	}
-	want := NodeState{ServerID: "8f0c0000-0000-4000-8000-000000000001", NodeToken: "tok", Applied: Applied{ConfigVersion: 7, ETag: `"x"`, Peers: 2}}
+	want := NodeState{
+		ServerID:      "8f0c0000-0000-4000-8000-000000000001",
+		NodeToken:     "tok",
+		TokenIssuedAt: time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC),
+		Applied: Applied{
+			ConfigVersion: 7,
+			ETag:          `"x"`,
+			AppliedAt:     time.Date(2026, 10, 27, 11, 30, 0, 0, time.UTC),
+			Peers:         2,
+		},
+	}
 	if err := s.Save(want); err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +130,26 @@ func TestSaveAndLoadRoundTripWithoutPrivateKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ServerID != want.ServerID || got.NodeToken != want.NodeToken || got.Applied.ConfigVersion != 7 {
-		t.Fatalf("загружено %+v", got)
+	if got.ServerID != want.ServerID {
+		t.Fatalf("ServerID %q; ожидался %q", got.ServerID, want.ServerID)
+	}
+	if got.NodeToken != want.NodeToken {
+		t.Fatal("узловой токен не совпал с сохранённым")
+	}
+	if got.Applied.ConfigVersion != want.Applied.ConfigVersion {
+		t.Fatalf("версия конфигурации %d; ожидалась %d", got.Applied.ConfigVersion, want.Applied.ConfigVersion)
+	}
+	if got.Applied.ETag != want.Applied.ETag {
+		t.Fatalf("ETag %q; ожидался %q", got.Applied.ETag, want.Applied.ETag)
+	}
+	if got.Applied.Peers != want.Applied.Peers {
+		t.Fatalf("пиеров %d; ожидалось %d", got.Applied.Peers, want.Applied.Peers)
+	}
+	if !got.Applied.AppliedAt.Equal(want.Applied.AppliedAt) {
+		t.Fatalf("время применения %v; ожидалось %v", got.Applied.AppliedAt, want.Applied.AppliedAt)
+	}
+	if !got.TokenIssuedAt.Equal(want.TokenIssuedAt) {
+		t.Fatalf("время выдачи токена %v; ожидалось %v", got.TokenIssuedAt, want.TokenIssuedAt)
 	}
 	info, err := os.Stat(filepath.Join(dir, "state.json"))
 	if err != nil {

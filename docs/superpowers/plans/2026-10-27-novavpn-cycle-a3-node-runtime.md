@@ -1600,7 +1600,10 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 Состояние переживает рестарт и недоступность API: последний применённый набор и узловой
 токен лежат на диске. Потеря токена означает повторный enroll, а потеря ключа — новый
 публичный ключ и правку сервера у администратора, поэтому ключ не перевыпускается молча,
-а запись атомарная: оборванный процесс не оставляет половину файла.
+а запись атомарная: оборванный процесс не оставляет половину файла. Права файлов `0600` и
+каталога `0700` ставятся и при создании, и при каждом обращении к существующему ключу,
+созданному с более широкими правами; пустой `Dir` отвергается, иначе `chmod` задел бы
+каталог, из которого запущен процесс.
 
 **Files:**
 - Create: `internal/nodeagent/state/state.go`
@@ -1625,10 +1628,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
 func TestEnsureKeyCreatesOnceAndKeepsMode(t *testing.T) {
-	dir := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(root, "node")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	s := Store{Dir: dir}
 	pub, created, err := s.EnsureKey()
 	if err != nil || !created || pub == "" {
@@ -1673,13 +1683,69 @@ func TestEnsureKeyDoesNotRegenerateBrokenKey(t *testing.T) {
 	}
 }
 
+func TestEnsureKeyTightensExistingKeyMode(t *testing.T) {
+	dir := t.TempDir()
+	s := Store{Dir: dir}
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "node.key")
+	if err := os.WriteFile(path, []byte(key.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pub, created, err := s.EnsureKey()
+	if err != nil || created {
+		t.Fatalf("существующий ключ: создан %v, ошибка %v", created, err)
+	}
+	if want := key.PublicKey().String(); pub != want {
+		t.Fatal("публичный ключ не совпал с существующим")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("права ключа %o; ожидались 600", got)
+	}
+}
+
+func TestEmptyDirRejected(t *testing.T) {
+	s := Store{}
+	if _, _, err := s.EnsureKey(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("EnsureKey: ошибка %v", err)
+	}
+	if _, err := s.PrivateKey(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("PrivateKey: ошибка %v", err)
+	}
+	if _, err := s.Load(); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("Load: ошибка %v", err)
+	}
+	if err := s.Save(NodeState{}); err == nil || !strings.Contains(err.Error(), "каталог не задан") {
+		t.Fatalf("Save: ошибка %v", err)
+	}
+}
+
 func TestSaveAndLoadRoundTripWithoutPrivateKey(t *testing.T) {
 	dir := t.TempDir()
 	s := Store{Dir: dir}
 	if _, _, err := s.EnsureKey(); err != nil {
 		t.Fatal(err)
 	}
-	want := NodeState{ServerID: "8f0c0000-0000-4000-8000-000000000001", NodeToken: "tok", Applied: Applied{ConfigVersion: 7, ETag: `"x"`, Peers: 2}}
+	want := NodeState{
+		ServerID:      "8f0c0000-0000-4000-8000-000000000001",
+		NodeToken:     "tok",
+		TokenIssuedAt: time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC),
+		Applied: Applied{
+			ConfigVersion: 7,
+			ETag:          `"x"`,
+			AppliedAt:     time.Date(2026, 10, 27, 11, 30, 0, 0, time.UTC),
+			Peers:         2,
+		},
+	}
 	if err := s.Save(want); err != nil {
 		t.Fatal(err)
 	}
@@ -1687,8 +1753,26 @@ func TestSaveAndLoadRoundTripWithoutPrivateKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ServerID != want.ServerID || got.NodeToken != want.NodeToken || got.Applied.ConfigVersion != 7 {
-		t.Fatalf("загружено %+v", got)
+	if got.ServerID != want.ServerID {
+		t.Fatalf("ServerID %q; ожидался %q", got.ServerID, want.ServerID)
+	}
+	if got.NodeToken != want.NodeToken {
+		t.Fatal("узловой токен не совпал с сохранённым")
+	}
+	if got.Applied.ConfigVersion != want.Applied.ConfigVersion {
+		t.Fatalf("версия конфигурации %d; ожидалась %d", got.Applied.ConfigVersion, want.Applied.ConfigVersion)
+	}
+	if got.Applied.ETag != want.Applied.ETag {
+		t.Fatalf("ETag %q; ожидался %q", got.Applied.ETag, want.Applied.ETag)
+	}
+	if got.Applied.Peers != want.Applied.Peers {
+		t.Fatalf("пиеров %d; ожидалось %d", got.Applied.Peers, want.Applied.Peers)
+	}
+	if !got.Applied.AppliedAt.Equal(want.Applied.AppliedAt) {
+		t.Fatalf("время применения %v; ожидалось %v", got.Applied.AppliedAt, want.Applied.AppliedAt)
+	}
+	if !got.TokenIssuedAt.Equal(want.TokenIssuedAt) {
+		t.Fatalf("время выдачи токена %v; ожидалось %v", got.TokenIssuedAt, want.TokenIssuedAt)
 	}
 	info, err := os.Stat(filepath.Join(dir, "state.json"))
 	if err != nil {
@@ -1784,7 +1868,14 @@ type NodeState struct {
 // Повторный вызов не перевыпускает ключ: смена ключа требует правки сервера у
 // администратора, поэтому «сгенерировать заново» — не восстановление, а поломка.
 func (s *Store) EnsureKey() (string, bool, error) {
-	if _, err := os.Stat(filepath.Join(s.Dir, privateKeyFile)); err == nil {
+	if s.Dir == "" {
+		return "", false, errors.New("state: каталог не задан")
+	}
+	path := filepath.Join(s.Dir, privateKeyFile)
+	if _, err := os.Stat(path); err == nil {
+		if err := os.Chmod(path, 0o600); err != nil {
+			return "", false, fmt.Errorf("state: права ключа: %w", err)
+		}
 		key, err := s.PrivateKey()
 		if err != nil {
 			return "", false, err
@@ -1797,13 +1888,16 @@ func (s *Store) EnsureKey() (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("state: генерация ключа: %w", err)
 	}
-	if err := writeAtomic(filepath.Join(s.Dir, privateKeyFile), []byte(key.String())); err != nil {
+	if err := writeAtomic(path, []byte(key.String())); err != nil {
 		return "", false, err
 	}
 	return key.PublicKey().String(), true, nil
 }
 
 func (s *Store) PrivateKey() (wgtypes.Key, error) {
+	if s.Dir == "" {
+		return wgtypes.Key{}, errors.New("state: каталог не задан")
+	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, privateKeyFile))
 	if err != nil {
 		return wgtypes.Key{}, fmt.Errorf("state: чтение ключа: %w", err)
@@ -1819,6 +1913,9 @@ func (s *Store) PrivateKey() (wgtypes.Key, error) {
 // и ошибку, если файл испорчен. Второе важно: молча начать с нуля значило бы
 // отправить узел в enroll без bootstrap-токена и оставить без доступа.
 func (s *Store) Load() (NodeState, error) {
+	if s.Dir == "" {
+		return NodeState{}, errors.New("state: каталог не задан")
+	}
 	raw, err := os.ReadFile(filepath.Join(s.Dir, stateFile))
 	if errors.Is(err, os.ErrNotExist) {
 		return NodeState{}, nil
@@ -1834,6 +1931,9 @@ func (s *Store) Load() (NodeState, error) {
 }
 
 func (s *Store) Save(ns NodeState) error {
+	if s.Dir == "" {
+		return errors.New("state: каталог не задан")
+	}
 	raw, err := json.Marshal(ns)
 	if err != nil {
 		return fmt.Errorf("state: сериализация: %w", err)
@@ -1883,7 +1983,7 @@ func writeAtomic(path string, data []byte) error {
 - [ ] **Step 4: Прогнать тесты**
 
 Run: focused `make unit` по пакету с `-mod=readonly`, затем полные `unit` и `vet`.
-Expected: PASS, четыре теста `state`; полный прогон без новых падений.
+Expected: PASS, шесть тестов `state`; полный прогон без новых падений.
 
 - [ ] **Step 5: Коммит**
 
