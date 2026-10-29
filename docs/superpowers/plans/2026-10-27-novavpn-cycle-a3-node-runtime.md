@@ -2011,7 +2011,9 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
 ### Task 7: HTTPS-клиент узла — enroll, desired с ETag, отчёты, ротация
 
 **Files:**
-- Create: `internal/nodeagent/api/client.go`, `internal/nodeagent/api/client_test.go`
+- Create: `internal/nodeagent/api/client.go`
+- Create: `internal/nodeagent/api/client_test.go`
+- Modify: `docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md` — только фрагмент Task 7
 
 **Interfaces:**
 - Produces: `api.Config{BaseURL, CAFile, Env string; AllowInsecure bool; Timeout time.Duration}`,
@@ -2021,98 +2023,33 @@ git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   `(*Client).Observed(ctx, serverID string, rep ObservedReport) error`,
   `(*Client).Heartbeat(ctx, serverID string, hb Heartbeat) error`,
   `(*Client).RotateToken(ctx, serverID string) (NodeToken, error)`,
-  `api.StatusError`, `api.DesiredSet`, `api.ObservedReport`, `api.Heartbeat`, `api.NodeToken`.
+  `api.StatusError`, `api.DesiredSet`, `api.DesiredPeer`, `api.EnrollRequest`, `api.ObservedReport`,
+  `api.ObservedPeer`, `api.Heartbeat`, `api.NodeToken`.
+
+Узел разговаривает с сервером только по документированному контракту `/internal/v1`
+(`api-spec/openapi.yaml`). Клиент обязан проверять сертификат в проде, различать 304 от
+ошибки, не читать бесконечное тело и не превращать неизмеренное в ноль.
 
 - [ ] **Step 1: Написать падающие тесты**
 
-`internal/nodeagent/api/client_test.go`:
+Используй ровно этот исходник `internal/nodeagent/api/client_test.go` (R30):
 
 ```go
 package api
 
 import (
 	"context"
-	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
-
-func TestDesiredDistinguishesNotModified(t *testing.T) {
-	var gotETag string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotETag = r.Header.Get("If-None-Match")
-		if gotETag == `"abc"` {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		w.Header().Set("ETag", `"abc"`)
-		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,
-			"tunnel_address":"10.99.0.1/24","dns_servers":["10.99.0.1"],"keepalive_sec":25,
-			"peers":[],"measured_at":"2026-10-27T10:00:00Z"}`))
-	}))
-	defer srv.Close()
-	c, err := New(Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	set, etag, notModified, err := c.Desired(context.Background(), "s", "")
-	if err != nil || notModified || etag != `"abc"` || set.TunnelAddress != "10.99.0.1/24" {
-		t.Fatalf("first: set=%+v etag=%q nm=%v err=%v", set, etag, notModified, err)
-	}
-	_, etag, notModified, err = c.Desired(context.Background(), "s", `"abc"`)
-	if err != nil || !notModified || etag != `"abc"` {
-		t.Fatalf("second: etag=%q nm=%v err=%v", etag, notModified, err)
-	}
-}
-
-func TestStatusErrorCarriesCode(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"нет"}}`))
-	}))
-	defer srv.Close()
-	c, _ := New(Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
-	_, _, _, err := c.Desired(context.Background(), "s", "")
-	var se *StatusError
-	if !errors.As(err, &se) || se.Status != 401 || se.Code != "unauthenticated" {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestTLSVerificationAndCAFile(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,
-			"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[],
-			"measured_at":"2026-10-27T10:00:00Z"}`))
-	}))
-	defer srv.Close()
-	if _, _, _, err := mustClient(t, Config{BaseURL: srv.URL, Env: "prod"}).Desired(context.Background(), "s", ""); err == nil {
-		t.Fatal("self-signed certificate accepted without CA")
-	}
-	dir := t.TempDir()
-	ca := filepath.Join(dir, "ca.pem")
-	block := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
-	if err := os.WriteFile(ca, block, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c := mustClient(t, Config{BaseURL: srv.URL, Env: "prod", CAFile: ca})
-	if _, _, _, err := c.Desired(context.Background(), "s", ""); err != nil {
-		t.Fatalf("CA file ignored: %v", err)
-	}
-	_ = x509.NewCertPool()
-}
-
-func TestInsecureRefusedOutsideDev(t *testing.T) {
-	if _, err := New(Config{BaseURL: "https://example.com", Env: "prod", AllowInsecure: true}); err == nil {
-		t.Fatal("insecure transport accepted in prod")
-	}
-}
 
 func mustClient(t *testing.T, cfg Config) *Client {
 	t.Helper()
@@ -2125,51 +2062,408 @@ func mustClient(t *testing.T, cfg Config) *Client {
 	}
 	return c
 }
+
+func TestNewValidatesConfig(t *testing.T) {
+	bad := []struct {
+		name string
+		cfg  Config
+	}{
+		{"пустой адрес", Config{Env: "dev", AllowInsecure: true}},
+		{"http вне dev", Config{BaseURL: "http://example.com", Env: "prod"}},
+		{"пропуск проверки вне dev", Config{BaseURL: "https://example.com", Env: "prod", AllowInsecure: true}},
+		{"пропуск проверки без окружения", Config{BaseURL: "https://example.com", AllowInsecure: true}},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := New(tc.cfg); err == nil {
+				t.Fatal("недопустимая конфигурация принята")
+			}
+		})
+	}
+	if _, err := New(Config{BaseURL: "http://127.0.0.1:1", Env: "dev", AllowInsecure: true}); err != nil {
+		t.Fatalf("dev-стенд по http отвергнут: %v", err)
+	}
+}
+
+func TestNewDefaultsAndTrimsBaseURL(t *testing.T) {
+	c, err := New(Config{BaseURL: "https://example.com/", Env: "prod"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.baseURL != "https://example.com" {
+		t.Fatalf("базовый адрес %q; ожидался без завершающей косой черты", c.baseURL)
+	}
+	if c.hc.Timeout != 15*time.Second {
+		t.Fatalf("таймаут %s; ожидалось 15s", c.hc.Timeout)
+	}
+	c, err = New(Config{BaseURL: "https://example.com", Env: "prod", Timeout: 3 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.hc.Timeout != 3*time.Second {
+		t.Fatalf("таймаут %s; ожидалось 3s", c.hc.Timeout)
+	}
+}
+
+func TestNewRejectsCAFileWithoutCertificates(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(ca, []byte("не сертификат"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Config{BaseURL: "https://example.com", Env: "prod", CAFile: ca}); err == nil {
+		t.Fatal("файл CA без сертификатов принят")
+	}
+	if _, err := New(Config{BaseURL: "https://example.com", Env: "prod", CAFile: filepath.Join(dir, "нет.pem")}); err == nil {
+		t.Fatal("отсутствующий файл CA принят")
+	}
+}
+
+func TestDesiredDistinguishesNotModified(t *testing.T) {
+	var gotETag, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotETag = r.Header.Get("If-None-Match")
+		gotAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/internal/v1/nodes/s/desired" {
+			t.Errorf("путь запроса %q", r.URL.Path)
+		}
+		w.Header().Set("ETag", `"abc"`)
+		if gotETag == `"abc"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":["10.99.0.1"],"keepalive_sec":25,` +
+			`"peers":[{"public_key":"k","allowed_ips":["10.99.0.2/32"],` +
+			`"expires_at":"2026-11-27T10:00:00Z","state":"active"}],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("токен-узла")
+	set, etag, notModified, err := c.Desired(context.Background(), "s", "")
+	if err != nil || notModified || etag != `"abc"` || set.TunnelAddress != "10.99.0.1/24" {
+		t.Fatalf("первый ответ: набор %+v, etag %q, notModified %v, ошибка %v", set, etag, notModified, err)
+	}
+	if gotETag != "" {
+		t.Fatalf("первый запрос отправлен с If-None-Match %q", gotETag)
+	}
+	if gotAuth != "Bearer токен-узла" {
+		t.Fatal("запрос отправлен без токена узла")
+	}
+	if set.ConfigVersion != 1 || set.MTU != 1420 || set.ListenPort != 51820 || set.KeepaliveSec != 25 {
+		t.Fatalf("числовые поля набора: %+v", set)
+	}
+	if len(set.DNSServers) != 1 || set.DNSServers[0] != "10.99.0.1" {
+		t.Fatalf("DNS-серверы %v", set.DNSServers)
+	}
+	if len(set.Peers) != 1 || set.Peers[0].State != "active" || set.Peers[0].PublicKey != "k" {
+		t.Fatalf("пиры %+v", set.Peers)
+	}
+	if set.MeasuredAt.IsZero() || set.MeasuredAt.UTC().Format(time.RFC3339) != "2026-10-27T10:00:00Z" {
+		t.Fatalf("measured_at %s", set.MeasuredAt)
+	}
+	_, etag, notModified, err = c.Desired(context.Background(), "s", `"abc"`)
+	if err != nil || !notModified || etag != `"abc"` {
+		t.Fatalf("второй ответ: etag %q, notModified %v, ошибка %v", etag, notModified, err)
+	}
+	if gotETag != `"abc"` {
+		t.Fatalf("второй запрос отправлен с If-None-Match %q", gotETag)
+	}
+}
+
+func TestDesiredRejectsBrokenJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"server_id":`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	if _, _, _, err := c.Desired(context.Background(), "s", ""); err == nil {
+		t.Fatal("битый JSON принят за набор")
+	}
+}
+
+func TestStatusErrorCarriesCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"unauthenticated","message":"нет"}}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	_, _, _, err := c.Desired(context.Background(), "s", "")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != 401 || se.Code != "unauthenticated" {
+		t.Fatalf("ошибка %v; ожидался StatusError 401 unauthenticated", err)
+	}
+}
+
+func TestTLSVerificationAndCAFile(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		_, _ = w.Write([]byte(`{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`))
+	}))
+	defer srv.Close()
+	if _, _, _, err := mustClient(t, Config{BaseURL: srv.URL, Env: "prod"}).Desired(context.Background(), "s", ""); err == nil {
+		t.Fatal("самоподписанный сертификат принят без CA")
+	}
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	block := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(ca, block, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "prod", CAFile: ca})
+	if _, _, _, err := c.Desired(context.Background(), "s", ""); err != nil {
+		t.Fatalf("файл CA не применён: %v", err)
+	}
+}
+
+func TestEnrollSendsNoToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/nodes/enroll" {
+			t.Errorf("запрос %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "" {
+			t.Error("enroll отправлен с заголовком авторизации")
+		}
+		var in struct {
+			BootstrapToken string `json:"bootstrap_token"`
+			PublicKey      string `json:"public_key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			t.Errorf("тело enroll не разобрано: %v", err)
+		}
+		if in.BootstrapToken != "стартовый" || in.PublicKey != "ключ" {
+			t.Errorf("тело enroll: стартовый токен %q, ключ %q", in.BootstrapToken, in.PublicKey)
+		}
+		_, _ = w.Write([]byte(`{"server_id":"srv","node_token":"новый-токен"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("прежний-токен")
+	nt, err := c.Enroll(context.Background(), "стартовый", "ключ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nt.ServerID != "srv" || nt.NodeToken != "новый-токен" {
+		t.Fatalf("ответ enroll: сервер %q", nt.ServerID)
+	}
+}
+
+func TestReportExpects204(t *testing.T) {
+	status := http.StatusNoContent
+	var seen []string
+	var hb map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer токен-узла" {
+			t.Error("отчёт отправлен без токена узла")
+		}
+		if r.URL.Path == "/internal/v1/nodes/srv/heartbeat" {
+			if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
+				t.Errorf("тело heartbeat не разобрано: %v", err)
+			}
+		}
+		w.WriteHeader(status)
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("токен-узла")
+	rep := ObservedReport{
+		ConfigVersion: 3,
+		Peers:         []ObservedPeer{{PublicKey: "k", RxBytes: 1, TxBytes: 2}},
+	}
+	if err := c.Observed(context.Background(), "srv", rep); err != nil {
+		t.Fatalf("отчёт отклонён: %v", err)
+	}
+	if len(seen) != 1 || seen[0] != "POST /internal/v1/nodes/srv/observed" {
+		t.Fatalf("запросы %v", seen)
+	}
+	load := 0.5
+	if err := c.Heartbeat(context.Background(), "srv", Heartbeat{
+		AgentVersion: "1.0", AgentUptimeSec: 60, Load1: &load, AppliedConfigVersion: 3,
+	}); err != nil {
+		t.Fatalf("heartbeat отклонён: %v", err)
+	}
+	if len(seen) != 2 || seen[1] != "POST /internal/v1/nodes/srv/heartbeat" {
+		t.Fatalf("запросы %v", seen)
+	}
+	if _, ok := hb["cpu_pct"]; !ok || hb["cpu_pct"] != nil {
+		t.Fatalf("cpu_pct %v; ожидался ключ со значением null", hb["cpu_pct"])
+	}
+	if hb["load1"] != 0.5 {
+		t.Fatalf("load1 %v; ожидалось 0.5", hb["load1"])
+	}
+	status = http.StatusOK
+	err := c.Observed(context.Background(), "srv", rep)
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != 200 {
+		t.Fatalf("ответ 200 принят за успешный отчёт: %v", err)
+	}
+}
+
+func TestRotateTokenSendsCurrentToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/v1/nodes/srv/token/rotate" {
+			t.Errorf("запрос %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"server_id":"srv","node_token":"следующий"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	c.SetToken("текущий")
+	if _, err := c.RotateToken(context.Background(), "srv"); err != nil {
+		t.Fatal(err)
+	}
+	if gotAuth != "Bearer текущий" {
+		t.Fatal("ротация отправлена не с текущим токеном")
+	}
+}
+
+func TestResponseBodyLimit(t *testing.T) {
+	big := strings.Repeat("а", 1<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		_, _ = w.Write([]byte(`{"server_id":"` + big + `"}`))
+	}))
+	defer srv.Close()
+	c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+	if _, _, _, err := c.Desired(context.Background(), "s", ""); err == nil {
+		t.Fatal("тело больше 1 МиБ принято")
+	}
+}
 ```
+
+R30: диагностика тестов в плане была английской; здесь она русская. Строка
+`_ = x509.NewCertPool()` и импорт `crypto/x509` из плана удалены: пул там создавался и
+выбрасывался, то есть ничего не проверял. Литеральных ключей WireGuard в этом пакете нет.
 
 - [ ] **Step 2: Прогнать и убедиться, что не компилируется**
 
-Run: `make unit`
-Expected: FAIL — `undefined: New`.
+Run: сосредоточенный `make unit` по пакету `internal/nodeagent/api` с `-mod=readonly`.
+Expected: FAIL — `undefined: New`, `undefined: Config`, `undefined: Client`.
 
-- [ ] **Step 3: Реализовать `client.go` (схема; ключевые функции дословно)**
+- [ ] **Step 3: Реализовать `client.go`**
 
-Требования:
+Требования к `New` (R31):
 
-- `New`: `BaseURL` обязателен, завершающий `/` срезается. `MinVersion: tls.VersionTLS12`.
-  `AllowInsecure` при `Env != "dev"` — ошибка конфигурации. `CAFile` читается, пул без
-  сертификатов — ошибка. `Timeout` по умолчанию 15 с. Тело ответа ограничено 1 MiB.
-- `do(ctx, method, path string, in, out any, token string) (int, http.Header, error)`:
-  JSON-тело, `Authorization: Bearer <token>` при непустом токене, `Accept:
-  application/json`, `Content-Type: application/json`; при статусе ≥ 400 разбирает
-  `{"error":{"code":…}}` в `*StatusError`; 304 не ошибка и тела не читает.
-- `Desired` возвращает `(set, etag, notModified, err)`; `etag` берётся из заголовка и при
-  304 тоже (сервер его присылает).
-- Типы ответов повторяют JSON сервера один в один: `DesiredSet{ServerID, ConfigVersion, MTU,
-  ListenPort, TunnelAddress string, DNSServers []string, KeepaliveSec int, Peers []DesiredPeer,
-  MeasuredAt time.Time}` и `DesiredPeer{PublicKey string, AllowedIPs []string, ExpiresAt
-  time.Time, State string}` с тегами `server_id`, `config_version`, `mtu`, `listen_port`,
-  `tunnel_address`, `dns_servers`, `keepalive_sec`, `peers`, `measured_at`, `public_key`,
-  `allowed_ips`, `expires_at`, `state`. `State` не отбрасывается: сервер уже отдаёт его
-  (`internal/servers/desired.go`), а без него узел не может отдать адрес активному ключу
-  при ротации (задача 2). Поле `DeviceID` API узлу не отдаёт и узел не заводит.
-- `Enroll` — POST без токена, ответ `NodeToken`, `Cache-Control` не проверяется.
-- Остальные типы — поле в поле со схемами `api-spec/openapi.yaml`, с дословными именами
-  Go и тегами JSON: их использует цикл (задача 8), поэтому переименование здесь ломает
-  соседнюю задачу. `LatestHandshake` — указатель, а не `time.Time`: «рукопожатия не
-  было» приходит как `null`, и нулевое время в отчёте означало бы 1970 год.
+- `BaseURL` обязателен; разбирается через `url.Parse`; завершающая `/` срезается.
+- Вне dev допустим только `https`: `http` принимается лишь при `Env == "dev"` и
+  `AllowInsecure == true`.
+- `AllowInsecure == true` при `Env != "dev"` — ошибка конфигурации.
+- `CAFile`: файл читается, `x509.NewCertPool` + `AppendCertsFromPEM`; `false` — ошибка.
+  Отсутствующий файл — ошибка с `%w`.
+- `MinVersion: tls.VersionTLS12`; `AllowInsecure` ставит `InsecureSkipVerify`.
+- `Timeout` по умолчанию 15 с (при `<= 0`).
+
+Дословно — тип клиента, конфигурация и тип ошибки:
 
 ```go
+// maxBody ограничивает тело ответа: сломанный или враждебный сервер не имеет
+// права заставить узел вычитать гигабайты в память.
+const maxBody = 1 << 20
+
+type Config struct {
+	BaseURL       string
+	CAFile        string
+	Env           string
+	AllowInsecure bool
+	Timeout       time.Duration
+}
+
+type Client struct {
+	baseURL string
+	token   string
+	hc      *http.Client
+}
+
+type StatusError struct {
+	Status int
+	Code   string
+}
+
+func (e *StatusError) Error() string {
+	if e.Code == "" {
+		return fmt.Sprintf("api: отказ %d", e.Status)
+	}
+	return fmt.Sprintf("api: отказ %d (%s)", e.Status, e.Code)
+}
+```
+
+`SetToken` сохраняет токен для последующих запросов; вызывается из одного горутины
+цикла (задача 8), поэтому мьютекс не нужен.
+
+`do` (R32):
+
+```go
+func (c *Client) do(ctx context.Context, method, path string, in, out any, token string, header http.Header) (int, http.Header, error)
+```
+
+- Тело `in` кодируется JSON; заголовки `Accept: application/json`,
+  `Content-Type: application/json` при теле, `Authorization: Bearer <token>` при непустом
+  токене, затем заголовки из `header`.
+- Ответ читается через `io.LimitReader` не более чем `maxBody+1` байт; больше
+  `maxBody` — ошибка, тело не разбирается.
+- `304` — не ошибка: статус и заголовки возвращаются, тело не читается и `out` не
+  разбирается.
+- Статус `>= 400` — `*StatusError`; `Code` берётся из `{"error":{"code":...}}`, при
+  неразбираемом теле остаётся пустым.
+- Иной статус с `out != nil` — разбор JSON; ошибка разбора возвращается, а не глотается.
+
+Методы:
+
+- `Enroll`: `POST /internal/v1/nodes/enroll`, тело `EnrollRequest`, токен не передаётся
+  (даже если `SetToken` уже вызывался), ответ — `NodeToken`.
+- `Desired`: `GET /internal/v1/nodes/{server_id}/desired`; при непустом `etag` —
+  заголовок `If-None-Match`; при 304 — `(DesiredSet{}, etag из заголовка, true, nil)`,
+  иначе разобранный набор и `etag` из заголовка.
+- `Observed`, `Heartbeat`: `POST` соответственно `/observed` и `/heartbeat` с текущим
+  токеном; ожидается ровно `204`; другой успешный код — `*StatusError` с пустым `Code`.
+- `RotateToken`: `POST /internal/v1/nodes/{server_id}/token/rotate` с текущим токеном,
+  ответ `NodeToken`; сам клиент токен не подменяет — это решение цикла (задача 8).
+- `serverID` в пути кодируется `url.PathEscape`.
+
+Типы ответов повторяют JSON сервера один в один:
+
+```go
+type EnrollRequest struct {
+	BootstrapToken string `json:"bootstrap_token"`
+	PublicKey      string `json:"public_key"`
+}
+
 type NodeToken struct {
 	ServerID  string `json:"server_id"`
 	NodeToken string `json:"node_token"`
 }
 
+type DesiredSet struct {
+	ServerID      string        `json:"server_id"`
+	ConfigVersion int64         `json:"config_version"`
+	MTU           int           `json:"mtu"`
+	ListenPort    int           `json:"listen_port"`
+	TunnelAddress string        `json:"tunnel_address"`
+	DNSServers    []string      `json:"dns_servers"`
+	KeepaliveSec  int           `json:"keepalive_sec"`
+	Peers         []DesiredPeer `json:"peers"`
+	MeasuredAt    time.Time     `json:"measured_at"`
+}
+
+type DesiredPeer struct {
+	PublicKey  string    `json:"public_key"`
+	AllowedIPs []string  `json:"allowed_ips"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	State      string    `json:"state"`
+}
+
 type ObservedReport struct {
-	ConfigVersion     int64          `json:"config_version"`
-	InterfaceRxBytes  int64          `json:"interface_rx_bytes"`
-	InterfaceTxBytes  int64          `json:"interface_tx_bytes"`
-	Peers             []ObservedPeer `json:"peers"`
+	ConfigVersion    int64          `json:"config_version"`
+	InterfaceRxBytes int64          `json:"interface_rx_bytes"`
+	InterfaceTxBytes int64          `json:"interface_tx_bytes"`
+	Peers            []ObservedPeer `json:"peers"`
 }
 
 type ObservedPeer struct {
@@ -2188,36 +2482,28 @@ type Heartbeat struct {
 	Stale                bool     `json:"stale"`
 }
 ```
-- `Observed` и `Heartbeat` ожидают 204; иной успешный код — `StatusError`.
-- `RotateToken` — POST `/internal/v1/nodes/{id}/token/rotate` с текущим токеном.
 
-Дословно — тип ошибки и подпись `do`:
-
-```go
-type StatusError struct {
-	Status int
-	Code   string
-}
-
-func (e *StatusError) Error() string {
-	return fmt.Sprintf("api: отказ %d (%s)", e.Status, e.Code)
-}
-
-func (c *Client) do(ctx context.Context, method, path string, in, out any, token string) (int, http.Header, error)
-```
+`State` в `DesiredPeer` не отбрасывается: сервер его отдаёт, и без него узел не отличит
+активный ключ от старого при ротации (задача 2). `LatestHandshake`, `Load1`, `CPUPct` —
+указатели: «не измеряли» приходит как `null`, и ноль вместо `null` был бы ложью
+(ADR-006). Тексты ошибок русские с префиксом `api:`; токен и содержимое файлов в тексты
+ошибок не попадают.
 
 - [ ] **Step 4: Прогнать тесты**
 
-Run: `make unit`
-Expected: PASS, включая TLS-тесты.
+Run: сосредоточенный `make unit` по пакету, затем полные `unit` и `vet`.
+Expected: PASS, одиннадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
+не менялись (новых внешних зависимостей нет).
 
 - [ ] **Step 5: Коммит**
 
 ```bash
-git add internal/nodeagent/api
+git add internal/nodeagent/api docs/superpowers/plans/2026-10-27-novavpn-cycle-a3-node-runtime.md
 git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
   commit -m "feat(a3): HTTPS-клиент узла с ETag, отчётами и проверкой сертификата"
 ```
+
+Один новый локальный коммит, без amend и push.
 
 ---
 
