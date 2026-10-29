@@ -2209,6 +2209,37 @@ func TestDesiredRequiresOK(t *testing.T) {
 	}
 }
 
+func TestDesiredRejectsIncompleteSet(t *testing.T) {
+	bodies := []string{
+		`null`,
+		`{}`,
+		`{"server_id":"s","config_version":0,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"","dns_servers":[],"keepalive_sec":25,"peers":[],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`,
+		`{"server_id":"s","config_version":0,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[]}`,
+	}
+	for _, body := range bodies {
+		body := body
+		t.Run(body, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"abc"`)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+			_, _, _, err := c.Desired(context.Background(), "s", "")
+			if err == nil {
+				t.Fatal("неполный набор принят")
+			}
+			var se *StatusError
+			if errors.As(err, &se) {
+				t.Fatalf("неполный набор выдан за отказ сервера: %v", err)
+			}
+		})
+	}
+}
+
 func TestStatusErrorCarriesCode(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -2556,7 +2587,10 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any, token
 - `Desired`: `GET /internal/v1/nodes/{server_id}/desired`; при непустом `etag` —
   заголовок `If-None-Match`; при 304 — `(DesiredSet{}, etag из заголовка, true, nil)`;
   иначе требуется ровно `200`, иной код (включая 204) — `*StatusError` без etag; при 200 —
-  разобранный набор и `etag` из заголовка.
+  разобранный набор и `etag` из заголовка. Набор с пустым `server_id`, пустым
+  `tunnel_address` или нулевым `measured_at` отвергается ошибкой `api: неполный набор: нет …`
+  с перечнем отсутствующих полей (значения тела в текст не попадают); `config_version`
+  не проверяется.
 - `Observed`, `Heartbeat`: `POST` соответственно `/observed` и `/heartbeat` с текущим
   токеном; ожидается ровно `204`; другой успешный код — `*StatusError` с пустым `Code`.
 - `RotateToken`: `POST /internal/v1/nodes/{server_id}/token/rotate` с текущим токеном,
@@ -2629,7 +2663,7 @@ type Heartbeat struct {
 - [ ] **Step 4: Прогнать тесты**
 
 Run: сосредоточенный `make unit` по пакету, затем полные `unit` и `vet`.
-Expected: PASS, пятнадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
+Expected: PASS, шестнадцать тестов; полный прогон без новых падений, `go.mod`/`go.sum`
 не менялись (новых внешних зависимостей нет).
 
 - [ ] **Step 5: Коммит**

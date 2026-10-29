@@ -145,6 +145,19 @@ func (c *Client) Desired(ctx context.Context, serverID, etag string) (DesiredSet
 	if status != http.StatusOK {
 		return DesiredSet{}, "", false, &StatusError{Status: status}
 	}
+	var missing []string
+	if out.ServerID == "" {
+		missing = append(missing, "server_id")
+	}
+	if out.TunnelAddress == "" {
+		missing = append(missing, "tunnel_address")
+	}
+	if out.MeasuredAt.IsZero() {
+		missing = append(missing, "measured_at")
+	}
+	if len(missing) > 0 {
+		return DesiredSet{}, "", false, fmt.Errorf("api: неполный набор: нет %s", strings.Join(missing, ", "))
+	}
 	return out, newETag, false, nil
 }
 

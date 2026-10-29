@@ -172,6 +172,37 @@ func TestDesiredRequiresOK(t *testing.T) {
 	}
 }
 
+func TestDesiredRejectsIncompleteSet(t *testing.T) {
+	bodies := []string{
+		`null`,
+		`{}`,
+		`{"server_id":"s","config_version":0,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"","dns_servers":[],"keepalive_sec":25,"peers":[],` +
+			`"measured_at":"2026-10-27T10:00:00Z"}`,
+		`{"server_id":"s","config_version":0,"mtu":1420,"listen_port":51820,` +
+			`"tunnel_address":"10.99.0.1/24","dns_servers":[],"keepalive_sec":25,"peers":[]}`,
+	}
+	for _, body := range bodies {
+		body := body
+		t.Run(body, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"abc"`)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+			_, _, _, err := c.Desired(context.Background(), "s", "")
+			if err == nil {
+				t.Fatal("неполный набор принят")
+			}
+			var se *StatusError
+			if errors.As(err, &se) {
+				t.Fatalf("неполный набор выдан за отказ сервера: %v", err)
+			}
+		})
+	}
+}
+
 func TestStatusErrorCarriesCode(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
