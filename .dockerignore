@@ -13,6 +13,31 @@ migrations/**
 !migrations/*.go
 !migrations/*.sql
 
+# Входы стенда E2E: ровно то, что COPY используют его Dockerfile. Каталоги
+# открываются по одному, иначе исключение ниже не смогло бы увидеть вложенный
+# файл; последующий блок запретов по-прежнему отсекает env, ключи и состояние.
+!tests
+tests/**
+!tests/e2e
+tests/e2e/**
+!tests/e2e/probe
+tests/e2e/probe/**
+!tests/e2e/probe/*.go
+!infrastructure
+infrastructure/**
+!infrastructure/docker
+infrastructure/docker/**
+!infrastructure/docker/e2e
+infrastructure/docker/e2e/**
+!infrastructure/docker/e2e/node1.Dockerfile
+!infrastructure/docker/e2e/client1.Dockerfile
+!infrastructure/docker/e2e/probe.Dockerfile
+!infrastructure/docker/e2e/unbound.conf
+!infrastructure/docker/e2e/nat.nft
+!infrastructure/docker/e2e/dnsmasq.conf
+!infrastructure/docker/e2e/node-entrypoint.sh
+!infrastructure/docker/e2e/client-entrypoint.sh
+
 # Даже исходники не берём из каталогов с секретами и посторонних деревьев.
 **/.git
 **/.git/**

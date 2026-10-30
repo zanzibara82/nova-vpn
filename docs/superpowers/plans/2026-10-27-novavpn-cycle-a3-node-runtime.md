@@ -3113,619 +3113,157 @@ MSYS_NO_PATHCONV=1 docker run --rm --network none --cap-add NET_ADMIN --cap-add 
 
 ### Task 11: Стенд E2E — две сети, настоящий туннель, egress = адрес узла
 
-Юнит-тесты не отвечают на вопрос «идёт ли трафик». Для этого нужен стенд, где у узла
-есть вторая сеть с сервисом-эхом, а у клиента нет маршрута в неё, кроме туннеля: тогда
-ответ эха с адресом узла — это факт про путь пакета, а не про запись в конфиге.
-
-Две сети, а не одна: `harness` (172.31.99.0/24) — управляющая, в ней API, узел и клиент;
-`uplink` (172.31.98.0/24) — «интернет» за узлом, в ней только узел и `probe`. Клиент не
-имеет адреса в `uplink` и маршрута туда, поэтому единственный путь к `probe` — `wg0`.
-NAT — отдельной таблицей `novavpn` (ADR-0009), `ip_forward` — через `sysctls` compose, а не
-записью в `/proc` из скрипта.
-
-**Files:**
-- Create: `infrastructure/docker/docker-compose.e2e.yml`,
-  `infrastructure/docker/e2e/node1.Dockerfile`,
-  `infrastructure/docker/e2e/client1.Dockerfile`,
-  `infrastructure/docker/e2e/probe.Dockerfile`,
-  `infrastructure/docker/e2e/unbound.conf`,
-  `infrastructure/docker/e2e/nat.nft`,
-  `infrastructure/docker/e2e/node-entrypoint.sh`,
-  `infrastructure/docker/e2e/client-entrypoint.sh`,
-  `infrastructure/docker/e2e/dnsmasq.conf`,
-  `tests/e2e/probe/main.go`,
-  `scripts/e2e.sh`
-- Modify: `Makefile` (цели `e2e`, `e2e-down`)
-
-**Interfaces:**
-- Produces: `make e2e` — код 0 только если все проверки фазы прошли; стек остаётся на
-  месте при отказе (разбор), снимается на успехе.
-
-- [ ] **Step 1: Сервис-эхо (дословный исходник)**
-
-`tests/e2e/probe/main.go`:
-
-```go
-// probe отвечает адресом клиента, каким его видит сеть за узлом. Это проверка
-// «пакет прошёл через узел и NAT», а не «пиер записан в конфиг»: адрес в ответе —
-// адрес узла в uplink-сети, и получить его иначе, чем через туннель, клиент не может.
-package main
-
-import (
-	"fmt"
-	"log"
-	"net"
-	"net/http"
-)
-
-func main() {
-	http.HandleFunc("/whoami", func(w http.ResponseWriter, r *http.Request) {
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			http.Error(w, "плохой RemoteAddr", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintln(w, host)
-	})
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-```
-
-- [ ] **Step 2: Образ probe и его DNS**
-
-`infrastructure/docker/e2e/probe.Dockerfile`:
-
-```dockerfile
-FROM golang:1.25-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/probe ./tests/e2e/probe
-
-FROM alpine:3.20
-RUN apk add --no-cache dnsmasq
-COPY --from=build /out/probe /usr/local/bin/probe
-COPY infrastructure/docker/e2e/dnsmasq.conf /etc/dnsmasq.conf
-ENTRYPOINT ["/bin/sh", "-c", "dnsmasq --conf-file=/etc/dnsmasq.conf && exec /usr/local/bin/probe"]
-```
-
-`infrastructure/docker/e2e/dnsmasq.conf` — единственный резолвер, доступный узлу, и только
-из `uplink`; `no-resolv` обязателен, иначе dnsmasq полез бы во внешний DNS контейнера и
-проверка «запрос ушёл через туннель» стала бы неправдой:
-
-```
-no-resolv
-no-hosts
-address=/probe.e2e.test/172.31.98.3
-address=/dns.e2e.test/172.31.98.3
-```
-
-- [ ] **Step 3: Образ узла**
-
-`infrastructure/docker/e2e/node1.Dockerfile`:
-
-```dockerfile
-FROM golang:1.25-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-ARG AGENT_VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-    -o /out/novavpn-node-agent ./services/node-agent/cmd/novavpn-node-agent
-
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates unbound nftables iproute2 su-exec libcap wireguard-tools \
- && adduser -D -H -u 65532 novavpn
-COPY --from=build /out/novavpn-node-agent /usr/local/bin/novavpn-node-agent
-RUN setcap cap_net_admin,cap_net_raw+ep /usr/local/bin/novavpn-node-agent
-COPY infrastructure/docker/e2e/unbound.conf /etc/unbound/unbound.conf
-COPY infrastructure/docker/e2e/nat.nft /etc/novavpn/nat.nft
-COPY infrastructure/docker/e2e/node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/node-entrypoint.sh
-ENTRYPOINT ["/usr/local/bin/node-entrypoint.sh"]
-CMD ["run"]
-```
-
-- [ ] **Step 4: unbound и NAT узла**
-
-`infrastructure/docker/e2e/unbound.conf` — слушает все адреса, но отвечает только
-туннельной сети; запросы из `harness` (например, на 172.31.99.2) обязаны получить `REFUSED`,
-и это проверяется в задаче 12, а не подразумевается:
-
-```
-server:
-    verbosity: 1
-    log-queries: no
-    interface: 0.0.0.0
-    access-control: 10.99.7.0/24 allow
-    access-control: 0.0.0.0/0 refuse
-    do-ip6: no
-    do-daemonize: no
-    username: "unbound"
-    chroot: ""
-    hide-identity: yes
-    hide-version: yes
-    qname-minimisation: yes
-    minimal-responses: yes
-
-forward-zone:
-    name: "."
-    forward-addr: 172.31.98.3
-```
-
-`forward-zone "."` на probe-dnsmasq — не «настоящая рекурсия»: в стенде нет внешнего DNS,
-и честная формулировка результата — «запрос клиента дошёл до резолвера узла и ушёл с узла
-настроенным форвардером», а не «рекурсия в интернете проверена».
-
-`infrastructure/docker/e2e/nat.nft`:
-
-```
-table ip novavpn {
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        ip saddr 10.99.7.0/24 oifname "eth1" masquerade
-    }
-}
-```
-
-- [ ] **Step 5: Точки входа контейнеров**
-
-`infrastructure/docker/e2e/node-entrypoint.sh` — root-шаг ровно один и только для `run`:
-каталог состояния принадлежит `novavpn`, дальше процесс идёт без root (capabilities на
-бинарнике, ADR-0009 правила 1 и 3):
-
-```sh
-#!/bin/sh
-set -eu
-mkdir -p /var/lib/novavpn-node
-chown -R novavpn:novavpn /var/lib/novavpn-node
-
-case "${1:-run}" in
-  run)
-    nft delete table ip novavpn 2>/dev/null || true
-    nft -f /etc/novavpn/nat.nft
-    unbound -c /etc/unbound/unbound.conf
-    exec su-exec novavpn /usr/local/bin/novavpn-node-agent run
-    ;;
-  *)
-    exec su-exec novavpn /usr/local/bin/novavpn-node-agent "$@"
-    ;;
-esac
-```
-
-`infrastructure/docker/e2e/client-entrypoint.sh` — конфиг из API попадает в контейнер без
-приватного ключа; ключ генерируется здесь же и здесь остаётся. `DNS =` вырезается, потому
-что `wg-quick` позвал бы `resolvconf`, которого в alpine нет; резолвер ставится явно:
-
-```sh
-#!/bin/sh
-set -eu
-STATE=/state
-
-case "${1:-run}" in
-  genkey)
-    path="${2:-$STATE/client.key}"
-    [ -f "$path" ] || wg genkey > "$path"
-    chmod 600 "$path"
-    wg pubkey < "$path"
-    ;;
-  run)
-    [ -f "$STATE/client.conf" ] || { echo "нет $STATE/client.conf" >&2; exit 1; }
-    [ -f "$STATE/client.key" ] || { echo "нет $STATE/client.key" >&2; exit 1; }
-    mkdir -p /etc/wireguard
-    {
-      echo "[Interface]"
-      echo "PrivateKey = $(cat "$STATE/client.key")"
-      grep -v '^DNS = ' "$STATE/client.conf" | grep -v '^\[Interface\]$'
-    } > /etc/wireguard/wg0.conf
-    chmod 600 /etc/wireguard/wg0.conf
-    printf 'nameserver 10.99.7.1\n' > /etc/resolv.conf
-    wg-quick up wg0
-    exec sleep infinity
-    ;;
-  *)
-    exec "$@"
-    ;;
-esac
-```
-
-`infrastructure/docker/e2e/client1.Dockerfile`:
-
-```dockerfile
-FROM alpine:3.20
-RUN apk add --no-cache wireguard-tools iproute2 bash curl iputils tcpdump bind-tools
-COPY infrastructure/docker/e2e/client-entrypoint.sh /usr/local/bin/client-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/client-entrypoint.sh
-VOLUME ["/state"]
-ENTRYPOINT ["/usr/local/bin/client-entrypoint.sh"]
-CMD ["run"]
-```
-
-- [ ] **Step 6: Compose стенда**
-
-`infrastructure/docker/docker-compose.e2e.yml`:
-
-```yaml
-# Отдельное имя: `down -v` стенда не должен снимать тома dev-стека.
-name: novavpn-e2e
-
-services:
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: nova
-      POSTGRES_PASSWORD: nova
-      POSTGRES_DB: novavpn
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nova -d novavpn"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-    networks:
-      harness: {ipv4_address: 172.31.99.11}
-
-  redis:
-    image: redis:7
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-    networks:
-      harness: {ipv4_address: 172.31.99.12}
-
-  api:
-    build:
-      context: ../..
-      dockerfile: Dockerfile.api
-    environment:
-      NOVAVPN_ENV: dev
-      NOVAVPN_LISTEN_ADDR: ":8080"
-      NOVAVPN_DATABASE_URL: postgres://nova:nova@172.31.99.11:5432/novavpn?sslmode=disable
-      NOVAVPN_REDIS_ADDR: 172.31.99.12:6379
-      # Значение приходит из .scratch/e2e/.env через --env-file скрипта. Пустое
-      # значение не «дефолт»: API откажется стартовать с понятной ошибкой конфигурации.
-      NOVAVPN_JWT_SECRET: ${NOVAVPN_JWT_SECRET:-}
-    ports:
-      - "127.0.0.1:18080:8080"
-    depends_on:
-      postgres: {condition: service_healthy}
-      redis: {condition: service_healthy}
-    networks:
-      harness: {ipv4_address: 172.31.99.10}
-
-  node1:
-    build:
-      context: ../..
-      dockerfile: infrastructure/docker/e2e/node1.Dockerfile
-    cap_add: [NET_ADMIN, NET_RAW]
-    sysctls:
-      net.ipv4.ip_forward: "1"
-    environment:
-      NOVAVPN_NODE_ENV: dev
-      NOVAVPN_NODE_API_URL: http://172.31.99.10:8080
-      NOVAVPN_NODE_ALLOW_INSECURE_API: "true"
-      NOVAVPN_NODE_STATE_DIR: /var/lib/novavpn-node
-      NOVAVPN_NODE_INTERFACE: wg0
-      NOVAVPN_NODE_POLL_INTERVAL: 25s
-    volumes:
-      - node1-state:/var/lib/novavpn-node
-    networks:
-      harness: {ipv4_address: 172.31.99.2}
-      uplink: {ipv4_address: 172.31.98.2}
-
-  client1:
-    build:
-      context: ../..
-      dockerfile: infrastructure/docker/e2e/client1.Dockerfile
-    cap_add: [NET_ADMIN]
-    sysctls:
-      # Политика §8: на время подключения IPv6 на клиенте отключается.
-      net.ipv6.conf.all.disable_ipv6: "1"
-    volumes:
-      - client1-state:/state
-    networks:
-      harness: {ipv4_address: 172.31.99.3}
-
-  probe:
-    build:
-      context: ../..
-      dockerfile: infrastructure/docker/e2e/probe.Dockerfile
-    networks:
-      uplink: {ipv4_address: 172.31.98.3}
-
-networks:
-  harness:
-    ipam:
-      config: [{subnet: 172.31.99.0/24}]
-  uplink:
-    ipam:
-      config: [{subnet: 172.31.98.0/24}]
-
-volumes:
-  node1-state:
-  client1-state:
-```
-
-- [ ] **Step 7: Скрипт стенда — установка и проверка туннеля**
-
-`scripts/e2e.sh` (дословный исходник; задачи 12–13 дописывают в него фазы):
-
-```bash
-#!/usr/bin/env bash
-# Стенд E2E: настоящий туннель между client1 и node1, probe за узлом в отдельной
-# сети. Каждая проверка печатает `ok` со своим именем; отказ — `FAIL` и код 1.
-# На успехе стек снимается, на отказе остаётся для разбора (make e2e-down).
-set -euo pipefail
-export MSYS_NO_PATHCONV=1
-
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
-SCRATCH="$ROOT/.scratch/e2e"
-COMPOSE_FILE="$ROOT/infrastructure/docker/docker-compose.e2e.yml"
-API=http://127.0.0.1:18080
-DC=(docker compose -f "$COMPOSE_FILE")
-STATUS=0
-
-say()  { printf '\n== %s\n' "$*"; }
-pass() { printf 'ok   %s\n' "$*"; }
-fail() { STATUS=1; printf 'FAIL %s\n' "$*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || fail "нет команды $1"; }
-
-finish() {
-  local code=$?
-  if [ "$code" -ne 0 ] || [ "$STATUS" -ne 0 ]; then
-    mkdir -p "$SCRATCH/logs"
-    "${DC[@]}" logs --no-color > "$SCRATCH/logs/stack.log" 2>&1 || true
-    printf '\nстек оставлен для разбора: %s (снять: make e2e-down)\n' "$SCRATCH/logs/stack.log" >&2
-    return
-  fi
-  "${DC[@]}" down -v --remove-orphans >/dev/null
-  rm -rf "$SCRATCH"
-}
-trap finish EXIT
-
-jget() { # файл путь.через.точку
-  python - "$1" "$2" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    d = json.load(f)
-for part in sys.argv[2].split("."):
-    d = d[int(part)] if part.isdigit() else d[part]
-print(d)
-PY
-}
-
-wait_for() { # секунды, что ждём, команда...
-  local seconds=$1 what=$2 deadline
-  shift 2
-  deadline=$(( $(date +%s) + seconds ))
-  until "$@" >/dev/null 2>&1; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      fail "за ${seconds} с не выполнено: ${what}"
-    fi
-    sleep 2
-  done
-}
-
-node_exec()   { "${DC[@]}" exec -T node1 "$@"; }
-client_exec() { "${DC[@]}" exec -T client1 "$@"; }
-node_run()    { "${DC[@]}" run --rm -T node1 "$@"; }
-client_run()  { "${DC[@]}" run --rm -T client1 "$@"; }
-# -d, а не «&»: фоновая задача должна пережить завершение exec-сессии.
-client_bg()   { "${DC[@]}" exec -d -T client1 sh -c "$1"; }
-# Ключ генерируется внутри работающего клиента: compose run поднял бы второй
-# контейнер с тем же статическим адресом 172.31.99.3 и получил бы конфликт.
-client_key()  { client_exec sh -c "wg genkey > '$1' && chmod 600 '$1' && wg pubkey < '$1'"; }
-
-api_ready() { curl -fsS -o /dev/null --max-time 2 "$API/debug/health"; }
-proxy_ok()  { client_exec curl -fsS --max-time 5 http://probe.e2e.test:8080/whoami; }
-peer_count() { node_exec wg show wg0 peers 2>/dev/null | grep -c . || true; }
-peers_at_least_one() { [ "$(peer_count)" -ge 1 ]; }
-peers_none()         { [ "$(peer_count)" = 0 ]; }
-handshake_seen() { node_exec wg show wg0 latest-handshakes | awk '$2 > 0 { seen = 1 } END { exit seen ? 0 : 1 }'; }
-peer_absent()  { ! node_exec wg show wg0 peers 2>/dev/null | grep -qx "$1"; }
-peer_address() { node_exec wg show wg0 allowed-ips | awk -v k="$1" '$1 == k { print $2 }'; }
-
-setup() {
-  say "стенд: секреты, БД, администратор, сервер, узел, клиент"
-  need docker
-  need python
-  need curl
-  rm -rf "$SCRATCH"
-  mkdir -p "$SCRATCH"
-  chmod 700 "$SCRATCH"
-
-  python - > "$SCRATCH/.env" <<'PY'
-import base64, secrets
-print("NOVAVPN_JWT_SECRET=" + base64.b64encode(secrets.token_bytes(32)).decode())
-PY
-  python - > "$SCRATCH/admin.pass" <<'PY'
-import secrets
-print(secrets.token_urlsafe(24))
-PY
-  chmod 600 "$SCRATCH/.env" "$SCRATCH/admin.pass"
-
-  "${DC[@]}" --env-file "$SCRATCH/.env" up -d --wait postgres redis
-  "${DC[@]}" --env-file "$SCRATCH/.env" run --rm -T api migrate up
-  "${DC[@]}" --env-file "$SCRATCH/.env" run --rm -T api admin create admin@e2e.test \
-    < "$SCRATCH/admin.pass" >/dev/null
-  "${DC[@]}" --env-file "$SCRATCH/.env" up -d api
-  wait_for 90 "API отвечает на /debug/health" api_ready
-  pass "API и база готовы, администратор создан"
-
-  python - "$SCRATCH/admin.pass" > "$SCRATCH/admin-login.json" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    password = f.read().strip()
-print(json.dumps({"email": "admin@e2e.test", "password": password}))
-PY
-  chmod 600 "$SCRATCH/admin-login.json"
-  curl -fsS -X POST "$API/api/v1/admin/login" -H 'Content-Type: application/json' \
-    --data-binary @"$SCRATCH/admin-login.json" > "$SCRATCH/admin-session.json"
-  printf 'Authorization: Bearer %s\nContent-Type: application/json\n' \
-    "$(jget "$SCRATCH/admin-session.json" access_token)" > "$SCRATCH/admin.hdr"
-  chmod 600 "$SCRATCH/admin.hdr"
-  rm -f "$SCRATCH/admin-login.json"
-
-  NODE_PUB=$(node_run init 2>/dev/null | sed -n 's/^public_key //p')
-  [ -n "$NODE_PUB" ] || fail "init узла не напечатал public_key"
-  python - "$NODE_PUB" > "$SCRATCH/server.json" <<'PY'
-import json, sys
-print(json.dumps({
-    "name": "e2e-1",
-    "advertised_host": "172.31.99.2",
-    "listen_port": 51820,
-    "public_key": sys.argv[1],
-    "address_pool_v4": "10.99.7.0/24",
-    "provider": "e2e",
-    "reason": "стенд E2E",
-    "location": {"country_code": "DE", "city": "Test", "lat": "52.5",
-                 "lon": "13.4", "timezone": "UTC"},
-}))
-PY
-  curl -fsS -X POST "$API/api/v1/admin/servers" -H @"$SCRATCH/admin.hdr" \
-    --data-binary @"$SCRATCH/server.json" > "$SCRATCH/server-created.json"
-  SERVER_ID=$(jget "$SCRATCH/server-created.json" id)
-  printf '{"status":"online","reason":"стенд E2E"}\n' > "$SCRATCH/online.json"
-  curl -fsS -X POST "$API/api/v1/admin/servers/$SERVER_ID/maintenance" \
-    -H @"$SCRATCH/admin.hdr" --data-binary @"$SCRATCH/online.json" >/dev/null
-  printf '{}\n' > "$SCRATCH/empty.json"
-  curl -fsS -X POST "$API/api/v1/admin/servers/$SERVER_ID/bootstrap-tokens" \
-    -H @"$SCRATCH/admin.hdr" --data-binary @"$SCRATCH/empty.json" > "$SCRATCH/bootstrap.json"
-  jget "$SCRATCH/bootstrap.json" token > "$SCRATCH/bootstrap.token"
-  chmod 600 "$SCRATCH/bootstrap.token"
-  pass "сервер $SERVER_ID создан и переведён в online"
-
-  node_run enroll < "$SCRATCH/bootstrap.token"
-  "${DC[@]}" --env-file "$SCRATCH/.env" up -d node1
-  pass "узел зарегистрирован и запущен"
-
-  CLIENT_PUB=$(client_run genkey /state/client.key)
-  python - > "$SCRATCH/user.pass" <<'PY'
-import secrets
-print(secrets.token_urlsafe(24))
-PY
-  chmod 600 "$SCRATCH/user.pass"
-  python - "$SCRATCH/user.pass" > "$SCRATCH/register.json" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    password = f.read().strip()
-print(json.dumps({"email": "user@e2e.test", "password": password}))
-PY
-  chmod 600 "$SCRATCH/register.json"
-  curl -fsS -X POST "$API/api/v1/auth/register" -H 'Content-Type: application/json' \
-    --data-binary @"$SCRATCH/register.json" >/dev/null
-  curl -fsS -X POST "$API/api/v1/auth/login" -H 'Content-Type: application/json' \
-    --data-binary @"$SCRATCH/register.json" > "$SCRATCH/user-session.json"
-  printf 'Authorization: Bearer %s\nContent-Type: application/json\n' \
-    "$(jget "$SCRATCH/user-session.json" access_token)" > "$SCRATCH/user.hdr"
-  chmod 600 "$SCRATCH/user.hdr"
-  rm -f "$SCRATCH/register.json"
-
-  python - "$CLIENT_PUB" > "$SCRATCH/device.json" <<'PY'
-import json, sys
-print(json.dumps({"public_key": sys.argv[1], "platform": "linux", "name": "e2e-client"}))
-PY
-  curl -fsS -X POST "$API/api/v1/devices" -H @"$SCRATCH/user.hdr" \
-    -H "Idempotency-Key: e2e-device-1" --data-binary @"$SCRATCH/device.json" \
-    > "$SCRATCH/device-created.json"
-  DEVICE_ID=$(jget "$SCRATCH/device-created.json" id)
-  python - "$SERVER_ID" > "$SCRATCH/profile.json" <<'PY'
-import json, sys
-print(json.dumps({"server_id": sys.argv[1]}))
-PY
-  curl -fsS -X POST "$API/api/v1/devices/$DEVICE_ID/profiles" -H @"$SCRATCH/user.hdr" \
-    -H "Idempotency-Key: e2e-profile-1" --data-binary @"$SCRATCH/profile.json" \
-    > "$SCRATCH/profile-created.json"
-
-  curl -fsS "$API/api/v1/devices/$DEVICE_ID/profiles/$SERVER_ID/config" \
-    -H @"$SCRATCH/user.hdr" > "$SCRATCH/client.conf"
-  if grep -q '^PrivateKey' "$SCRATCH/client.conf"; then
-    fail "API вернул конфиг с приватным ключом (§3 нарушен)"
-  fi
-  pass "профиль выдан, конфиг получен и приватного ключа в нём нет"
-
-  # Конфиг кладётся в том до старта клиента: client1 ещё не запущен, и exec к нему
-  # невозможен, а run поднимает одноразовый контейнер с тем же томом /state.
-  client_run sh -c 'cat > /state/client.conf' < "$SCRATCH/client.conf"
-  "${DC[@]}" --env-file "$SCRATCH/.env" up -d client1
-}
-
-tunnel() {
-  say "туннель: handshake, трафик, egress"
-  wait_for 120 "пиер клиента появился на узле" peers_at_least_one
-  wait_for 90 "handshake с клиентом" handshake_seen
-  pass "узел видит пиера и handshake"
-
-  wait_for 90 "ответ probe через туннель" proxy_ok
-  EGRESS=$(client_exec curl -fsS --max-time 5 http://probe.e2e.test:8080/whoami | tr -d '\r\n')
-  [ "$EGRESS" = "172.31.98.2" ] || fail "egress = $EGRESS, ожидался адрес узла 172.31.98.2"
-  pass "egress = $EGRESS (адрес узла, не клиента)"
-
-  client_exec ping -c 3 -W 2 -q probe.e2e.test >/dev/null || fail "ICMP через туннель не ходит"
-  pass "ICMP через туннель проходит"
-
-  node_exec wg show wg0 allowed-ips | grep -q '10\.99\.7\.2/32' \
-    || fail "у узла нет allowed-ips клиента 10.99.7.2/32"
-  pass "адрес клиента на узле — 10.99.7.2/32"
-}
-
-main() {
-  local phase="${1:-all}"
-  case "$phase" in
-    all)    setup; tunnel ;;
-    tunnel) setup; tunnel ;;
-    *) fail "неизвестная фаза: $phase" ;;
-  esac
-  pass "фаза $phase пройдена"
-}
-
-main "$@"
-```
-
-- [ ] **Step 8: Цели Makefile**
-
-В `Makefile` рядом с остальными целями:
-
-```makefile
-# Стенд E2E требует загруженного модуля wireguard на хосте (S1). На успехе снимает
-# стек сам; при отказе оставляет его и печатает путь к журналу — разбор важнее чистоты.
-e2e:
-	bash scripts/e2e.sh all
-
-e2e-down:
-	docker compose -f infrastructure/docker/docker-compose.e2e.yml down -v --remove-orphans
-```
-
-Добавить `e2e e2e-down` в `.PHONY`. Файл скрипта сделать исполняемым
-(`chmod +x scripts/e2e.sh`).
-
-- [ ] **Step 9: Прогнать**
-
-Run: `make e2e`
-Expected: код 0; в выводе пять строк `ok` фазы setup/tunnel, включая
-`egress = 172.31.98.2 (адрес узла, не клиента)`.
-
-Если прогон падает на `modprobe` или `Operation not permitted` при `wg`, это не повод
-обходить проверку: модуль `wireguard` загружается на хосте (S1), и строка об этом идёт в
-`docs/testing-status.md` как незакрытая, а не в комментарий «должно работать».
-
-- [ ] **Step 10: Коммит**
-
-```bash
-chmod +x scripts/e2e.sh
-git add infrastructure/docker/docker-compose.e2e.yml infrastructure/docker/e2e \
-  tests/e2e scripts/e2e.sh Makefile
-git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
-  commit -m "test(a3): стенд E2E — две сети, настоящий туннель, egress = адрес узла"
-```
+Задача разделена контроллером на рубежи: **11a** — построить стенд и доказать
+оффлайн-проверки, **11b** — выполнить настоящий прогон. Ниже фактическое состояние
+после 11a. Исходный шаблон с `eth1`, `do-daemonize: no`, паролем `nova` в compose и
+`rm -rf` scratch не использовался.
+
+**Созданные файлы:**
+- `infrastructure/docker/docker-compose.e2e.yml`
+- `infrastructure/docker/e2e/node1.Dockerfile`
+- `infrastructure/docker/e2e/client1.Dockerfile`
+- `infrastructure/docker/e2e/probe.Dockerfile`
+- `infrastructure/docker/e2e/unbound.conf`
+- `infrastructure/docker/e2e/nat.nft`
+- `infrastructure/docker/e2e/dnsmasq.conf`
+- `infrastructure/docker/e2e/node-entrypoint.sh`
+- `infrastructure/docker/e2e/client-entrypoint.sh`
+- `tests/e2e/probe/main.go`, `tests/e2e/probe/main_test.go`
+- `tests/e2e/scripts_test.sh`
+- `scripts/e2e.sh`
+
+**Изменённые файлы:** `Makefile` — только цели `e2e`, `e2e-down` и их переменные;
+`.dockerignore` — только узкий допуск `tests/e2e/probe/*.go` и восьми входов
+`infrastructure/docker/e2e/*`; прежние запреты env, ключей, состояния, секретных
+каталогов и посторонних деревьев сохранены.
+
+**Фактическая архитектура**
+
+Compose-проект `novavpn-e2e`, две сети: `novavpn-e2e_harness` (172.31.99.0/24) и
+`novavpn-e2e_uplink` (172.31.98.0/24). В harness: PostgreSQL 172.31.99.11, Redis
+172.31.99.12, API 172.31.99.10, разовая миграция 172.31.99.20, узел 172.31.99.2,
+клиент 172.31.99.3. В uplink только узел 172.31.98.2 и probe 172.31.98.3; клиент
+не имеет туда ни адреса, ни маршрута. Сети, тома и контейнеры несут метку
+`novavpn.e2e.project=novavpn-e2e`.
+
+Пароль PostgreSQL и JWT генерируются `secrets` в защищённом томе
+`novavpn-e2e-control`; пароль подаётся PostgreSQL и API через защищённые
+`env_file` (`postgres.env` и `api.env`). Compose-secret с `file:` не используется:
+compose монтирует такой файл с хоста, а `/state` существует только внутри
+оркестратора, поэтому CLI читает env-файлы сам. Постоянный пароль `nova` в новый
+compose не переносился. Управляющий файл окружения подключается ко всем вызовам
+Compose, включая `down`.
+
+`make e2e` создаёт/проверяет защищённый том и запускает одноразовый
+`novavpn-e2e-runner` (`alpine:3.20`) с исходниками `:ro`, Docker socket только у
+него и томом `/state`. Внутри ставится `make bash python3 curl docker-cli
+docker-cli-compose docker-cli-buildx`; на хост ничего не устанавливается. Перед
+созданием тома цель отказывает, если проект, сети или имя runner уже заняты.
+Успешный runner позволяет удалить только свой control-том; на отказе том
+сохраняется. `make e2e-down` снимает runner и том только при подтверждённой метке,
+затем запускает фазу `down`.
+
+`scripts/e2e.sh` принимает только `all`, `tunnel`, `down` (аргумент или
+`E2E_PHASE`), отвергая остальное до Docker. Фазы `all` и `tunnel` выполняют
+setup и проверки; `down` снимает лишь собственные ресурсы. Маркер владения
+создаётся исключительно новым файлом; повторный запуск после отказа требует
+явного `make e2e-down`. SIGINT/SIGTERM завершают тест с сохранением стенда.
+
+- [x] **Шаг 1: probe и dnsmasq**
+
+`probe` отвечает `GET /whoami` адресом из `RemoteAddr` (IPv4 и IPv6) и
+`GET /healthz` телом `ok\n`; заголовок `X-Forwarded-For` не учитывается.
+`tests/e2e/probe/main_test.go` проверяет точное тело, тип ответа, IPv4/IPv6,
+неверный `RemoteAddr` и отсутствие доверия заголовку без открытия порта.
+`probe.Dockerfile` собирает пакет на `golang:1.25-alpine` с `-mod=readonly`,
+`CGO_ENABLED=0`, кладёт бинарник в `alpine:3.20` с dnsmasq. `dnsmasq.conf`
+содержит `no-resolv`, `no-hosts`, адреса `probe.e2e.test` и `dns.e2e.test` →
+172.31.98.3; журналирование запросов не включено. `/healthz` проверяется с узла
+по uplink до проверки маршрута.
+
+- [x] **Шаг 2: образ узла**
+
+`node1.Dockerfile` собирает настоящий агент, ставит `ca-certificates unbound
+nftables iproute2 su-exec libcap wireguard-tools`, создаёт пользователя и группу
+65532/65532, каталог `/var/lib/novavpn-node` с режимом 0700. `setcap
+cap_net_admin,cap_net_raw+ep` выполняется строго после `COPY` без подавления
+ошибки. Точка входа для `init`, `enroll`, `status` только готовит каталог и
+сбрасывает владельца без рекурсии; NAT и DNS не запускаются. Для `run` она
+применяет `nat.nft`, проверяет и поднимает unbound как демон, дожидается
+pid-файла и делает `exec su-exec novavpn:novavpn` агента (PID 1 без root).
+Ошибки nft, unbound-checkconf, unbound и отсутствие pid-файла останавливают
+запуск.
+
+`unbound.conf`: `log-queries: no`, `log-replies: no`, `use-syslog: no`,
+`do-daemonize: yes`, `do-ip6: no`, без chroot; разрешена только
+10.99.7.0/24, остальным `refuse`; `forward-zone "."` → 172.31.98.3.
+`nat.nft` — отдельная `table ip novavpn` с узким masquerade
+`ip saddr 10.99.7.0/24 ip daddr 172.31.98.0/24`, без зависимости от имени
+интерфейса и без flush всего ruleset.
+
+- [x] **Шаг 3: образ и точка входа клиента**
+
+`client1.Dockerfile` — `alpine:3.20` с `bash wireguard-tools iproute2 curl
+iputils nftables`, том `/state`, точка входа. `nftables` нужен самому `wg-quick`
+для policy routing при `AllowedIPs=0.0.0.0/0`; без него подъём интерфейса
+обрывается. `genkey` создаёт ключ только внутри тома,
+не перевыпускает существующий и отказывает повреждённому. `saveconfig`
+принимает текст API со stdin и кладёт его в том только после проверки.
+`validate_config` разбирает закрытый набор секций и ключей без `eval`: ровно
+`[Interface]` затем `[Peer]`, `Address=10.99.7.2/32`, `DNS=10.99.7.1`, `MTU`
+1280–1420, корректный `PublicKey`, `AllowedIPs=0.0.0.0/0`,
+`Endpoint=172.31.99.2:51820`, `PersistentKeepalive` 5–120; любое иное поле,
+секция, повтор или значение отвергаются до `wg-quick`. При запуске строка
+`DNS =` удаляется, приватный ключ вставляется чтением файла, `resolv.conf`
+явно указывает на 10.99.7.1.
+
+- [x] **Шаг 4: compose и проверки пути**
+
+Службы имеют статические адреса и метки владельца; API и миграция используют
+образ `novavpn-e2e-api:local`; узел получает `NET_ADMIN`, `NET_RAW` и
+`net.ipv4.ip_forward=1`; клиент — `NET_ADMIN`, отключённый IPv6 и только
+harness-сеть. Производственный агент и API не менялись.
+
+`scripts/e2e.sh`: реальные HTTP-маршруты admin/auth/devices/profiles/config,
+проверка кодов и обязательных полей, конфиг без `PrivateKey`; узел
+регистрируется bootstrap-токеном через stdin; отрицательный контроль — отдельный
+клиент без wg0 не достигает probe по IP; затем проверяются именно CLIENT_PUB на
+узле, `allowed-ips=10.99.7.2/32`, handshake >0, состояние wg0, HTTP через
+`probe.e2e.test` ровно 172.31.98.2, ICMP `-c 3`, маршрут `dev wg0` и рост
+счётчиков `wg show transfer` в обе стороны на узле и клиенте. Ошибка чтения
+wg не превращается в «пиера нет» и не считается нулевым счётчиком. Все HTTP и
+ожидания ограничены по времени; секреты не печатаются.
+
+- [x] **Шаг 5: оффлайн-проверки 11a**
+
+| что | результат | журнал |
+| --- | --- | --- |
+| RED probe до реализации | компиляция `main_test.go` падала: `undefined: newMux` | `task-11a-red-probe.log` |
+| GREEN probe | `go test -count=1 ./tests/e2e/probe`, код 0 | `task-11a-green-probe.log` |
+| RED управляющей логики | 19 проверок, 10 отказов, код 1, `scripts/e2e.sh` отсутствовал | `task-11a-red-scripts-current.log` |
+| GREEN управляющей логики | 19 проверок, 0 отказов, код 0 (Alpine, `bash`) | `task-11a-green-scripts.log` |
+| сборка четырёх образов | `novavpn-e2e-api/node1/client1/probe:local`, buildx, код 0 | `task-11a-build.log` |
+| YAML compose | `docker compose config --quiet`, код 0 | `task-11a-yaml.log` |
+| контекст сборки | 131 файл; 11 запретных или лишних путей (env, ключи, состояние, журналы, секретные каталоги, чужой тест) отсутствуют, все входы на месте | `task-11a-context.log` |
+| синтаксис, формат, diff | `bash -n` четырёх скриптов, `gofmt` чист, `git diff --check` код 0 | `task-11a-syntax.log`, `task-11a-gofmt.log`, `task-11a-diff-check.log` |
+| полные unit и vet | `make unit`, `make vet` по одному разу с `GOFLAGS=-mod=readonly`, `CGO_ENABLED=0`, код 0; probe входит | `task-11a-unit.log`, `task-11a-vet.log` |
+
+Проверки `scripts_test.sh` покрывают неизвестную фазу до Docker, `E2E_PHASE`,
+занятое имя, маркер прошлого запуска, чужой runner, ошибку очистки, сохранение
+исходного кода отказа, повреждённый ключ, шесть видов недопустимого конфига до
+`wg-quick`, канонический конфиг, отсутствие NAT/DNS в `init`, порядок
+NAT → unbound → агент, остановку при отказе NAT и удаление только своих сетей.
+
+- [ ] **Шаг 6: рубеж 11b — настоящий прогон**
+
+Не выполнялся. Требуется `make e2e` (через `run-make.sh`), затем разбор вывода,
+проверка реальных IP/handshake/счётчиков/ICMP, отсутствия секретов в публикуемом
+выводе и очистки после успеха. Команда и состояние артефактов —
+в `task-11a-report.md`. Успешный туннель, DNS-утечки, IPv6 и лимиты остаются
+`not-run` до 11b/задачи 12.
+
+**Коммит не разрешён:** индексация, коммит и публикация на рубеже 11a не
+выполнялись.
 
 ---
 

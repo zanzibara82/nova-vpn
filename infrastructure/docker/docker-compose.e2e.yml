@@ -1,0 +1,156 @@
+# Стенд E2E: harness (172.31.99.0/24) — управляющая сеть, uplink
+# (172.31.98.0/24) — «интернет» за узлом. Клиент имеет адрес только в harness,
+# поэтому единственный путь к probe — wg0. Имя проекта отдельное: down -v стенда
+# не должен снимать тома dev-стека.
+name: novavpn-e2e
+
+x-e2e-labels: &e2e-labels
+  novavpn.e2e.project: novavpn-e2e
+
+services:
+  postgres:
+    image: postgres:17
+    # Пароль идёт env-файлом, а не compose-secret: файл секрета compose
+    # монтирует с хоста, а каталог /state живёт только в контейнере-оркестраторе.
+    # env_file читает сам CLI внутри оркестратора, поэтому путь /state верен.
+    env_file:
+      - "${E2E_CONTROL_DIR}/run/postgres.env"
+    environment:
+      POSTGRES_USER: nova
+      POSTGRES_DB: novavpn
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Именно TCP на 127.0.0.1: временный Unix-сокет initdb ещё не доказывает,
+      # что база принимает сетевые соединения от API.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U nova -d novavpn -q"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      harness:
+        ipv4_address: 172.31.99.11
+    labels: *e2e-labels
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      harness:
+        ipv4_address: 172.31.99.12
+    labels: *e2e-labels
+
+  api:
+    image: novavpn-e2e-api:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    command: ["serve"]
+    env_file:
+      - "${E2E_CONTROL_DIR}/run/api.env"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      harness:
+        ipv4_address: 172.31.99.10
+    labels: *e2e-labels
+
+  migrate:
+    image: novavpn-e2e-api:local
+    command: ["migrate", "up"]
+    env_file:
+      - "${E2E_CONTROL_DIR}/run/api.env"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      harness:
+        ipv4_address: 172.31.99.20
+    labels: *e2e-labels
+
+  node1:
+    image: novavpn-e2e-node1:local
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/e2e/node1.Dockerfile
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      NOVAVPN_NODE_ENV: dev
+      NOVAVPN_NODE_API_URL: http://172.31.99.10:8080
+      NOVAVPN_NODE_ALLOW_INSECURE_API: "true"
+      NOVAVPN_NODE_STATE_DIR: /var/lib/novavpn-node
+      NOVAVPN_NODE_INTERFACE: wg0
+      NOVAVPN_NODE_POLL_INTERVAL: 25s
+    volumes:
+      - node1-state:/var/lib/novavpn-node
+    networks:
+      harness:
+        ipv4_address: 172.31.99.2
+      uplink:
+        ipv4_address: 172.31.98.2
+    labels: *e2e-labels
+
+  client1:
+    image: novavpn-e2e-client1:local
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/e2e/client1.Dockerfile
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    volumes:
+      - client1-state:/state
+    networks:
+      harness:
+        ipv4_address: 172.31.99.3
+    labels: *e2e-labels
+
+  probe:
+    image: novavpn-e2e-probe:local
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/e2e/probe.Dockerfile
+    networks:
+      uplink:
+        ipv4_address: 172.31.98.3
+    labels: *e2e-labels
+
+networks:
+  harness:
+    name: novavpn-e2e_harness
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.99.0/24
+    labels: *e2e-labels
+  uplink:
+    name: novavpn-e2e_uplink
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.98.0/24
+    labels: *e2e-labels
+
+volumes:
+  postgres-data:
+    name: novavpn-e2e-postgres-data
+    labels: *e2e-labels
+  node1-state:
+    name: novavpn-e2e-node1-state
+    labels: *e2e-labels
+  client1-state:
+    name: novavpn-e2e-client1-state
+    labels: *e2e-labels

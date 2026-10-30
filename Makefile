@@ -111,3 +111,81 @@ node-image:
 
 node-help:
 	MSYS_NO_PATHCONV=1 docker run --rm --network none --cap-add NET_ADMIN --cap-add NET_RAW novavpn-node-agent:dev --help
+
+# Стенд E2E. Оркестратор — одноразовый доверенный контейнер alpine:3.20:
+# исходники только для чтения, Docker socket только ему, защищённый том
+# novavpn-e2e-control в /state. Службы стенда socket не получают. run-make.sh
+# передаёт CURDIR путём хоста Docker, поэтому том исходников строится от него.
+E2E_CONTROL_VOL  := novavpn-e2e-control
+E2E_RUNNER       := novavpn-e2e-runner
+E2E_RUNNER_DOWN  := novavpn-e2e-runner-down
+E2E_ORCH_IMAGE   := alpine:3.20
+E2E_ORCH_PACKAGES := make bash python3 curl docker-cli docker-cli-compose docker-cli-buildx
+E2E_ORCH_FLAGS   := --label novavpn.e2e.project=novavpn-e2e \
+	-v "$(CURDIR):/work:ro" \
+	-v "$(E2E_CONTROL_VOL):/state" \
+	-v /var/run/docker.sock:/var/run/docker.sock \
+	-w /work
+
+.PHONY: e2e e2e-down
+e2e:
+	@if MSYS_NO_PATHCONV=1 docker ps -a \
+		--filter "label=com.docker.compose.project=novavpn-e2e" \
+		--format '{{.Names}}' | grep -q .; then \
+		echo "проект novavpn-e2e занят; сначала выполните make e2e-down" >&2; exit 1; \
+	fi
+	@for net in novavpn-e2e_harness novavpn-e2e_uplink; do \
+		if MSYS_NO_PATHCONV=1 docker network inspect "$$net" >/dev/null 2>&1; then \
+			echo "сеть $$net уже существует; сначала выполните make e2e-down" >&2; exit 1; \
+		fi; \
+	done
+	@if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
+		echo "контейнер $(E2E_RUNNER) уже существует; сначала выполните make e2e-down" >&2; exit 1; \
+	fi
+	@if MSYS_NO_PATHCONV=1 docker volume inspect $(E2E_CONTROL_VOL) >/dev/null 2>&1; then \
+		label=$$(MSYS_NO_PATHCONV=1 docker volume inspect --format \
+			'{{ index .Labels "novavpn.e2e.project" }}' $(E2E_CONTROL_VOL) 2>/dev/null || true); \
+		if [ "$$label" != "novavpn-e2e" ]; then \
+			echo "том $(E2E_CONTROL_VOL) существует без метки владельца" >&2; exit 1; \
+		fi; \
+	else \
+		MSYS_NO_PATHCONV=1 docker volume create \
+			--label novavpn.e2e.project=novavpn-e2e $(E2E_CONTROL_VOL) >/dev/null; \
+	fi
+	@MSYS_NO_PATHCONV=1 docker run --rm --name $(E2E_RUNNER) $(E2E_ORCH_FLAGS) \
+		-e E2E_ORCHESTRATOR=1 $(E2E_ORCH_IMAGE) sh -ec \
+		'apk add --no-cache $(E2E_ORCH_PACKAGES) >/dev/null && exec bash scripts/e2e.sh all'; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+		MSYS_NO_PATHCONV=1 docker volume rm $(E2E_CONTROL_VOL) >/dev/null || rc=1; \
+	fi; \
+	exit $$rc
+
+# Снимает только собственный проект, runner и control-том при подтверждённых
+# метках. Если защищённого тома нет, снимать нечего; чужой runner не трогается.
+e2e-down:
+	@if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
+		label=$$(MSYS_NO_PATHCONV=1 docker inspect --format \
+			'{{ index .Config.Labels "novavpn.e2e.project" }}' $(E2E_RUNNER)); \
+		if [ "$$label" = "novavpn-e2e" ]; then \
+			MSYS_NO_PATHCONV=1 docker rm -f $(E2E_RUNNER) >/dev/null; \
+		else \
+			echo "чужой контейнер $(E2E_RUNNER) без метки владельца" >&2; exit 1; \
+		fi; \
+	fi
+	@if ! MSYS_NO_PATHCONV=1 docker volume inspect $(E2E_CONTROL_VOL) >/dev/null 2>&1; then \
+		echo "том $(E2E_CONTROL_VOL) отсутствует; снимать нечего" >&2; exit 0; \
+	fi
+	@label=$$(MSYS_NO_PATHCONV=1 docker volume inspect --format \
+		'{{ index .Labels "novavpn.e2e.project" }}' $(E2E_CONTROL_VOL) 2>/dev/null || true); \
+	if [ "$$label" != "novavpn-e2e" ]; then \
+		echo "том $(E2E_CONTROL_VOL) существует без метки владельца" >&2; exit 1; \
+	fi
+	@MSYS_NO_PATHCONV=1 docker run --rm --name $(E2E_RUNNER_DOWN) $(E2E_ORCH_FLAGS) \
+		$(E2E_ORCH_IMAGE) sh -ec \
+		'apk add --no-cache $(E2E_ORCH_PACKAGES) >/dev/null && exec bash scripts/e2e.sh down'; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+		MSYS_NO_PATHCONV=1 docker volume rm $(E2E_CONTROL_VOL) >/dev/null || rc=1; \
+	fi; \
+	exit $$rc
