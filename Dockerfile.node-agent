@@ -1,0 +1,23 @@
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG AGENT_VERSION=dev
+RUN CGO_ENABLED=0 go build -mod=readonly -trimpath \
+    -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
+    -o /out/novavpn-node-agent ./services/node-agent/cmd/novavpn-node-agent
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates libcap wireguard-tools iproute2 \
+    && addgroup -g 65532 novavpn \
+    && adduser -D -H -u 65532 -G novavpn novavpn \
+    && mkdir -p /var/lib/novavpn-node \
+    && chown 65532:65532 /var/lib/novavpn-node \
+    && chmod 0700 /var/lib/novavpn-node
+COPY --from=build /out/novavpn-node-agent /usr/local/bin/novavpn-node-agent
+RUN setcap cap_net_admin,cap_net_raw+ep /usr/local/bin/novavpn-node-agent
+USER novavpn:novavpn
+VOLUME ["/var/lib/novavpn-node"]
+ENTRYPOINT ["/usr/local/bin/novavpn-node-agent"]
+CMD ["run"]

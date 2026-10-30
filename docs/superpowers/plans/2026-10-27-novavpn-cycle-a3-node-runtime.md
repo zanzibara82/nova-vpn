@@ -2951,112 +2951,163 @@ GNU make `--eval` с `$(docker-go) run ./services/node-agent/cmd/novavpn-node-ag
 
 ---
 
-### Task 10: Образы и dev-сервис
+### Task 10: Образы и профиль разработки
 
-**Files:**
-- Create: `Dockerfile.api`, `Dockerfile.node-agent`
-- Modify: `infrastructure/docker/docker-compose.dev.yml`
-- Modify: `Makefile` (цели `api-image`, `node-image`, `node-help`)
+Действующая постановка учитывает R11/R41–R44. Изменяются только `Dockerfile.api`,
+`Dockerfile.node-agent`, `.dockerignore`, `Makefile`,
+`infrastructure/docker/docker-compose.dev.yml`, новый
+`infrastructure/docker/.env.node.example`, этот раздел и добавления в
+`docs/testing-status.md`. Исходники Go и зависимости не меняются.
 
-**Interfaces:**
-- Produces: образы `novavpn-api:dev`, `novavpn-node-agent:dev`; профиль compose `node`.
+- [x] **Шаг 1: Образ API**
 
-- [ ] **Step 1: `Dockerfile.api`**
+Сборка на `golang:1.25-alpine`, рабочий каталог `/src`: сначала `go.mod`/`go.sum` и
+`go mod download`, затем исходники. Команда `CGO_ENABLED=0 go build -mod=readonly
+-trimpath -ldflags="-s -w"` собирает `./services/api/cmd/novavpn-api` в
+`/out/novavpn-api`. Финальная основа — `gcr.io/distroless/static-debian12:nonroot`,
+пользователь `nonroot:nonroot`, бинарник `/usr/local/bin/novavpn-api`,
+`ENTRYPOINT` указывает на него, `CMD ["serve"]`, `EXPOSE 8080`.
+Миграции встроены через `migrations/embed.go`; внешняя папка не копируется.
 
-```dockerfile
-FROM golang:1.25-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/novavpn-api ./services/api/cmd/novavpn-api
+- [x] **Шаг 2: Образ узла**
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/novavpn-api /usr/local/bin/novavpn-api
-USER nonroot:nonroot
-EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/novavpn-api"]
-CMD ["serve"]
-```
+Та же последовательность сборки, `CGO_ENABLED=0`, `-mod=readonly`, `-trimpath`.
+Параметр `ARG AGENT_VERSION=dev` передаётся как
+`-ldflags="-s -w -X main.version=${AGENT_VERSION}"`. Пакет
+`./services/node-agent/cmd/novavpn-node-agent` собирается в `/out/novavpn-node-agent`.
+Финальная основа — `alpine:3.20`; пакеты `ca-certificates`, `libcap`,
+`wireguard-tools`, `iproute2`. Явные пользователь и группа `novavpn` имеют
+UID/GID 65532; домашнего каталога нет, `USER novavpn:novavpn`.
+Каталог `/var/lib/novavpn-node` заранее имеет владельца `65532:65532` и режим
+`0700`, затем объявляется `VOLUME`. Поэтому свежий именованный том пригоден для
+`init` без запуска от root и без исправления прав на хосте.
 
-- [ ] **Step 2: `Dockerfile.node-agent`**
+После `COPY` бинарника в `/usr/local/bin/novavpn-node-agent` выполняется
+`setcap cap_net_admin,cap_net_raw+ep` без подавления ошибки.
+`ENTRYPOINT` запускает бинарник, `CMD ["run"]`. Без `NET_ADMIN` даже `--help`
+получает `EPERM`: это проверено настоящим запуском. Для справки и локальной
+инициализации нужны `--cap-add NET_ADMIN --cap-add NET_RAW --network none`.
 
-```dockerfile
-FROM golang:1.25-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-# Версия уходит в heartbeat (agent_version): без -X она осталась бы "dev" и в проде.
-ARG AGENT_VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${AGENT_VERSION}" \
-    -o /out/novavpn-node-agent ./services/node-agent/cmd/novavpn-node-agent
+- [x] **Шаг 3: Закрыть контекст сборки**
 
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates libcap wireguard-tools iproute2 \
- && adduser -D -H -u 65532 novavpn
-COPY --from=build /out/novavpn-node-agent /usr/local/bin/novavpn-node-agent
-RUN setcap cap_net_admin,cap_net_raw+ep /usr/local/bin/novavpn-node-agent
-USER novavpn
-VOLUME ["/var/lib/novavpn-node"]
-ENTRYPOINT ["/usr/local/bin/novavpn-node-agent"]
-CMD ["run"]
-```
+`.dockerignore` допускает только `go.mod`, `go.sum`, исходники Go из `internal`,
+`services`, `migrations` и встроенные `migrations/*.sql`. Каталоги с секретами,
+рабочие деревья, окружение и ключи исключены независимо от расширения вложенных
+исходников. Проверка настоящего `COPY` на безобидных маркерах подтвердила
+6 разрешённых входов и отсутствие 29 запрещённых путей.
 
-`setcap` стоит после `COPY` и без `|| true`: копирование сбрасывает расширенные атрибуты
-файла, поэтому до него команда бессмысленна, а проглоченная ошибка дала бы «контейнер
-стартует и падает на первом применении» вместо отказа сборки.
+- [x] **Шаг 4: Профиль `node` и команды сборки**
 
-- [ ] **Step 3: Добавить сервис в dev-compose**
+`api` и `node-agent` входят только в профиль `node`, используют контекст `../..`
+и образы `novavpn-api:dev`/`novavpn-node-agent:dev`. API ждёт `service_healthy`
+для PostgreSQL и Redis; агент ждёт лишь `service_started` для API, не готовности
+HTTP. Порты API на хост не публикуются. Проверка состояния через отсутствующую
+оболочку в образе API не добавляется. Старые службы и `make up-dev` сохранены.
 
-В `infrastructure/docker/docker-compose.dev.yml`:
+API читает `env_file` с `path: ${NOVAVPN_NODE_DEV_ENV_FILE:-.env.node}` и
+`required: false`. Без файла обычный состав служб остаётся прежним, а настоящий
+API отказывает при проверке настроек. Встроенного JWT-секрета нет.
+Агент получает только четыре настройки `NOVAVPN_NODE_*`, том
+`novavpn-node-state:/var/lib/novavpn-node` и дополнительные права `NET_ADMIN`,
+`NET_RAW`. Нет `privileged`, сети хоста, устройств хоста, сокета Docker,
+автоматической регистрации или скрытой генерации ключа.
 
-```yaml
-  node-agent:
-    profiles: ["node"]
-    build:
-      context: ../..
-      dockerfile: Dockerfile.node-agent
-    cap_add: [NET_ADMIN, NET_RAW]
-    environment:
-      NOVAVPN_NODE_ENV: dev
-      NOVAVPN_NODE_API_URL: http://api:8080
-      NOVAVPN_NODE_ALLOW_INSECURE_API: "true"
-      NOVAVPN_NODE_STATE_DIR: /var/lib/novavpn-node
-    volumes:
-      - novavpn-node-state:/var/lib/novavpn-node
+`Makefile` добавляет `.PHONY` для `api-image`, `node-image`, `node-help`.
+`AGENT_VERSION ?= dev` передаётся через `--build-arg`; новые команды Docker
+содержат `MSYS_NO_PATHCONV=1`. `node-help` добавляет оба сетевых права и
+`--network none`.
 
-volumes:
-  novavpn-node-state:
-```
+- [x] **Шаг 5: Явная подготовка локального окружения**
 
-Профиль `node` нужен, чтобы обычный `make up-dev` не поднимал узел без ключа и сервера.
+До заполнения любых секретов создать только новый файл. Следующая команда
+выполняется из корня дерева в Linux с Python 3 на файловой системе с POSIX-правами.
+Она задаёт `0600` при исключительном создании, независимо от разрешающей `umask`,
+записывает только образец без секретов и проверяет режим. Существующий файл или
+симлинк не перезаписывается. При любой ошибке не заполнять секреты и не продолжать.
+Для другого расположения заранее задать `NOVAVPN_NODE_DEV_ENV_FILE` через `export`:
+только абсолютный путь своего файла в защищённом каталоге, не секрет.
 
-- [ ] **Step 4: Цели Makefile**
-
-```make
-api-image:
-	MSYS_NO_PATHCONV=1 docker build -t novavpn-api:dev -f Dockerfile.api .
-
-node-image:
-	MSYS_NO_PATHCONV=1 docker build -t novavpn-node-agent:dev -f Dockerfile.node-agent .
-
-node-help:
-	MSYS_NO_PATHCONV=1 docker run --rm novavpn-node-agent:dev --help
-```
-
-- [ ] **Step 5: Собрать и проверить**
-
-Run: `make api-image && make node-image && make node-help`
-Expected: три команды с кодом 0; `--help` печатает четыре команды.
-
-- [ ] **Step 6: Коммит**
+Для Windows/NTFS `chmod` и показанный POSIX-режим не доказывают защиту ACL.
+Сначала оператор должен проверить в свойствах безопасности файла и каталога,
+что доступ есть только у своего пользователя и необходимых системных учётных
+записей, либо использовать защищённую Linux-файловую систему. ACL хоста здесь
+не проверены и инструментами не меняются; вывод `0600` не заменяет эту проверку.
 
 ```bash
-git add Dockerfile.api Dockerfile.node-agent infrastructure/docker/docker-compose.dev.yml Makefile
-git -c user.name="NovaVPN Dev" -c user.email="dev@novavpn.local" \
-  commit -m "feat(a3): образы API и агента, профиль node в dev-стеке"
+python3 - <<'PY'
+import os
+import stat
+from pathlib import Path
+
+sample = Path("infrastructure/docker/.env.node.example").read_bytes()
+path = os.environ.get("NOVAVPN_NODE_DEV_ENV_FILE", "infrastructure/docker/.env.node")
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "wb") as target:
+    target.write(sample)
+    if stat.S_IMODE(os.fstat(target.fileno()).st_mode) != 0o600:
+        raise SystemExit("Режим не равен 0600; не заполняйте секреты")
+print("Создан только образец без секретов; режим 0600 проверен")
+PY
 ```
+
+Только после успешного создания и проверки защиты в своём файле заполнить пароль
+локальной базы вместо заполнителя и `NOVAVPN_JWT_SECRET`: base64 от не менее
+32 случайных байт. Генерировать секрет криптографическим генератором, например
+модулем Python `secrets`, сразу в файл; не печатать его и не передавать в аргументах.
+Файл не индексировать. После редактирования повторно проверить защиту: редактор
+не должен ослабить режим или ACL. Миграции, запуск API и инициализация узла
+выполняются явно; выполнять блок целиком, остановка при ошибке обязательна:
+
+```bash
+(
+make api-image || exit "$?"
+make node-image || exit "$?"
+make node-help || exit "$?"
+docker compose -f infrastructure/docker/docker-compose.dev.yml up -d --wait postgres redis || exit "$?"
+docker compose -f infrastructure/docker/docker-compose.dev.yml exec -T postgres sh -ec '
+  attempt=0
+  until pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t 1; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 15 ]; then
+      printf "%s\n" "PostgreSQL не готов по TCP; миграция отменена" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+' || exit "$?"
+docker compose -f infrastructure/docker/docker-compose.dev.yml --profile node run --rm -T api migrate up || exit "$?"
+docker compose -f infrastructure/docker/docker-compose.dev.yml --profile node up -d api || exit "$?"
+MSYS_NO_PATHCONV=1 docker run --rm --network none --cap-add NET_ADMIN --cap-add NET_RAW -v novavpn-dev_novavpn-node-state:/var/lib/novavpn-node novavpn-node-agent:dev init || exit "$?"
+)
+```
+
+Последняя команда рассчитана на имя проекта `novavpn-dev`; при `-p` следует
+подставить соответствующее имя тома. Для свежей БД начальный сервер PostgreSQL
+может временно удовлетворять проверке через сокет. Поэтому блок до миграции
+делает не более 15 проб основного TCP-сервера, каждая с тайм-аутом 1 с, и не более
+14 пауз по 1 с; при исчерпании попыток возвращает ошибку, не запуская миграцию/API.
+Прежний healthcheck не меняется. `enroll` выполняется отдельно; до регистрации
+`run` и `status` честно отказывают. Секрет API не передаётся узлу.
+
+- [x] **Шаг 6: Локальные проверки**
+
+Сборки и проверки выполняются последовательно через существующий `run-make.sh`.
+Служебная цель устанавливает Python и Buildx только в одноразовую обёртку.
+Проверены настоящие образы, версия `task10-check`, повторный `init`, права,
+отказы, состав профиля, миграция и `/debug/health` из общей сети и контейнера
+агента. После проверки версии локальный образ пересобран с `AGENT_VERSION=dev`.
+`go version -m` показывает сведения сборки, но при `-trimpath` не выводит
+`-ldflags`; метка версии дополнительно найдена в бинарнике через `strings`.
+Это не проверка отправки `agent_version` в heartbeat.
+
+Полные `make unit` и `make vet` выполняются по одному разу со строгими
+`GOFLAGS=-mod=readonly`, `CGO_ENABLED=0` и исходниками только для чтения.
+Фактические команды, коды выхода, предупреждения и очистка перечисляются в
+служебном `task-10-report.md`; статус проверок — в `docs/testing-status.md`.
+Контейнерный профиль и права ключа не доказывают работающий туннель.
+Регистрация, туннель, DNS, отзыв, CI и VPS — `not-run` в этой задаче.
+
+**Коммит не разрешён:** индексация, коммит и публикация не выполняются.
 
 ---
 

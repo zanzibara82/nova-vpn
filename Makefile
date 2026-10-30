@@ -99,3 +99,15 @@ sqlc-generate:
 
 api-lint:
 	docker run --rm -v "$(CURDIR)/api-spec:/spec" $(API_IMAGE) lint /spec/openapi.yaml
+
+AGENT_VERSION ?= dev
+
+.PHONY: api-image node-image node-help
+api-image:
+	MSYS_NO_PATHCONV=1 docker build -t novavpn-api:dev -f Dockerfile.api .
+
+node-image:
+	MSYS_NO_PATHCONV=1 docker build --build-arg AGENT_VERSION=$(AGENT_VERSION) -t novavpn-node-agent:dev -f Dockerfile.node-agent .
+
+node-help:
+	MSYS_NO_PATHCONV=1 docker run --rm --network none --cap-add NET_ADMIN --cap-add NET_RAW novavpn-node-agent:dev --help
