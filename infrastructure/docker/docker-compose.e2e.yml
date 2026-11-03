@@ -107,8 +107,14 @@ services:
     build:
       context: ../..
       dockerfile: infrastructure/docker/e2e/client1.Dockerfile
-    cap_add: [NET_ADMIN]
+    # NET_RAW без privileged: tcpdump обязан открыть сырой сокет на eth0, иначе
+    # проверка утечки DNS ловила бы пустоту.
+    cap_add: [NET_ADMIN, NET_RAW]
     sysctls:
+      # src_valid_mark нужен policy routing wg0; в контейнере /proc/sys только
+      # для чтения, поэтому значение задаёт Docker при старте, а не sysctl в
+      # точке входа.
+      net.ipv4.conf.all.src_valid_mark: "1"
       net.ipv6.conf.all.disable_ipv6: "1"
       net.ipv6.conf.default.disable_ipv6: "1"
     volumes:

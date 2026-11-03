@@ -142,6 +142,25 @@ e2e:
 	@if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
 		echo "контейнер $(E2E_RUNNER) уже существует; сначала выполните make e2e-down" >&2; exit 1; \
 	fi
+	@nets=$$(MSYS_NO_PATHCONV=1 docker network ls --format '{{.Name}}') || { \
+		echo "не удалось прочитать подсети Docker" >&2; exit 1; }; \
+	for net in $$nets; do \
+		subs=$$(MSYS_NO_PATHCONV=1 docker network inspect --format \
+			'{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$$net") || { \
+			echo "не удалось прочитать подсети Docker" >&2; exit 1; }; \
+		for sub in $$subs; do \
+			case "$$sub" in ''|*:*) continue ;; esac; \
+			for ours in 172.31.99.0/24 172.31.98.0/24; do \
+				rc=$$(awk -v x="$$ours" -v y="$$sub" 'function bounds(s, p, ip, i, n, base, bits) { if (s ~ /[^0-9.\/]/) return 0; n = split(s, p, "/"); if (n != 2) return 0; if (p[2] + 0 > 32) return 0; if (split(p[1], ip, ".") != 4) return 0; for (i = 1; i <= 4; i++) { if (ip[i] == "" || ip[i] + 0 > 255) return 0 } base = 0; for (i = 1; i <= 4; i++) base = base * 256 + ip[i]; bits = 2 ^ (32 - p[2]); lo = int(base / bits) * bits; hi = lo + bits - 1; return 1 } BEGIN { if (!bounds(x)) { print 2; exit } xl = lo; xh = hi; if (!bounds(y)) { print 2; exit } if (xl <= hi && lo <= xh) { print 1 } else { print 0 } }') || rc=2; \
+				case "$$rc" in \
+				0) ;; \
+				1) echo "сеть $$net занимает подсеть $$sub; пересечение с нашей подсетью $$ours" >&2; \
+					exit 1 ;; \
+				*) echo "не удалось прочитать подсети Docker" >&2; exit 1 ;; \
+				esac; \
+			done; \
+		done; \
+	done
 	@if MSYS_NO_PATHCONV=1 docker volume inspect $(E2E_CONTROL_VOL) >/dev/null 2>&1; then \
 		label=$$(MSYS_NO_PATHCONV=1 docker volume inspect --format \
 			'{{ index .Labels "novavpn.e2e.project" }}' $(E2E_CONTROL_VOL) 2>/dev/null || true); \
@@ -162,9 +181,36 @@ e2e:
 	exit $$rc
 
 # Снимает только собственный проект, runner и control-том при подтверждённых
-# метках. Если защищённого тома нет, снимать нечего; чужой runner не трогается.
+# метках. Если защищённого тома нет, команда сначала перечисляет оставшиеся
+# ресурсы и отказывает, ничего не трогая; чужой runner не трогается.
 e2e-down:
-	@if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
+	@if ! MSYS_NO_PATHCONV=1 docker volume inspect $(E2E_CONTROL_VOL) >/dev/null 2>&1; then \
+		found=""; \
+		names=$$(MSYS_NO_PATHCONV=1 docker ps -a \
+			--filter "label=com.docker.compose.project=novavpn-e2e" \
+			--format '{{.Names}}') || { \
+			echo "не удалось прочитать контейнеры проекта" >&2; exit 1; }; \
+		[ -n "$$names" ] && found="$$found контейнеры $$(printf '%s ' $$names)"; \
+		if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
+			found="$$found контейнер $(E2E_RUNNER)"; \
+		fi; \
+		for net in novavpn-e2e_harness novavpn-e2e_uplink; do \
+			if MSYS_NO_PATHCONV=1 docker network inspect "$$net" >/dev/null 2>&1; then \
+				found="$$found сеть $$net"; \
+			fi; \
+		done; \
+		for vol in novavpn-e2e-postgres-data novavpn-e2e-node1-state novavpn-e2e-client1-state; do \
+			if MSYS_NO_PATHCONV=1 docker volume inspect "$$vol" >/dev/null 2>&1; then \
+				found="$$found том $$vol"; \
+			fi; \
+		done; \
+		if [ -n "$$found" ]; then \
+			echo "том $(E2E_CONTROL_VOL) отсутствует, но ресурсы проекта найдены:$$found; разберите вручную" >&2; \
+			exit 1; \
+		fi; \
+		echo "том $(E2E_CONTROL_VOL) отсутствует; снимать нечего" >&2; exit 0; \
+	fi; \
+	if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
 		label=$$(MSYS_NO_PATHCONV=1 docker inspect --format \
 			'{{ index .Config.Labels "novavpn.e2e.project" }}' $(E2E_RUNNER)); \
 		if [ "$$label" = "novavpn-e2e" ]; then \
@@ -172,16 +218,13 @@ e2e-down:
 		else \
 			echo "чужой контейнер $(E2E_RUNNER) без метки владельца" >&2; exit 1; \
 		fi; \
-	fi
-	@if ! MSYS_NO_PATHCONV=1 docker volume inspect $(E2E_CONTROL_VOL) >/dev/null 2>&1; then \
-		echo "том $(E2E_CONTROL_VOL) отсутствует; снимать нечего" >&2; exit 0; \
-	fi
-	@label=$$(MSYS_NO_PATHCONV=1 docker volume inspect --format \
+	fi; \
+	label=$$(MSYS_NO_PATHCONV=1 docker volume inspect --format \
 		'{{ index .Labels "novavpn.e2e.project" }}' $(E2E_CONTROL_VOL) 2>/dev/null || true); \
 	if [ "$$label" != "novavpn-e2e" ]; then \
 		echo "том $(E2E_CONTROL_VOL) существует без метки владельца" >&2; exit 1; \
-	fi
-	@MSYS_NO_PATHCONV=1 docker run --rm --name $(E2E_RUNNER_DOWN) $(E2E_ORCH_FLAGS) \
+	fi; \
+	MSYS_NO_PATHCONV=1 docker run --rm --name $(E2E_RUNNER_DOWN) $(E2E_ORCH_FLAGS) \
 		$(E2E_ORCH_IMAGE) sh -ec \
 		'apk add --no-cache $(E2E_ORCH_PACKAGES) >/dev/null && exec bash scripts/e2e.sh down'; \
 	rc=$$?; \

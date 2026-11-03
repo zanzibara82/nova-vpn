@@ -1,7 +1,9 @@
 FROM alpine:3.20
-# nftables нужен самому wg-quick: для AllowedIPs=0.0.0.0/0 он строит policy
-# routing и ставит правила nft; без nft/iptables подъём интерфейса обрывается.
-RUN apk add --no-cache bash wireguard-tools iproute2 curl iputils nftables \
+# Интерфейс клиента настраивается явными командами ip/wg: wg-quick вызывает
+# sysctl, а /proc/sys в контейнере только для чтения. Правила nftables при этом
+# не нужны. bind-tools даёт nslookup для проверки резолвера, tcpdump — снимок
+# eth0 для проверки утечки DNS.
+RUN apk add --no-cache bash wireguard-tools iproute2 curl iputils bind-tools tcpdump \
     && mkdir -p /state \
     && chmod 0700 /state
 COPY infrastructure/docker/e2e/client-entrypoint.sh /usr/local/bin/client-entrypoint.sh

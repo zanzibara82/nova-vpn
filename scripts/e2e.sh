@@ -3,10 +3,11 @@
 # novavpn-e2e-runner, которому смонтированы исходники только для чтения, Docker
 # socket и защищённый том novavpn-e2e-control в /state.
 #
-# Фазы: all и tunnel выполняют установку и проверки туннеля, down снимает только
-# собственный стенд этого проекта. Неизвестная фаза отвергается до любых обращений
-# к Docker. На успехе стенд снимается, на отказе остаётся для разбора; снять его
-# можно только целью make e2e-down.
+# Фазы: all выполняет установку, контроль обхода, проверки туннеля, DNS и лимита
+# устройств; tunnel, dns и limit проходят тот же путь, но проверяют только своё
+# утверждение; down снимает только собственный стенд этого проекта. Неизвестная
+# фаза отвергается до любых обращений к Docker. На успехе стенд снимается, на
+# отказе остаётся для разбора; снять его можно только целью make e2e-down.
 set -uo pipefail
 umask 077
 
@@ -25,6 +26,10 @@ RUN_DIR=$CONTROL/run
 OWNER=$RUN_DIR/owner
 COMPOSE_ENV=$RUN_DIR/compose.env
 API=http://172.31.99.10:8080
+# Адрес оркестратора в harness закреплён: без него Docker выдаёт первый
+# свободный .99.2 — адрес узла, и создание узла падает с «Address already in
+# use». Остальные адреса сети перечислены в docker-compose.e2e.yml.
+ORCHESTRATOR_IP=172.31.99.4
 ATTACHED=0
 
 say() { printf '\n== %s\n' "$*"; }
@@ -150,7 +155,7 @@ attach_self() {
 	if [ "${E2E_ORCHESTRATOR:-0}" != "1" ]; then
 		return 0
 	fi
-	docker network connect "$HARNESS" "$(self_id)" >/dev/null ||
+	docker network connect --ip "$ORCHESTRATOR_IP" "$HARNESS" "$(self_id)" >/dev/null ||
 		fail "не удалось подключить оркестратор к сети $HARNESS"
 	ATTACHED=1
 }
@@ -181,16 +186,83 @@ db_ready() { compose exec -T postgres pg_isready -h 127.0.0.1 -U nova -d novavpn
 redis_ready() { compose exec -T redis redis-cli ping >/dev/null; }
 node_wg_up() { node_exec ip link show wg0; }
 client_wg_up() { client_exec ip link show wg0; }
+# node_peer_present различает три исхода: 0 — пиер есть, 1 — пиера нет при
+# успешно прочитанном списке, 2 — список не прочитан. Pipeline здесь не годится:
+# он потерял бы код чтения и выдал отказ за отсутствие пиера.
 node_peer_present() { # публичный ключ клиента
-	node_exec wg show wg0 peers | grep -qx "$1"
+	local peers
+	peers=$(node_exec wg show wg0 peers) || return 2
+	printf '%s\n' "$peers" | grep -qx -- "$1"
 }
 probe_healthy_from_node() {
 	[ "$(node_exec wget -qO- -T 3 http://172.31.98.3:8080/healthz 2>/dev/null | tr -d '\r\n')" = "ok" ]
 }
 
+# subnet_overlap печатает 1 при пересечении двух IPv4-подсетей, 0 — без
+# пересечения и 2 — если запись не распознана. Сеть с префиксом p занимает
+# [int(ip/2^(32-p))*2^(32-p), +2^(32-p)-1].
+subnet_overlap() { # наша подсеть, чужая подсеть
+	awk -v x="$1" -v y="$2" '
+	function bounds(s, p, ip, i, n, base, bits) {
+		if (s ~ /[^0-9.\/]/) return 0
+		n = split(s, p, "/")
+		if (n != 2) return 0
+		if (p[2] + 0 > 32) return 0
+		if (split(p[1], ip, ".") != 4) return 0
+		for (i = 1; i <= 4; i++) {
+			if (ip[i] == "" || ip[i] + 0 > 255) return 0
+		}
+		base = 0
+		for (i = 1; i <= 4; i++) base = base * 256 + ip[i]
+		bits = 2 ^ (32 - p[2])
+		lo = int(base / bits) * bits
+		hi = lo + bits - 1
+		return 1
+	}
+	BEGIN {
+		if (!bounds(x)) { print 2; exit }
+		xl = lo; xh = hi
+		if (!bounds(y)) { print 2; exit }
+		if (xl <= hi && lo <= xh) { print 1 } else { print 0 }
+	}'
+}
+
+# check_subnets отказывает до создания ресурсов, если чужая сеть Docker занимает
+# нашу подсеть, а также если список сетей или их подсети прочитать не удалось:
+# непрочитанная подсеть не доказывает свободу.
+check_subnets() {
+	local nets net subnets subnet ours rc
+	nets=$(docker network ls --format '{{.Name}}') ||
+		fail "не удалось прочитать подсети Docker"
+	for net in $nets; do
+		# Судьбу своих сетей решают проверки имён ниже.
+		case "$net" in
+		"$HARNESS" | "$UPLINK") continue ;;
+		esac
+		subnets=$(docker network inspect \
+			--format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$net") ||
+			fail "не удалось прочитать подсети Docker"
+		for subnet in $subnets; do
+			case "$subnet" in
+			'' | *:*) continue ;;
+			esac
+			for ours in 172.31.99.0/24 172.31.98.0/24; do
+				rc=$(subnet_overlap "$ours" "$subnet") || rc=2
+				case "$rc" in
+				0) ;;
+				1) fail "сеть $net занимает подсеть $subnet; пересечение с нашей подсетью $ours" ;;
+				*) fail "не удалось прочитать подсети Docker" ;;
+				esac
+			done
+		done
+	done
+	ok "подсети чужих сетей Docker не пересекаются с 172.31.98.0/24 и 172.31.99.0/24"
+}
+
 preflight() {
 	need docker
 	docker info >/dev/null 2>&1 || fail "Docker недоступен"
+	check_subnets
 
 	if [ -e "$OWNER" ]; then
 		fail "найден маркер прошлого запуска в $OWNER; сначала выполните make e2e-down"
@@ -307,7 +379,8 @@ setup() {
 	rm -f "$RUN_DIR/admin-login.json"
 
 	local out node_pub
-	out=$(node_run init 2>/dev/null) || fail "init узла не выполнен"
+	out=$(node_run init 2>"$RUN_DIR/node-init.err") ||
+		fail "init узла не выполнен; stderr: $RUN_DIR/node-init.err"
 	node_pub=$(printf '%s\n' "$out" | sed -n 's/^public_key //p' | head -n 1)
 	[ -n "$node_pub" ] || fail "init узла не напечатал public_key"
 	python3 - "$node_pub" "$RUN_DIR/server.json" <<'PY'
@@ -470,6 +543,24 @@ wait_handshake() { # публичный ключ клиента; 2 — не уд
 	done
 }
 
+# wait_peer ждёт пиера клиента до 90 с: 0 — пиер найден, 1 — не появился,
+# 2 — список пиеров не прочитан, ожидание прекращается сразу.
+wait_peer() { # публичный ключ клиента
+	local key=$1 deadline=$(( $(date +%s) + 90 )) rc
+	while :; do
+		node_peer_present "$key"
+		rc=$?
+		case "$rc" in
+		0) return 0 ;;
+		2) return 2 ;;
+		esac
+		if [ "$(date +%s)" -ge "$deadline" ]; then
+			return 1
+		fi
+		sleep 2
+	done
+}
+
 trigger_traffic() {
 	local i
 	for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -493,8 +584,13 @@ tunnel() {
 	[ -n "$client_pub" ] || fail "не удалось прочитать публичный ключ клиента"
 	# Агент опрашивает API раз в 25 с: до первого трафика убеждаемся, что новый
 	# пиер уже применён, иначе короткое ожидание ping не докажет ничего.
-	wait_for 90 "узел получил пиера клиента после опроса API" \
-		node_peer_present "$client_pub"
+	# Ошибка чтения списка пиеров не выдаётся за их отсутствие.
+	local peer_rc=0
+	wait_peer "$client_pub" || peer_rc=$?
+	if [ "$peer_rc" -eq 2 ]; then
+		fail "не удалось прочитать список пиеров узла; отсутствие пиера не доказано"
+	fi
+	[ "$peer_rc" -eq 0 ] || fail "пиер клиента не появился на узле за 90 с"
 	ok "узел получил пиера клиента"
 
 	trigger_traffic || fail "трафик по IP не инициировал handshake"
@@ -540,7 +636,7 @@ tunnel() {
 
 	local egress
 	egress=$(client_exec curl -fsS --max-time 10 http://probe.e2e.test:8080/whoami | tr -d '\r\n') ||
-		fail "HTTP к probe через имя не выполнена"
+		fail "HTTP-запрос к probe через имя не выполнен"
 	[ "$egress" = "172.31.98.2" ] ||
 		fail "egress = $egress, ожидался адрес узла 172.31.98.2"
 	ok "HTTP через имя вернул ровно 172.31.98.2"
@@ -569,6 +665,167 @@ tunnel() {
 	[ "$crx1" -gt "$crx0" ] && [ "$ctx1" -gt "$ctx0" ] ||
 		fail "счётчики клиента не выросли: было $crx0/$ctx0, стало $crx1/$ctx1"
 	ok "счётчики передачи выросли на узле и на клиенте"
+}
+
+# capture_count читает итоговую строку tcpdump из снимка в /state клиента и
+# печатает число пойманных пакетов. Пустое значение означает, что статистики нет
+# и снимок нечитаем — это не «ноль пакетов». Живой tcpdump печатает единственное
+# число без «s» («1 packet captured»), поэтому шаблон покрывает обе формы.
+capture_count() { # имя_файла_снимка
+	client_exec sh -c "grep -oE '[0-9]+ packets? captured' /state/$1 | tail -n 1" 2>/dev/null |
+		tr -d '\r' | awk '{print $1}'
+}
+
+# dns — три разных утверждения о DNS, и каждое проверяется отдельно: клиент
+# получает ответ резолвера узла; ни один DNS-пакет не уходит с eth0 клиента мимо
+# туннеля; тот же резолвер отвергает запрос из сети без туннеля. Первое без
+# второго и третьего не доказывает ничего. Порядок внутри фазы: резолв через
+# туннель, перехват-утечка, отказ из чужой сети, положительный контроль
+# перехвата, журнал узла, IPv6.
+dns() {
+	say "DNS: резолвер узла, отсутствие утечки, отказ из чужой сети, IPv6"
+
+	# resolv.conf читается явно: ответ стенда сам по себе не означает, что
+	# резолвит узел — адрес резолвера проверяется по файлу клиента.
+	client_exec cat /etc/resolv.conf 2>/dev/null | tr -d '\r' |
+		grep -Eq '^[[:space:]]*nameserver[[:space:]]+10\.99\.7\.1([[:space:]]|$)' ||
+		fail "в /etc/resolv.conf клиента нет nameserver 10.99.7.1"
+
+	# Запрос — A-запись через dig с явным адресом резолвера. nslookup для этой
+	# проверки непригоден: он дополнительно шлёт AAAA, форвардер стенда на AAAA
+	# отвергает, и у bind-ной версии nslookup код выхода 1 при верной A-записи.
+	# Решение берётся из разобранного rcode и answer-секции, а не из кода выхода.
+	local dig_out rcode
+	dig_out=$(client_exec dig +tries=1 +time=3 +noedns @10.99.7.1 probe.e2e.test 2>/dev/null | tr -d '\r')
+	rcode=$(printf '%s\n' "$dig_out" | grep -o 'status: [A-Z]*' | tail -n 1)
+	[ "$rcode" = "status: NOERROR" ] ||
+		fail "резолвер узла не ответил NOERROR на A-запрос клиента (получено: '${rcode:-нет ответа}')"
+	printf '%s\n' "$dig_out" | grep -qE 'IN[[:space:]]+A[[:space:]]+172\.31\.98\.3([[:space:]]|$)' ||
+		fail "имя probe.e2e.test разрезалось не в адрес стенда (rcode NOERROR, ответ без 172.31.98.3)"
+	ok "resolv.conf клиента → 10.99.7.1, имя probe.e2e.test резолвится в 172.31.98.3"
+
+	# DNS-пакет на eth0 клиента, ушедший мимо wg0, — это утечка. Окно захвата
+	# обязано охватывать запрос: tcpdump поднимается в фоне ДО резолва и
+	# дожидается ПОСЛЕ него. Решением служит число пойманных пакетов из итоговой
+	# строки снимка, а не код выхода захвата: в образе клиента `timeout` из
+	# busybox возвращает статус дочерней команды, а tcpdump по сигналу выходит с
+	# нулём (замер на стенде), так что по коду «пусто» неотличимо от «пойман».
+	# Снимок живёт в /state клиента; в тексте отказа печатаются путь и число, но
+	# не содержимое пакетов.
+	local leak_snippet='timeout 10 tcpdump -i eth0 -n -q -c 1 udp port 53 > /state/leak.log 2>&1 &'
+	leak_snippet="$leak_snippet"' cap=$!; sleep 1;'
+	leak_snippet="$leak_snippet"' dig +tries=1 +time=3 +noedns @10.99.7.1 probe.e2e.test >/dev/null 2>&1;'
+	leak_snippet="$leak_snippet"' wait $cap'
+	client_exec sh -c "$leak_snippet" >/dev/null 2>&1
+	local leak_count
+	leak_count=$(capture_count leak.log)
+	[ -n "$leak_count" ] ||
+		fail "перехват на eth0 клиента не дал статистики: /state/leak.log в контейнере client1"
+	[ "$leak_count" = 0 ] ||
+		fail "на eth0 клиента захвачен DNS-пакет (поймано $leak_count); снимок — /state/leak.log в контейнере client1"
+	ok "на eth0 клиента нет ни одного DNS-пакета"
+
+	# Ожидается именно rcode REFUSED в ответе резолвера, а не молчание: таймаут
+	# означал бы, что пакет уронил файрвол, и тогда правило access-control этой
+	# проверкой не доказано. Код выхода dig не учитывается: живой замер на стенде
+	# дал REFUSED при коде 0, поэтому решение берётся только из разобранного
+	# rcode, а пустое значение (нет ответа) даёт отказ.
+	local refused
+	refused=$(client_exec dig +tries=1 +time=3 +noedns @172.31.99.2 probe.e2e.test 2>/dev/null |
+		tr -d '\r' | grep -o 'status: [A-Z]*' | tail -n 1)
+	[ "$refused" = "status: REFUSED" ] ||
+		fail "резолвер узла не ответил REFUSED на запрос без туннеля (получено: '${refused:-нет ответа}')"
+	ok "тот же резолвер отвергает запрос не из туннельной сети: rcode REFUSED"
+
+	# R63: положительный контроль чувствительности. Тот же интерфейс, тот же
+	# захват, но запрос идёт НЕ через туннель — пакет обязан быть пойман. Без
+	# этого шага «ноль пакетов» выше неотличим от неработающего tcpdump.
+	local control_snippet='timeout 10 tcpdump -i eth0 -n -q -c 1 udp port 53 > /state/control.log 2>&1 &'
+	control_snippet="$control_snippet"' cap=$!; sleep 1;'
+	control_snippet="$control_snippet"' dig +tries=1 +time=3 +noedns @172.31.99.2 probe.e2e.test >/dev/null 2>&1;'
+	control_snippet="$control_snippet"' wait $cap'
+	client_exec sh -c "$control_snippet" >/dev/null 2>&1
+	local control_count
+	control_count=$(capture_count control.log)
+	[ -n "$control_count" ] ||
+		fail "положительный контроль перехвата не дал статистики: /state/control.log в контейнере client1"
+	[ "$control_count" -gt 0 ] 2>/dev/null ||
+		fail "перехват не поймал DNS-пакет мимо туннеля (поймано $control_count): проверка утечки недостоверна"
+	ok "перехват чувствителен: запрос мимо туннеля пойман на eth0"
+
+	# Непрочитанный журнал — не «журнал чист»: отсутствие строк доказывает
+	# только успешно прочитанный вывод контейнера.
+	local nodelog
+	if ! nodelog=$(compose logs --no-color node1 2>/dev/null); then
+		fail "не удалось прочитать журнал контейнера узла; отсутствие строк запросов не доказано"
+	fi
+	if printf '%s\n' "$nodelog" | grep -qE 'query:|reply:'; then
+		fail "в журнале контейнера узла есть строки запросов unbound"
+	fi
+	ok "журнала DNS-запросов в выводе контейнера узла нет"
+
+	# ADR-007: IPv6 на клиенте отключён. Проверяются три независимых признака —
+	# адрес, маршрут и путь наружу: маршрут по умолчанию без адреса был бы тихим
+	# blackhole, и его тоже быть не должно.
+	if client_exec sh -c 'ip -6 addr show | grep -q "inet6 .*global"'; then
+		fail "у клиента есть глобальный IPv6-адрес"
+	fi
+	if client_exec sh -c 'ip -6 route show default | grep -q .'; then
+		fail "у клиента есть IPv6 default route (ADR-007: тихий blackhole)"
+	fi
+	if client_exec sh -c 'ping -6 -c 1 -W 1 2001:db8::1' >/dev/null 2>&1; then
+		fail "IPv6-путь наружу существует"
+	fi
+	ok "IPv6 на клиенте отключён: адреса, маршрута и пути наружу нет"
+}
+
+# device_register создаёт дополнительное устройство. Публичный ключ считается
+# внутри уже запущенного контейнера клиента: приватная часть не покидает
+# контейнер и не печатается ни в журнале, ни в ok, ни в отказе. Идемпотентный
+# ключ — отдельный на каждое устройство и лежит в файле заголовков, который
+# curl читает через -H @файл.
+device_register() { # номер устройства, ожидаемый код
+	local n=$1 want=$2 pub status
+	pub=$(client_exec sh -c 'wg genkey | wg pubkey' 2>/dev/null | tr -d '\r\n') ||
+		fail "клиент не выдал ключ для устройства $n"
+	printf '%s\n' "$pub" | grep -Eq '^[A-Za-z0-9+/]{43}=$' ||
+		fail "клиент выдал некорректный публичный ключ для устройства $n"
+	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/device-$n.hdr" "e2e-device-$n"
+	python3 - "$pub" "$n" "$RUN_DIR/device-$n.json" <<'PY'
+import json, sys
+with open(sys.argv[3], "w", encoding="utf-8") as f:
+    json.dump({"public_key": sys.argv[1], "platform": "linux",
+               "name": "e2e-extra-" + sys.argv[2]}, f)
+PY
+	chmod 600 "$RUN_DIR/device-$n.hdr" "$RUN_DIR/device-$n.json"
+	status=$(http_status POST "$API/api/v1/devices" "$RUN_DIR/device-$n.json" \
+		"$RUN_DIR/device-$n.out" "$RUN_DIR/device-$n.hdr") ||
+		fail "запрос на создание устройства $n не выполнен"
+	[ "$status" = "$want" ] || fail "устройство $n: HTTP $status, ожидался $want"
+}
+
+# limit проверяет жёсткий лимит устройств ровно на том же стенде, где уже
+# зарегистрировано первое: третье устройство проходит, четвёртое отклоняется 409
+# с кодом device_limit_reached. Код ошибки читается из тела ответа, а не из
+# статуса: любой другой 409 лимит не доказывает.
+limit() {
+	say "лимит устройств: третье проходит, четвёртое — 409"
+	local n
+	for n in 2 3; do
+		device_register "$n" 201
+	done
+	ok "устройства 2 и 3 созданы: HTTP 201"
+	device_register 4 409
+	if ! python3 - "$RUN_DIR/device-4.out" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    code = json.load(f)["error"]["code"]
+sys.exit(0 if code == "device_limit_reached" else 1)
+PY
+	then
+		fail "четвёртое устройство отклонено не по коду device_limit_reached"
+	fi
+	ok "лимит 3: четвёртое устройство отклонено с device_limit_reached"
 }
 
 cleanup() {
@@ -644,11 +901,28 @@ run_main() {
 		printf 'лишние аргументы; допустима одна фаза\n' >&2
 		exit 2
 	fi
-	local phase=${1:-${E2E_PHASE:-all}}
+	# Позиционный аргумент принимает all, tunnel, dns, limit и down. Фаза из
+	# окружения, если задана, проверяется всегда и принимает all, tunnel, dns и
+	# limit: снятие стенда идёт исключительно через make e2e-down с его
+	# проверками тома и контейнеров.
+	local phase=${1:-}
+	if [ -n "${E2E_PHASE:-}" ]; then
+		case "$E2E_PHASE" in
+		all | tunnel | dns | limit) ;;
+		*)
+			printf 'недопустимая фаза окружения: %s (допустимы all, tunnel, dns, limit)\n' \
+				"${E2E_PHASE}" >&2
+			exit 2
+			;;
+		esac
+	fi
+	if [ -z "$phase" ]; then
+		phase=${E2E_PHASE:-all}
+	fi
 	case "$phase" in
-	all | tunnel | down) ;;
+	all | tunnel | dns | limit | down) ;;
 	*)
-		printf 'неизвестная фаза: %s (допустимы all, tunnel, down)\n' "$phase" >&2
+		printf 'неизвестная фаза: %s (допустимы all, tunnel, dns, limit, down)\n' "$phase" >&2
 		exit 2
 		;;
 	esac
@@ -656,11 +930,39 @@ run_main() {
 	trap on_exit EXIT
 	trap 'exit 130' INT TERM
 
+	# Одиночная фаза всегда идёт полным прогоном: установка, контроль обхода,
+	# туннель, сама проверка и очистка. Без контроля обхода и очистки фаза
+	# теряла бы и доказательство, и стенд.
 	case "$phase" in
-	all | tunnel)
+	all)
 		setup
 		negative_control
 		tunnel
+		dns
+		limit
+		cleanup
+		ok "фаза $phase пройдена"
+		;;
+	tunnel)
+		setup
+		negative_control
+		tunnel
+		cleanup
+		ok "фаза $phase пройдена"
+		;;
+	dns)
+		setup
+		negative_control
+		tunnel
+		dns
+		cleanup
+		ok "фаза $phase пройдена"
+		;;
+	limit)
+		setup
+		negative_control
+		tunnel
+		limit
 		cleanup
 		ok "фаза $phase пройдена"
 		;;
