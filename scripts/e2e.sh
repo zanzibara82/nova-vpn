@@ -119,6 +119,19 @@ expect_status() { # полученный, ожидаемый, что
 	ok "$3"
 }
 
+# http_secret_post выполняет запрос с телом, содержащим пароль, и печатает код
+# ответа. Файл тела снимается до вердикта о коде: на отказе стенд и том управления
+# сохраняются для разбора, и секрет не должен пережить запрос ни на одной дорожке,
+# включая сам сбой curl.
+http_secret_post() { # метод, адрес, файл-тела, файл-ответа
+	local out rc
+	out=$(http_status "$1" "$2" "$3" "$4" -)
+	rc=$?
+	rm -f "$3"
+	printf '%s' "$out"
+	return "$rc"
+}
+
 write_auth_header() { # json-сессии, файл-заголовков, необязательный Idempotency-Key
 	python3 - "$1" "$2" "${3:-}" <<'PY'
 import json, sys
@@ -372,11 +385,10 @@ setup() {
 
 	json_login admin@e2e.test "$RUN_DIR/admin.pass" "$RUN_DIR/admin-login.json"
 	local status
-	status=$(http_status POST "$API/api/v1/admin/login" "$RUN_DIR/admin-login.json" \
-		"$RUN_DIR/admin-session.json" -) || fail "вход администратора не выполнен"
+	status=$(http_secret_post POST "$API/api/v1/admin/login" "$RUN_DIR/admin-login.json" \
+		"$RUN_DIR/admin-session.json") || fail "вход администратора не выполнен"
 	expect_status "$status" 200 "администратор вошёл"
 	write_auth_header "$RUN_DIR/admin-session.json" "$RUN_DIR/admin.hdr"
-	rm -f "$RUN_DIR/admin-login.json"
 
 	local out node_pub
 	out=$(node_run init 2>"$RUN_DIR/node-init.err") ||
@@ -439,13 +451,12 @@ PY
 	[ -n "$client_pub" ] || fail "клиент не напечатал публичный ключ"
 
 	json_login user@e2e.test "$RUN_DIR/user.pass" "$RUN_DIR/register.json"
-	status=$(http_status POST "$API/api/v1/auth/register" "$RUN_DIR/register.json" \
-		"$RUN_DIR/user-session.json" -) || fail "регистрация пользователя не выполнена"
+	status=$(http_secret_post POST "$API/api/v1/auth/register" "$RUN_DIR/register.json" \
+		"$RUN_DIR/user-session.json") || fail "регистрация пользователя не выполнена"
 	expect_status "$status" 201 "пользователь зарегистрирован"
 	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/user.hdr"
 	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/device.hdr" e2e-device-1
 	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/profile.hdr" e2e-profile-1
-	rm -f "$RUN_DIR/register.json"
 
 	python3 - "$client_pub" "$RUN_DIR/device.json" <<'PY'
 import json, sys
@@ -835,9 +846,8 @@ limit() {
 	local fresh status
 	fresh="$RUN_DIR/limit-login.json"
 	json_login user@e2e.test "$RUN_DIR/user.pass" "$fresh"
-	status=$(http_status POST "$API/api/v1/auth/login" "$fresh" \
-		"$RUN_DIR/user-session.json" -) || fail "вход за свежей сессией не выполнен"
-	rm -f "$fresh"
+	status=$(http_secret_post POST "$API/api/v1/auth/login" "$fresh" \
+		"$RUN_DIR/user-session.json") || fail "вход за свежей сессией не выполнен"
 	expect_status "$status" 200 "свежая сессия для фазы лимита получена"
 	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/user.hdr"
 	local n

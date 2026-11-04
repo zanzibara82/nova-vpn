@@ -1252,5 +1252,15 @@ grep -Eq '^[[:space:]]*log-queries:[[:space:]]*no' "$UNBOUND_CONF" \
 	&& grep -Eq '^[[:space:]]*log-replies:[[:space:]]*no' "$UNBOUND_CONF"
 check $? "в конфиге резолвера выключены log-queries и log-replies"
 
+# 64. Отказ запроса не оставляет в томе управления тело входа с паролем: на
+# отказе стенд сохраняют для разбора, поэтому снятие файла обязан предшествовать
+# вердикту о коде, а не стоять после него.
+dir="$TMPROOT/limit-curlfail"; fake_tools "$dir"
+FAKE_CURL_EXIT=1 limit_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'FAIL' "$dir/out" \
+	&& ! [ -e "$dir/state-run/run/limit-login.json" ]
+check $? "сбой входа не оставляет файл тела входа (код $code)"
+
 printf '%s\n' "проверок: $CASES, отказов: $FAILS"
 [ "$FAILS" -eq 0 ]
