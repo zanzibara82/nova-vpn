@@ -680,15 +680,24 @@ capture_count() { # имя_файла_снимка
 # получает ответ резолвера узла; ни один DNS-пакет не уходит с eth0 клиента мимо
 # туннеля; тот же резолвер отвергает запрос из сети без туннеля. Первое без
 # второго и третьего не доказывает ничего. Порядок внутри фазы: резолв через
-# туннель, перехват-утечка, отказ из чужой сети, положительный контроль
-# перехвата, журнал узла, IPv6.
+# туннель, положительный контроль перехвата, перехват-утечка, отказ из чужой
+# сети, журнал узла, IPv6. Контроль стоит перед вердиктом об утечке: ok-строка
+# «пакетов нет» должна печататься уже после того, как доказано, что перехват
+# вообще способен поймать пакет.
 dns() {
 	say "DNS: резолвер узла, отсутствие утечки, отказ из чужой сети, IPv6"
 
 	# resolv.conf читается явно: ответ стенда сам по себе не означает, что
-	# резолвит узел — адрес резолвера проверяется по файлу клиента.
-	client_exec cat /etc/resolv.conf 2>/dev/null | tr -d '\r' |
-		grep -Eq '^[[:space:]]*nameserver[[:space:]]+10\.99\.7\.1([[:space:]]|$)' ||
+	# резолвит узел — адрес резолвера проверяется по файлу клиента. Строк
+	# nameserver обязана быть ровно одна: второй адрес был бы каналом утечки,
+	# который окном перехвата ниже не наблюдается, и наличие нужной строки среди
+	# прочих этого не исключает.
+	local resolv ns_count
+	resolv=$(client_exec cat /etc/resolv.conf 2>/dev/null | tr -d '\r')
+	ns_count=$(printf '%s\n' "$resolv" | grep -cE '^[[:space:]]*nameserver')
+	[ "$ns_count" = 1 ] ||
+		fail "в /etc/resolv.conf клиента $ns_count строк nameserver, ожидалась ровно одна"
+	printf '%s\n' "$resolv" | grep -Eq '^[[:space:]]*nameserver[[:space:]]+10\.99\.7\.1([[:space:]]|$)' ||
 		fail "в /etc/resolv.conf клиента нет nameserver 10.99.7.1"
 
 	# Запрос — A-запись через dig с явным адресом резолвера. nslookup для этой
@@ -701,8 +710,25 @@ dns() {
 	[ "$rcode" = "status: NOERROR" ] ||
 		fail "резолвер узла не ответил NOERROR на A-запрос клиента (получено: '${rcode:-нет ответа}')"
 	printf '%s\n' "$dig_out" | grep -qE 'IN[[:space:]]+A[[:space:]]+172\.31\.98\.3([[:space:]]|$)' ||
-		fail "имя probe.e2e.test разрезалось не в адрес стенда (rcode NOERROR, ответ без 172.31.98.3)"
+		fail "имя probe.e2e.test разрешилось не в адрес стенда (rcode NOERROR, ответ без 172.31.98.3)"
 	ok "resolv.conf клиента → 10.99.7.1, имя probe.e2e.test резолвится в 172.31.98.3"
+
+	# R63: положительный контроль чувствительности идёт раньше вердикта об
+	# утечке. Тот же интерфейс, тот же захват, но запрос идёт НЕ через туннель —
+	# пакет обязан быть пойман. Без этого шага «ноль пакетов» ниже неотличим от
+	# неработающего tcpdump.
+	local control_snippet='timeout 10 tcpdump -i eth0 -n -q -c 1 '"'"'( port 53 or port 853 or port 5353 )'"'"' > /state/control.log 2>&1 &'
+	control_snippet="$control_snippet"' cap=$!; sleep 1;'
+	control_snippet="$control_snippet"' dig +tries=1 +time=3 +noedns @172.31.99.2 probe.e2e.test >/dev/null 2>&1;'
+	control_snippet="$control_snippet"' wait $cap'
+	client_exec sh -c "$control_snippet" >/dev/null 2>&1
+	local control_count
+	control_count=$(capture_count control.log)
+	[ -n "$control_count" ] ||
+		fail "положительный контроль перехвата не дал статистики: /state/control.log в контейнере client1"
+	[ "$control_count" -gt 0 ] 2>/dev/null ||
+		fail "перехват не поймал DNS-пакет мимо туннеля (поймано $control_count): проверка утечки недостоверна"
+	ok "перехват чувствителен: запрос мимо туннеля пойман на eth0"
 
 	# DNS-пакет на eth0 клиента, ушедший мимо wg0, — это утечка. Окно захвата
 	# обязано охватывать запрос: tcpdump поднимается в фоне ДО резолва и
@@ -710,9 +736,11 @@ dns() {
 	# строки снимка, а не код выхода захвата: в образе клиента `timeout` из
 	# busybox возвращает статус дочерней команды, а tcpdump по сигналу выходит с
 	# нулём (замер на стенде), так что по коду «пусто» неотличимо от «пойман».
-	# Снимок живёт в /state клиента; в тексте отказа печатаются путь и число, но
-	# не содержимое пакетов.
-	local leak_snippet='timeout 10 tcpdump -i eth0 -n -q -c 1 udp port 53 > /state/leak.log 2>&1 &'
+	# Фильтр не привязан к udp и накрывает 53, 853 и 5353: ok-строка обещает
+	# отсутствие DNS-трафика, и TCP-53, DoT и mDNS мимо туннеля тоже относятся к
+	# нему. Снимок живёт в /state клиента; в тексте отказа печатаются путь и
+	# число, но не содержимое пакетов.
+	local leak_snippet='timeout 10 tcpdump -i eth0 -n -q -c 1 '"'"'( port 53 or port 853 or port 5353 )'"'"' > /state/leak.log 2>&1 &'
 	leak_snippet="$leak_snippet"' cap=$!; sleep 1;'
 	leak_snippet="$leak_snippet"' dig +tries=1 +time=3 +noedns @10.99.7.1 probe.e2e.test >/dev/null 2>&1;'
 	leak_snippet="$leak_snippet"' wait $cap'
@@ -737,22 +765,6 @@ dns() {
 		fail "резолвер узла не ответил REFUSED на запрос без туннеля (получено: '${refused:-нет ответа}')"
 	ok "тот же резолвер отвергает запрос не из туннельной сети: rcode REFUSED"
 
-	# R63: положительный контроль чувствительности. Тот же интерфейс, тот же
-	# захват, но запрос идёт НЕ через туннель — пакет обязан быть пойман. Без
-	# этого шага «ноль пакетов» выше неотличим от неработающего tcpdump.
-	local control_snippet='timeout 10 tcpdump -i eth0 -n -q -c 1 udp port 53 > /state/control.log 2>&1 &'
-	control_snippet="$control_snippet"' cap=$!; sleep 1;'
-	control_snippet="$control_snippet"' dig +tries=1 +time=3 +noedns @172.31.99.2 probe.e2e.test >/dev/null 2>&1;'
-	control_snippet="$control_snippet"' wait $cap'
-	client_exec sh -c "$control_snippet" >/dev/null 2>&1
-	local control_count
-	control_count=$(capture_count control.log)
-	[ -n "$control_count" ] ||
-		fail "положительный контроль перехвата не дал статистики: /state/control.log в контейнере client1"
-	[ "$control_count" -gt 0 ] 2>/dev/null ||
-		fail "перехват не поймал DNS-пакет мимо туннеля (поймано $control_count): проверка утечки недостоверна"
-	ok "перехват чувствителен: запрос мимо туннеля пойман на eth0"
-
 	# Непрочитанный журнал — не «журнал чист»: отсутствие строк доказывает
 	# только успешно прочитанный вывод контейнера.
 	local nodelog
@@ -764,14 +776,20 @@ dns() {
 	fi
 	ok "журнала DNS-запросов в выводе контейнера узла нет"
 
-	# ADR-007: IPv6 на клиенте отключён. Проверяются три независимых признака —
-	# адрес, маршрут и путь наружу: маршрут по умолчанию без адреса был бы тихим
-	# blackhole, и его тоже быть не должно.
+	# ADR-007: IPv6 на клиенте отключён. Сначала сверяется сам механизм — флаг
+	# ядра: три отрицательных признака без него читались бы как «отключено» и
+	# при сломанном инструменте. Затем три независимых признака — адрес, маршрут
+	# и путь наружу: маршрут по умолчанию без адреса был бы тихой чёрной дырой, и
+	# его тоже быть не должно.
+	local ip6_flag
+	ip6_flag=$(client_exec cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null | tr -d '\r')
+	[ "$ip6_flag" = 1 ] ||
+		fail "net.ipv6.conf.all.disable_ipv6 на клиенте не равен 1 (получено: '${ip6_flag:-нет значения}')"
 	if client_exec sh -c 'ip -6 addr show | grep -q "inet6 .*global"'; then
 		fail "у клиента есть глобальный IPv6-адрес"
 	fi
 	if client_exec sh -c 'ip -6 route show default | grep -q .'; then
-		fail "у клиента есть IPv6 default route (ADR-007: тихий blackhole)"
+		fail "у клиента есть IPv6-маршрут по умолчанию (ADR-007: тихая чёрная дыра)"
 	fi
 	if client_exec sh -c 'ping -6 -c 1 -W 1 2001:db8::1' >/dev/null 2>&1; then
 		fail "IPv6-путь наружу существует"
@@ -810,6 +828,18 @@ PY
 # статуса: любой другой 409 лимит не доказывает.
 limit() {
 	say "лимит устройств: третье проходит, четвёртое — 409"
+	# Access-токен живёт десять минут, а между выдачей сессии в setup и этой
+	# фазой стоят контроль обхода, туннель и dns. На стенде проекта журнал уже
+	# показывал 401 в лимите, поэтому сессия обновляется здесь: тело входа
+	# собирается из файла пароля, а не из аргументов команды.
+	local fresh status
+	fresh="$RUN_DIR/limit-login.json"
+	json_login user@e2e.test "$RUN_DIR/user.pass" "$fresh"
+	status=$(http_status POST "$API/api/v1/auth/login" "$fresh" \
+		"$RUN_DIR/user-session.json" -) || fail "вход за свежей сессией не выполнен"
+	rm -f "$fresh"
+	expect_status "$status" 200 "свежая сессия для фазы лимита получена"
+	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/user.hdr"
 	local n
 	for n in 2 3; do
 		device_register "$n" 201
@@ -818,8 +848,11 @@ limit() {
 	device_register 4 409
 	if ! python3 - "$RUN_DIR/device-4.out" <<'PY'
 import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    code = json.load(f)["error"]["code"]
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        code = json.load(f)["error"]["code"]
+except Exception:
+    sys.exit(2)
 sys.exit(0 if code == "device_limit_reached" else 1)
 PY
 	then

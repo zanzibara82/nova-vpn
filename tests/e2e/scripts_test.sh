@@ -22,6 +22,9 @@ NODE_ENTRY=${NODE_ENTRY:-$ROOT/infrastructure/docker/e2e/node-entrypoint.sh}
 # capability, не трогая настоящие файлы.
 CLIENT_IMAGE=${CLIENT_IMAGE:-$ROOT/infrastructure/docker/e2e/client1.Dockerfile}
 E2E_COMPOSE=${E2E_COMPOSE:-$ROOT/infrastructure/docker/docker-compose.e2e.yml}
+# Конфиг резолвера узла тоже подставляемый: статическая проверка правки журнала
+# гоняется против копии с включённым логированием запросов.
+UNBOUND_CONF=${UNBOUND_CONF:-$ROOT/infrastructure/docker/e2e/unbound.conf}
 
 FAILS=0
 CASES=0
@@ -152,12 +155,20 @@ compose)
 		printf '%s\n' "${FAKE_DEV_PUB-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
 		exit 0 ;;
 	*"logs --no-color node1"*)
+		# Непрочитанный журнал обязан отличаться от чистого: подставка умеет и
+		# отказ команды, и пустой вывод.
+		[ "${FAKE_NODE_LOG_FAIL:-0}" = 1 ] && exit 1
 		[ -n "${FAKE_NODE_LOG:-}" ] && printf '%s\n' "$FAKE_NODE_LOG"
 		exit 0 ;;
 	# Файл resolv.conf читается фазой dns построчно: подстановка даёт как
 	# резолвер узла, так и чужой адрес — проверка не должна проходить по инерции.
 	*"/etc/resolv.conf"*)
 		printf '%s\n' "${FAKE_RESOLV_CONF-nameserver 10.99.7.1}"
+		exit 0 ;;
+	# Механизм отключения IPv6: фаза обязана сверить признак до трёх отрицательных
+	# проверок, иначе «молчание инструмента» и «стек выключен» неразличимы.
+	*"/proc/sys/net/ipv6/conf/all/disable_ipv6"*)
+		printf '%s\n' "${FAKE_IP6_DISABLE-1}"
 		exit 0 ;;
 	# Запуск перехвата: код выхода не используется решением. Busybox-`timeout`
 	# (образ клиента) возвращает статус дочерней команды, а tcpdump по SIGTERM
@@ -207,6 +218,14 @@ done
 code=${FAKE_DEVICE_CODE:-201}
 if [ -n "${FAKE_DEVICE_BODY:-}" ]; then body=$FAKE_DEVICE_BODY; else body='{"id":"e2e-device"}'; fi
 case "$out" in
+*user-session*)
+	# Вход за свежей сессией: тело обязано содержать access_token, иначе
+	# заголовок не собрать и фаза откажет по своей логике, а не по подставке.
+	code=${FAKE_LOGIN_CODE:-200}
+	if [ -n "${FAKE_LOGIN_BODY:-}" ]; then body=$FAKE_LOGIN_BODY; else
+		body='{"access_token":"e2e-access","refresh_token":"e2e-refresh"}'
+	fi
+	;;
 *device-4*)
 	code=${FAKE_DEVICE4_CODE:-409}
 	if [ -n "${FAKE_DEVICE4_BODY:-}" ]; then
@@ -918,12 +937,12 @@ order=$(printf '%s\n' "$leak_line" | awk '{
 	if (a < b && b < c) print "порядок"; else print "нет"
 }')
 [ "$order" = "порядок" ] \
-	&& printf '%s\n' "$leak_line" | grep -q -- '-c 1 udp port 53'
+	&& printf '%s\n' "$leak_line" | grep -qF -- '-c 1 '"'"'( port 53 or port 853 or port 5353 )'"'"''
 check $? "захват tcpdump стартует до резолва и дожидается после (код $code)"
 
 # 32. Положительный контроль чувствительности читает статистика снимка: «пакет
 # пойман» без разобранного числа ничего не доказывает.
-control_line=$(grep -m1 'timeout 10 tcpdump -i eth0 -n -q -c 1 udp port 53 > /state/control.log' "$dir/log")
+control_line=$(grep -m1 "timeout 10 tcpdump -i eth0 -n -q -c 1 '( port 53 or port 853 or port 5353 )' > /state/control.log" "$dir/log")
 [ -n "$control_line" ] && grep -qF "packets? captured' /state/control.log" "$dir/log" \
 	&& printf '%s\n' "$control_line" | grep -q 'dig .*@172.31.99.2 probe.e2e.test'
 check $? "положительный контроль разбирает снимок и шлёт запрос мимо туннеля"
@@ -996,7 +1015,7 @@ ipv6_fail_case() { # описание, имя переменной состоя�
 }
 
 ipv6_fail_case 'глобальный IPv6-адрес у клиента' 'IP6_ADDR_RC'
-ipv6_fail_case 'IPv6 default route у клиента' 'IP6_ROUTE_RC'
+ipv6_fail_case 'IPv6-маршрут по умолчанию у клиента' 'IP6_ROUTE_RC'
 ipv6_fail_case 'работающий IPv6-путь наружу' 'IP6_PING_RC'
 
 # limit_run — вызов фазы limit на подставном докере и curl. Сессия пользователя
@@ -1006,6 +1025,7 @@ limit_run() { # каталог
 	local dir=$1
 	mkdir -p "$dir/state-run/run"
 	printf '{"access_token":"e2e-offline-token"}\n' > "$dir/state-run/run/user-session.json"
+	printf 'e2e-offline-password\n' > "$dir/state-run/run/user.pass"
 	PATH="$dir/bin:$PATH" FAKE_LOG="$dir/log" FAKE_STATE="$dir/state" \
 	E2E_STATE_DIR="$dir/state-run" timeout 60 bash -c 'source "$0"; limit' "$E2E" \
 		> "$dir/out" 2>&1
@@ -1144,6 +1164,93 @@ capture_rc_case() { # код выхода перехвата
 capture_rc_case 0
 capture_rc_case 124
 capture_rc_case 143
+
+# 55. Два nameserver в файле клиента: второй адрес и есть канал утечки, который
+# окном перехвата не наблюдается — тот запрос отправлен явно на резолвер узла.
+# Фаза обязана требовать ровно одну строку, а не наличие нужной среди прочих.
+dir="$TMPROOT/dns-twons"; fake_tools "$dir"
+FAKE_RESOLV_CONF=$(printf 'nameserver 10.99.7.1\nnameserver 8.8.8.8') dns_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'FAIL' "$dir/out" \
+	&& ! grep -q '^ok   resolv.conf клиента' "$dir/out"
+check $? "второй nameserver в resolv.conf даёт отказ фазы dns (код $code)"
+
+# 56. Фильтр съёмки не ограничен udp/53: TCP-53, DoT-853 и mDNS-5353 мимо
+# туннеля тоже попадают в кадр, иначе ok-строка обещает больше, чем видно.
+dir="$TMPROOT/dns-filter"; fake_tools "$dir"
+dns_run "$dir"
+code=$?
+captures=$(grep -cF "tcpdump -i eth0 -n -q -c 1 '( port 53 or port 853 or port 5353 )'" "$dir/log")
+[ "$code" -eq 0 ] && [ "$captures" = 2 ] \
+	&& ! grep -q 'tcpdump -i eth0 .*udp port 53' "$dir/log"
+check $? "окна перехвата снимают порты 53, 853 и 5353 без привязки к udp (окон: ${captures:-0})"
+
+# 57. Положительный контроль чувствительности идёт до вердикта об утечке:
+# иначе ok-строка «пакетов нет» печатается раньше, чем доказано, что перехват
+# вообще способен поймать пакет.
+dir="$TMPROOT/dns-order"; fake_tools "$dir"
+dns_run "$dir"
+code=$?
+control_pos=$(grep -n -m1 'tcpdump -i eth0 .* > /state/control.log' "$dir/log" | cut -d: -f1)
+leak_pos=$(grep -n -m1 'tcpdump -i eth0 .* > /state/leak.log' "$dir/log" | cut -d: -f1)
+[ "$code" -eq 0 ] && [ -n "$control_pos" ] && [ -n "$leak_pos" ] && [ "$control_pos" -lt "$leak_pos" ]
+check $? "контроль перехвата предшествует вердикту об утечке (контроль на $control_pos, утечка на $leak_pos)"
+
+# 58. Снимок утечки нечитается: пустой вывод должен дать отказ с указанием
+# снимка, а не молчаливое «пакетов нет».
+dir="$TMPROOT/dns-leakunreadable"; fake_tools "$dir"
+FAKE_LEAK_CAPTURE='' dns_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'FAIL' "$dir/out" \
+	&& grep -q 'не дал статистики' "$dir/out" \
+	&& ! grep -q '^ok   на eth0 клиента нет ни одного DNS-пакета' "$dir/out"
+check $? "пустой снимок утечки даёт отказ с названием файла (код $code)"
+
+# 59. Журнал узла не прочитан: отказ обязан назвать причину, а не сойти за
+# «строк запросов нет».
+dir="$TMPROOT/dns-nodelogfail"; fake_tools "$dir"
+FAKE_NODE_LOG_FAIL=1 dns_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'FAIL' "$dir/out" \
+	&& grep -q 'не удалось прочитать журнал контейнера узла' "$dir/out" \
+	&& ! grep -q '^ok   журнала DNS-запросов' "$dir/out"
+check $? "сбой чтения журнала узла не засчитывается как чистый журнал (код $code)"
+
+# 60. Механизм отключения IPv6 не подтверждён: три отрицательных признака без
+# положительного читались бы как «отключено» и при сломанном инструменте.
+dir="$TMPROOT/dns-ip6mechanism"; fake_tools "$dir"
+FAKE_IP6_DISABLE=0 dns_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'FAIL' "$dir/out" \
+	&& ! grep -q '^ok   IPv6 на клиенте отключён' "$dir/out"
+check $? "disable_ipv6 без единицы даёт отказ фазы dns (код $code)"
+
+# 61. Фаза limit берёт свежую сессию: access-токен живёт десять минут, а между
+# выдачей сессии и лимитом стоят контроль обхода, туннель и dns. На медленном
+# хосте просроченный токен дал бы отказ на создании второго устройства, и лимит
+# был бы отвергнут не по своей причине.
+dir="$TMPROOT/limit-login"; fake_tools "$dir"
+limit_run "$dir"
+code=$?
+login_pos=$(grep -n -m1 'auth/login' "$dir/log" | cut -d: -f1)
+first_device=$(grep -n -m1 'api/v1/devices' "$dir/log" | cut -d: -f1)
+[ "$code" -eq 0 ] && [ -n "$login_pos" ] && [ -n "$first_device" ] && [ "$login_pos" -lt "$first_device" ]
+check $? "лимит входит заново до создания устройств (вход на $login_pos, первое устройство на $first_device)"
+
+# 62. Отказ при некорректном теле 409 остаётся русским сообщением о коде ошибки,
+# а не дампом стека интерпретатора: формат отказа в проекте — одна строка.
+dir="$TMPROOT/limit-brokenbody"; fake_tools "$dir"
+FAKE_DEVICE4_BODY='{}' limit_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'FAIL' "$dir/out" && ! grep -q 'Traceback' "$dir/out"
+check $? "некорректное тело 409 даёт русский отказ без дампа стека (код $code)"
+
+# 63. Резолвер узла настроен на молчание: логирование запросов и ответов
+# выключено в самом конфиге, а не только проверено выводом контейнера. Это
+# статическая закрепка предусловия, живое доказательство — проверка 38.
+grep -Eq '^[[:space:]]*log-queries:[[:space:]]*no' "$UNBOUND_CONF" \
+	&& grep -Eq '^[[:space:]]*log-replies:[[:space:]]*no' "$UNBOUND_CONF"
+check $? "в конфиге резолвера выключены log-queries и log-replies"
 
 printf '%s\n' "проверок: $CASES, отказов: $FAILS"
 [ "$FAILS" -eq 0 ]
