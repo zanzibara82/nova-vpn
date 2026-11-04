@@ -55,6 +55,7 @@ fake_tools() { # имя_каталога
 #!/bin/sh
 printf 'docker %s\n' "$*" >> "$FAKE_LOG"
 state=$FAKE_STATE
+run=${FAKE_RUN-$state}
 case "$1" in
 info|version) exit 0 ;;
 ps) cat "$state/ps"; exit 0 ;;
@@ -134,11 +135,121 @@ compose)
 	*" version"*) exit 0 ;;
 	esac
 	[ "${FAKE_FAIL_COMPOSE:-0}" = 1 ] && exit 1
+	# Модель жизненного цикла доступа: применённый набор (allowed) и желаемый
+	# (desired) лежат в состоянии подставки, часами шагает подставной сон. Модель
+	# активна только у прогонов с файлом desired, поэтому прежние проверки
+	# (туннель, dns, лимит) разбирают те же подставки, что и раньше.
+	case "$*" in
+	*"wg show wg0 allowed-ips"*)
+		[ -f "$state/allowed" ] || exit 0
+		if [ -f "$state/read_fail" ]; then exit 1; fi
+		cat "$state/allowed"
+		exit 0 ;;
+	# Состояние агента читается фазой как JSON: подставка отдаёт тот же вид, что
+	# пишет агент, — ETag с экранированными кавычками внутри строки.
+	*"exec -T node1 cat /var/lib/novavpn-node/state.json"*)
+		[ "${FAKE_NODE_STATE-1}" = "" ] && exit 1
+		[ -f "$state/etag" ] || exit 0
+		printf '{"applied":{"etag":"%s"}}\n' "\\\"$(cat "$state/etag")\\\""
+		exit 0 ;;
+	*"exec -d client1"*)
+		[ -f "$state/desired" ] || exit 0
+		[ "${FAKE_BG_FAIL-0}" = 1 ] && exit 1
+		case "$*" in
+		*first_fail*)
+			rm -f "$run/first_fail"
+			start=$(printf '%s\n' "$*" | sed -n 's/.*start=\([0-9][0-9]*\).*/\1/p')
+			printf '%s\n' "${start:-0}" > "$state/revoke_start"
+			printf '%s\n' "$(cat "$state/secs")" > "$state/revoke_base" ;;
+		*ping.stop*)
+			rm -f "$run/ping.log" "$run/ping.stop"
+			if [ "${FAKE_BG_EMPTY-0}" = 1 ]; then
+				: > "$run/ping.log"
+			else
+				date +%s > "$state/base"
+				printf '0\n' > "$state/rows"
+			fi ;;
+		esac
+		exit 0 ;;
+	*"exec -T client1 sh -c umask 077"*)
+		[ -f "$state/desired" ] || exit 0
+		[ -n "${FAKE_NEW_PUB-}" ] || exit 1
+		# Приватная половина остаётся в клиентском томе: в модели это метка,
+		# которая не имеет права появиться в выводе фазы.
+		printf 'e2e-privatesecret\n' > "$run/rotate.key"
+		printf '%s\n' "$FAKE_NEW_PUB" > "$state/new_pub"
+		printf '%s\n' "$FAKE_NEW_PUB"
+		exit 0 ;;
+	*"exec -T client1 sh -c wg set wg0 private-key"*)
+		[ -f "$state/desired" ] || exit 0
+		: > "$state/down"
+		awk '$2 == "10.99.7.2/32" { print $1 }' "$state/allowed" > "$state/old_pub"
+		printf 'handshake\n' > "$state/stage"
+		if [ "${FAKE_PAUSE_RESUME-1}" = 1 ]; then
+			printf '%s\n' "$(( $(cat "$state/secs") + ${FAKE_POLL_SECONDS:-3} ))" \
+				> "$state/poll_at"
+		fi
+		exit 0 ;;
+	*"exec -T client1 sh -c touch /state/ping.stop"*)
+		rm -f "$state/rows" "$run/ping.stop"
+		exit 0 ;;
+	*"exec -T client1 cat /state/ping.log"*)
+		[ "${FAKE_PING_FAIL-0}" = 1 ] && exit 1
+		cat "$run/ping.log"
+		exit 0 ;;
+	*"exec -T client1 test -s /state/first_fail"*)
+		[ -s "$run/first_fail" ]
+		exit 0 ;;
+	*"exec -T client1 cat /state/first_fail"*)
+		[ -s "$run/first_fail" ] || exit 1
+		if [ "${FAKE_NO_TIMESTAMP-0}" = 1 ]; then
+			printf 'нет метки\n'
+			exit 0
+		fi
+		cat "$run/first_fail"
+		exit 0 ;;
+	# Запрос клиента к probe через туннель: адрес egress либо получен, либо
+	# запрос не прошёл — трафик стоит.
+	*"/whoami"*)
+		[ -f "$state/desired" ] || exit 0
+		[ -f "$state/down" ] && exit 7
+		printf '%s\n' "${FAKE_EGRESS-172.31.98.2}"
+		exit 0 ;;
+	*" restart node1"*)
+		[ -f "$state/desired" ] || exit 0
+		: > "$state/allowed"
+		printf '%s\n' "$(( $(cat "$state/secs") + ${FAKE_POLL_SECONDS:-3} ))" \
+			> "$state/poll_at"
+		if [ "${FAKE_ETAG_CHANGES-0}" = 1 ]; then
+			printf 'e2\n' > "$state/etag"
+		fi
+		exit 0 ;;
+	*" stop api"*)
+		: > "$state/api-down"
+		if [ "${FAKE_OUTAGE_DOWN-0}" = 1 ]; then
+			: > "$state/down"
+		fi
+		if [ "${FAKE_OUTAGE_PEERS-0}" = 1 ]; then
+			: > "$state/allowed"
+		fi
+		exit 0 ;;
+	*" start api"*)
+		rm -f "$state/api-down"
+		exit 0 ;;
+	esac
 	case "$*" in
 	*"wg show wg0 public-key"*)
 		printf '%s\n' "${FAKE_CLIENT_PUB:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
 		exit 0 ;;
 	*"wg show wg0 peers"*)
+		if [ -f "$state/allowed" ]; then
+			# FAKE_READ_FAIL ломает именно чтение пиеров: чтение allowed-ips
+			# остаётся рабочим, иначе фаза отверглась бы раньше и различие
+			# «пиеров нет» и «пиеров не прочитали» не было бы доказано.
+			if [ -f "$state/read_fail" ] || [ "${FAKE_READ_FAIL-0}" = 1 ]; then exit 1; fi
+			awk '{ print $1 }' "$state/allowed"
+			exit 0
+		fi
 		case "${FAKE_PEERS:-key}" in
 		error) exit 1 ;;
 		empty) exit 0 ;;
@@ -159,6 +270,10 @@ compose)
 		# отказ команды, и пустой вывод.
 		[ "${FAKE_NODE_LOG_FAIL:-0}" = 1 ] && exit 1
 		[ -n "${FAKE_NODE_LOG:-}" ] && printf '%s\n' "$FAKE_NODE_LOG"
+		# При недоступном API узел записывает отказ получения набора: фаза
+		# проверяет именно эту строку журнала, а не молчание контейнера.
+		[ -f "$state/api-down" ] && [ "${FAKE_API_LOG_NONE-0}" != 1 ] \
+			&& printf 'узел: получение желаемого набора не удалось\n'
 		exit 0 ;;
 	# Файл resolv.conf читается фазой dns построчно: подстановка даёт как
 	# резолвер узла, так и чужой адрес — проверка не должна проходить по инерции.
@@ -206,10 +321,17 @@ exit 0
 FAKE
 
 	# Подставной curl отвечает кодом и телом по имени файла-ответа: так
-	# управляющая логика лимита проверяется без настоящего API.
+	# управляющая логика лимита проверяется без настоящего API. В модели
+	# жизненного цикла ответы ещё и меняют желаемый набор: draining снимает
+	# пиеров, online возвращает, отзыв оставляет desired пустым.
 	cat > "$dir/bin/curl" <<'FAKE'
 #!/bin/sh
 printf 'curl %s\n' "$*" >> "$FAKE_LOG"
+state=$FAKE_STATE
+run=${FAKE_RUN-$state}
+# Применение события узлом откладывается на интервал опроса: событие
+# отражается на интерфейсе не раньше, чем агент успевает его заметить.
+arm() { printf '%s\n' "$(( $(cat "$state/secs") + ${FAKE_POLL_SECONDS:-3} ))" > "$state/poll_at"; }
 out=""
 while [ "$#" -gt 0 ]; do
 	if [ "$1" = "-o" ]; then out="$2"; shift 2; continue; fi
@@ -224,6 +346,53 @@ case "$out" in
 	code=${FAKE_LOGIN_CODE:-200}
 	if [ -n "${FAKE_LOGIN_BODY:-}" ]; then body=$FAKE_LOGIN_BODY; else
 		body='{"access_token":"e2e-access","refresh_token":"e2e-refresh"}'
+	fi
+	;;
+*admin-session*)
+	code=${FAKE_LOGIN_CODE:-200}
+	body='{"access_token":"e2e-admin","refresh_token":"e2e-refresh"}'
+	;;
+*rotate-created*)
+	code=${FAKE_ROTATE_CODE:-200}
+	body='{"id":"e2e-device-child"}'
+	;;
+*rotate-config*)
+	code=${FAKE_ROTATE_CONFIG_CODE:-200}
+	body="[Interface]
+Address = ${FAKE_ROTATE_CONFIG_ADDR-10.99.7.2/32}
+"
+	;;
+# Порядок веток важен: имя файла ответа возврата в online содержит «draining-resp»,
+# поэтому ветка online стоит выше ветки draining — иначе возврат применялся бы как
+# очередной draining, желаемый набор оставался пустым и пиер не возвращался.
+*online-after-draining-resp*)
+	code=${FAKE_ONLINE_CODE:-200}
+	body='{"id":"e2e-server-1","status":"online"}'
+	if [ -f "$state/allowed" ]; then
+		active=$(cat "$state/active")
+		if [ -n "$active" ]; then
+			printf '%s 10.99.7.2/32\n' "$active" > "$state/desired"
+		fi
+		arm
+	fi
+	;;
+*draining-resp*)
+	code=${FAKE_DRAINING_CODE:-200}
+	body='{"id":"e2e-server-1","status":"draining"}'
+	if [ -f "$state/allowed" ]; then
+		awk '$2 == "10.99.7.2/32" { print $1 }' "$state/allowed" > "$state/active"
+		: > "$state/desired"
+		arm
+	fi
+	;;
+*revoke-resp*)
+	code=${FAKE_REVOKE_CODE:-204}
+	body=''
+	if [ -f "$state/allowed" ]; then
+		: > "$state/desired"
+		: > "$state/revoke_at"
+		printf '%s\n' "$(( $(cat "$state/secs") + ${FAKE_REVOKE_DELAY:-3} ))" \
+			> "$state/poll_at"
 	fi
 	;;
 *device-4*)
@@ -270,10 +439,90 @@ FAKE
 
 	# Клиент завершает настройку через exec sleep infinity; подставной sleep
 	# возвращает управление, иначе проверка запуска висела бы до timeout.
+	# В модели жизненного цикла сон ещё и шагает часами: он доводит применение
+	# набора до интервала опроса узла и пишет строки наблюдения, поэтому
+	# фазовые ожидания отрабатывают оффлайн за секунды, а не за минуты.
 	cat > "$dir/bin/sleep" <<'FAKE'
 #!/bin/sh
 printf 'sleep %s\n' "$*" >> "$FAKE_LOG"
+state=$FAKE_STATE
+run=${FAKE_RUN-$state}
+if [ -f "$state/desired" ]; then
+	i=0
+	while [ "$i" -lt "${1:-0}" ]; do
+		i=$(( i + 1 ))
+		secs=$(( $(cat "$state/secs") + 1 ))
+		printf '%s\n' "$secs" > "$state/secs"
+		# Применение набора: узел опрашивает API раз в 25 с, модель — через
+		# заданный после события интервал. Сначала адрес переходит к новому
+		# ключу (старый ещё в списке, но без адреса), на следующем опросе
+		# старый снимается: так ведёт себя агент, увидевший handshake нового.
+		if [ -f "$state/poll_at" ] && [ "$secs" -ge "$(cat "$state/poll_at")" ]; then
+			rm -f "$state/poll_at"
+			case "$(cat "$state/stage")" in
+			handshake)
+				new=$(cat "$state/new_pub")
+				old=$(cat "$state/old_pub")
+				if [ "${FAKE_ADDRESS_STAYS_OLD-0}" = 1 ]; then
+					printf '%s 10.99.7.2/32\n%s 10.99.7.2/32\n' "$new" "$old" \
+						> "$state/desired"
+				else
+					printf '%s 10.99.7.2/32\n%s\n' "$new" "$old" > "$state/desired"
+				fi
+				printf 'dropold\n' > "$state/stage"
+				printf '%s\n' "$(( secs + ${FAKE_POLL_SECONDS:-3} ))" > "$state/poll_at"
+				;;
+			dropold)
+				if [ "${FAKE_ADDRESS_STAYS_OLD-0}" = 1 ]; then
+					printf '%s 10.99.7.2/32\n%s 10.99.7.2/32\n' "$new" "$old" \
+						> "$state/desired"
+				else
+					printf '%s 10.99.7.2/32\n' "$new" > "$state/desired"
+				fi
+				: > "$state/stage"
+				;;
+			esac
+			cp "$state/desired" "$state/allowed"
+			if grep -q '10.99.7.2/32' "$state/allowed"; then
+				rm -f "$state/down"
+			else
+				: > "$state/down"
+			fi
+		fi
+		if [ -f "$state/rows" ]; then
+			k=$(( $(cat "$state/rows") + 1 ))
+			printf '%s\n' "$k" > "$state/rows"
+			ts=$(( $(cat "$state/base") + k ))
+			if [ -f "$state/down" ]; then
+				printf 'fail %s\n' "$ts" >> "$run/ping.log"
+			else
+				printf 'ok %s\n' "$ts" >> "$run/ping.log"
+			fi
+		fi
+		# Момент остановки трафика фиксируется только после отзыва: отказ,
+		# случившийся раньше запроса, в измерение не входит.
+		if [ -f "$state/revoke_at" ] && [ -f "$state/down" ] && ! [ -e "$run/first_fail" ]; then
+			printf '%s\n' \
+				"$(( $(cat "$state/revoke_start") + secs - $(cat "$state/revoke_base")
+					+ ${FAKE_REVOKE_OFFSET:-0} ))" > "$run/first_fail"
+		fi
+	done
+fi
 exit 0
+FAKE
+
+	# Подставные часы: допущение ожидания сравнивает date +%s с дедлайном, а
+	# подставной сон возвращает управление сразу, поэтому без подмены часов
+	# провалившееся ожидание ползло бы по настоящим секундам. Часы идут только
+	# у прогонов с файлом secs (модель жизненного цикла), остальные остаются на
+	# настоящем date.
+	cat > "$dir/bin/date" <<'FAKE'
+#!/bin/sh
+if [ "$1" = '+%s' ] && [ -f "$FAKE_STATE/secs" ]; then
+	printf '%s\n' "$(( 1000 + $(cat "$FAKE_STATE/secs") ))"
+	exit 0
+fi
+exec /usr/bin/date "$@"
 FAKE
 
 	# Подставной sysctl успешен и пишет в журнал: иначе вызов sysctl из
@@ -773,6 +1022,7 @@ setup() { printf 'setup\n' >> "$PLAN_FILE"; }
 negative_control() { printf 'negative_control\n' >> "$PLAN_FILE"; }
 tunnel() { printf 'tunnel\n' >> "$PLAN_FILE"; }
 dns() { printf 'dns\n' >> "$PLAN_FILE"; }
+lifecycle() { printf 'lifecycle\n' >> "$PLAN_FILE"; }
 limit() { printf 'limit\n' >> "$PLAN_FILE"; }
 cleanup() { printf 'cleanup\n' >> "$PLAN_FILE"; }
 e2e_down() { printf 'e2e_down\n' >> "$PLAN_FILE"; }
@@ -797,12 +1047,13 @@ setup
 negative_control
 tunnel
 dns
+lifecycle
 limit
 cleanup
 EOF
 [ "$code" -eq 0 ] && diff -q "$dir/expected" "$dir/plan" >/dev/null \
 	&& [ "$(tail -n 1 "$dir/out")" = "ok   фаза all пройдена" ]
-check $? "фаза all: setup, negative_control, tunnel, dns, limit, cleanup (код $code)"
+check $? "фаза all: setup, negative_control, tunnel, dns, lifecycle, limit, cleanup (код $code)"
 
 # 22. Одиночная фаза dns идёт как setup, negative_control, tunnel, dns, cleanup.
 dir="$TMPROOT/plan-dns"; fake_tools "$dir"
@@ -832,6 +1083,20 @@ cleanup
 EOF
 [ "$code" -eq 0 ] && diff -q "$dir/expected" "$dir/plan" >/dev/null
 check $? "одиночная фаза limit: dns не вызывается, очистка на месте (код $code)"
+
+# 23a. Одиночная фаза lifecycle: тот же полный прогон, но без dns и limit.
+dir="$TMPROOT/plan-lifecycle"; fake_tools "$dir"
+phase_plan "$dir" "$dir/plan" lifecycle ''
+code=$?
+cat > "$dir/expected" <<'EOF'
+setup
+negative_control
+tunnel
+lifecycle
+cleanup
+EOF
+[ "$code" -eq 0 ] && diff -q "$dir/expected" "$dir/plan" >/dev/null
+check $? "одиночная фаза lifecycle: dns и limit не вызываются, контроль и очистка на месте (код $code)"
 
 # 24. Фаза tunnel осталась в прежнем составе: dns и limit к ней не добавлены.
 dir="$TMPROOT/plan-tunnel"; fake_tools "$dir"
@@ -884,6 +1149,28 @@ EOF
 [ "$code" -eq 0 ] && diff -q "$dir/expected" "$dir/plan" >/dev/null \
 	&& ! grep -q 'фаза окружения' "$dir/out"
 check $? "E2E_PHASE=limit принят и выполнен (код $code)"
+
+dir="$TMPROOT/plan-env-lifecycle"; fake_tools "$dir"
+phase_plan "$dir" "$dir/plan" '' lifecycle
+code=$?
+cat > "$dir/expected" <<'EOF'
+setup
+negative_control
+tunnel
+lifecycle
+cleanup
+EOF
+[ "$code" -eq 0 ] && diff -q "$dir/expected" "$dir/plan" >/dev/null \
+	&& ! grep -q 'фаза окружения' "$dir/out"
+check $? "E2E_PHASE=lifecycle принят и выполнен (код $code)"
+
+# 26a. Списки допустимых фаз в двух валидациях перечисляют lifecycle: иначе фаза
+# отвергается до прогона, а текст отказа остаётся прежним и вводит в заблуждение.
+grep -q 'all | tunnel | dns | limit | lifecycle) ;;' "$E2E" \
+	&& grep -q 'all | tunnel | dns | limit | lifecycle | down) ;;' "$E2E" \
+	&& grep -q 'допустимы all, tunnel, dns, limit, lifecycle)' "$E2E" \
+	&& grep -q 'допустимы all, tunnel, dns, limit, lifecycle, down)' "$E2E"
+check $? "lifecycle принята обеими валидациями и названа в текстах отказов"
 
 # 27. Образ клиента: без bind-tools нет dig, без tcpdump нет перехвата, и
 # проверка утечки молча проходила бы как пустая.
@@ -1261,6 +1548,312 @@ code=$?
 [ "$code" -ne 0 ] && grep -q 'FAIL' "$dir/out" \
 	&& ! [ -e "$dir/state-run/run/limit-login.json" ]
 check $? "сбой входа не оставляет файл тела входа (код $code)"
+
+# --- Задача 13: фаза жизненного цикла доступа ---
+#
+# Модель подставки: файл allowed — применённый набор на интерфейсе узла («ключ
+# адрес»), файл desired — то, что обещает API. Подставной сон шагает часами и
+# доводит применение до интервала опроса, ответы curl меняют desired: draining его
+# чистит, online возвращает активного пиера, отзыв снимает профиль. Файлы run
+# готовятся как после установки: сессии, пароли и идентификаторы сервера с
+# устройством.
+lifecycle_run() { # каталог
+	local dir=$1
+	local pub=${FAKE_LIFECYCLE_PUB:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+	local new_pub=${FAKE_NEW_PUB-$(printf 'B%.0s' {1..43})=}
+	mkdir -p "$dir/state-run/run"
+	printf 'e2e-offline-password\n' > "$dir/state-run/run/user.pass"
+	printf 'e2e-offline-password\n' > "$dir/state-run/run/admin.pass"
+	printf '{"id":"e2e-server-1"}\n' > "$dir/state-run/run/server-created.json"
+	printf '{"id":"e2e-device-1"}\n' > "$dir/state-run/run/device-created.json"
+	printf '%s 10.99.7.2/32\n' "$pub" > "$dir/state/desired"
+	cp "$dir/state/desired" "$dir/state/allowed"
+	printf '0\n' > "$dir/state/secs"
+	printf 'e1\n' > "$dir/state/etag"
+	: > "$dir/state/stage"
+	PATH="$dir/bin:$PATH" FAKE_LOG="$dir/log" FAKE_STATE="$dir/state" \
+	FAKE_RUN="$dir/state-run" FAKE_NEW_PUB="$new_pub" \
+	E2E_STATE_DIR="$dir/state-run" timeout 120 bash -c 'source "$0"; lifecycle' "$E2E" \
+		> "$dir/out" 2>&1
+}
+
+# 65. Фаза проходит целиком: все её утверждения напечатаны, оба замера (пауза при
+# смене ключа и время отзыва) названы числами, в выводе нет посторонних
+# предупреждений и дампов.
+dir="$TMPROOT/lifecycle-ok"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+[ "$code" -eq 0 ] \
+	&& grep -q '^ok   ротация ключа принята API' "$dir/out" \
+	&& grep -q '^ok   измеренная пауза при смене ключа: [0-9][0-9]* с (разрешение 1 с)$' \
+		"$dir/out" \
+	&& grep -q '^ok   адрес 10.99.7.2/32 у активного ключа, старый ключ без адреса' "$dir/out" \
+	&& grep -q '^ok   draining: узел снял всех пиеров' "$dir/out" \
+	&& grep -q '^ok   online: пиер и трафик вернулись' "$dir/out" \
+	&& grep -q '^ok   узел пережил отказ API' "$dir/out" \
+	&& grep -q '^ok   после рестарта узел применил тот же набор' "$dir/out" \
+	&& grep -q '^ok   отзыв применился за [0-9][0-9]* с$' "$dir/out" \
+	&& grep -q '^ok   отзыв уложился в критерий' "$dir/out" \
+	&& ! grep -qE 'Traceback|cat: [^ ]+: No such|line [0-9]+' "$dir/out"
+check $? "фаза lifecycle проходит на подставном стенде и печатает все доказательства (код $code)"
+
+# 66. Пауза — число из журнала наблюдения, а не из текста фазы: сумма отказов в
+# журнале совпадает с напечатанной паузой.
+dir="$TMPROOT/lifecycle-pause"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+printed=$(grep -m1 -oE 'пауза при смене ключа: [0-9]+' "$dir/out" | grep -oE '[0-9]+$')
+failed=$(grep -c '^fail' "$dir/state-run/ping.log")
+[ "$code" -eq 0 ] && [ -n "$printed" ] && [ "$printed" = "$failed" ] && [ "$failed" -gt 0 ]
+check $? "измеренная пауза равна числу отказов в журнале пингов (напечатано $printed, отказов $failed)"
+
+# 67. Отказ, если трафик после смены ключа не вернулся: разбор пингов даёт -1,
+# и фаза обязана отвергнуть прогон, а не напечатать паузу.
+dir="$TMPROOT/lifecycle-noresume"; fake_tools "$dir"
+FAKE_PAUSE_RESUME=0 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'трафик не вернулся после смены ключа' "$dir/out" \
+	&& ! grep -q 'измеренная пауза при смене ключа' "$dir/out"
+check $? "возврат трафика обязателен: без него фаза отвергнута (код $code)"
+
+# 68. Пустой журнал наблюдения — это не «нулевая пауза»: строк наблюдения нет,
+# и измерение не доказано.
+dir="$TMPROOT/lifecycle-emptylog"; fake_tools "$dir"
+FAKE_BG_EMPTY=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'пауза при смене ключа не измерена' "$dir/out"
+check $? "пустой журнал пингов даёт отдельный отказ (код $code)"
+
+# 69. Нечитаемый журнал пингов отличается от пустого: отказ называет файл, а фаза
+# не печатает паузу.
+dir="$TMPROOT/lifecycle-pingfail"; fake_tools "$dir"
+FAKE_PING_FAIL=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q '/state/ping.log' "$dir/out" \
+	&& ! grep -q 'измеренная пауза при смене ключа' "$dir/out"
+check $? "сбой чтения журнала пингов даёт отказ с путём файла (код $code)"
+
+# 70. Откреплённый запуск наблюдения не молчит: если exec -T -d не поднялся, фаза
+# обязана отвергнуть прогон, иначе пауза измерялась бы по чужому файлу.
+dir="$TMPROOT/lifecycle-bgfail"; fake_tools "$dir"
+FAKE_BG_FAIL=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'откреплённый запуск команды в контейнере клиента не удался' \
+	"$dir/out"
+check $? "неподнявшийся откреплённый запуск виден в отказе (код $code)"
+
+# 71. Ротация: ключ генерируется внутри клиента, запрос идёт с обязательным
+# Idempotency-Key, а приватная часть не попадает в вывод фазы.
+dir="$TMPROOT/lifecycle-rotate"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+[ "$code" -eq 0 ] \
+	&& grep -q 'exec -T client1 sh -c umask 077; wg genkey > /state/rotate.key' "$dir/log" \
+	&& grep -q 'Idempotency-Key: e2e-rotate-1' "$dir/state-run/run/rotate.hdr" \
+	&& grep -q 'e2e-privatesecret' "$dir/state-run/rotate.key" \
+	&& ! grep -q 'e2e-privatesecret' "$dir/out"
+check $? "новый ключ рождается в клиенте, запрос ротации с идемпотентным ключом, секрет не в выводе (код $code)"
+
+# 72. Отказ, когда API не принял ротацию: фаза не считает ключ смены состоявшимся.
+dir="$TMPROOT/lifecycle-rotate500"; fake_tools "$dir"
+FAKE_ROTATE_CODE=500 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'ротация ключа принята API: код 500' "$dir/out" \
+	&& ! grep -q 'измеренная пауза при смене ключа' "$dir/out"
+check $? "непринятая ротация даёт отказ (код $code)"
+
+# 73. Конфиг потомка обязан нести адрес: без него новый ключ не занимает адрес
+# предка и пауза измерялась бы по несуществующему подключению.
+dir="$TMPROOT/lifecycle-badaddr"; fake_tools "$dir"
+FAKE_ROTATE_CONFIG_ADDR=10.99.7.9/32 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'после ротации у нового ключа другой адрес' "$dir/out"
+check $? "конфиг потомка с чужим адресом даёт отказ (код $code)"
+
+# 74. Отзывы и проверки привязаны к идентификаторам: ротация идёт по родителю,
+# конфиг и отзыв — по потомку из ответа ротации.
+dir="$TMPROOT/lifecycle-ids"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+[ "$code" -eq 0 ] \
+	&& grep -q '/api/v1/devices/e2e-device-1/keys/rotate' "$dir/log" \
+	&& grep -q '/api/v1/devices/e2e-device-child/profiles/e2e-server-1/config' "$dir/log" \
+	&& grep -q '/api/v1/devices/e2e-device-child/profiles/e2e-server-1' "$dir/log"
+check $? "ротация по родителю, конфиг и отзыв по потомку (код $code)"
+
+# 75. Отказ, когда адрес остался у старого ключа: ядро отдаёт /32 одному пиеру, и
+# такой набор означает, что адрес не перешёл к активному ключу.
+dir="$TMPROOT/lifecycle-oldaddr"; fake_tools "$dir"
+FAKE_ADDRESS_STAYS_OLD=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'адрес остался у старого ключа' "$dir/out" \
+	&& ! grep -q 'старый ключ снят после того, как API увидел handshake нового' "$dir/out"
+check $? "адрес у старого ключа даёт отказ (код $code)"
+
+# 76. Эксклюзивность адреса доказывается разбором allowed-ips: активный ключ с
+# адресом, старый без адреса и затем снят.
+dir="$TMPROOT/lifecycle-exclusion"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+[ "$code" -eq 0 ] \
+	&& grep -q '^ok   адрес 10.99.7.2/32 у активного ключа, старый ключ без адреса' "$dir/out" \
+	&& grep -q '^ok   старый ключ снят после того, как API увидел handshake нового' "$dir/out" \
+	&& grep -q 'exec -T node1 wg show wg0 allowed-ips' "$dir/log"
+check $? "адрес у активного ключа, старый снят после handshake (код $code)"
+
+# 77. Draining: запрос под админской сессией, desired пуст, пиеры сняты, после
+# возврата в online трафик проходит.
+dir="$TMPROOT/lifecycle-draining"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+[ "$code" -eq 0 ] \
+	&& grep -q '/api/v1/admin/servers/e2e-server-1/maintenance' "$dir/log" \
+	&& grep -q 'Bearer e2e-admin' "$dir/state-run/run/admin.hdr" \
+	&& grep -q '^ok   сервер переведён в draining' "$dir/out" \
+	&& grep -q '^ok   сервер возвращён в online' "$dir/out" \
+	&& grep -q '^ok   draining: узел снял всех пиеров' "$dir/out" \
+	&& grep -q '^ok   online: пиер и трафик вернулись' "$dir/out"
+check $? "draining снимает пиеров и возвращается в online (код $code)"
+
+# 78. Отказ, когда draining не принят: узел не обязан ничего снимать, и ожидание
+# пустого набора не доказывает ничего.
+dir="$TMPROOT/lifecycle-draining409"; fake_tools "$dir"
+FAKE_DRAINING_CODE=409 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'сервер переведён в draining: код 409' "$dir/out" \
+	&& ! grep -q 'draining: узел снял всех пиеров' "$dir/out"
+check $? "непринятый draining даёт отказ (код $code)"
+
+# 79. Отказ API переживается: трафик идёт, пиеры на месте, узел записал в журнал
+# недоступность набора, а фаза не снимает контейнер API.
+dir="$TMPROOT/lifecycle-outage"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+seg=$(awk '/stop api/,/start api/' "$dir/log")
+[ "$code" -eq 0 ] \
+	&& [ -n "$seg" ] \
+	&& printf '%s\n' "$seg" | grep -q 'logs --no-color node1' \
+	&& printf '%s\n' "$seg" | grep -q 'exec -T client1 curl' \
+	&& printf '%s\n' "$seg" | grep -q 'exec -T node1 wg show wg0 peers' \
+	&& ! printf '%s\n' "$seg" | grep -Eq 'compose.*(down|rm)' \
+	&& grep -q '^ok   узел пережил отказ API' "$dir/out"
+check $? "отказ API: журнал прочитан, трафик и пиеры проверены, контейнер API не снят (код $code)"
+
+# 80. Отказ, когда узел не записал недоступность набора: молчание журнала — не
+# доказательство пережитого отказа.
+dir="$TMPROOT/lifecycle-nologline"; fake_tools "$dir"
+FAKE_API_LOG_NONE=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'узел не записал в журнал недоступность desired set' "$dir/out"
+check $? "журнал без записи о недоступности набора даёт отказ (код $code)"
+
+# 81. Отказ, когда трафик остановился при недоступном API: обещание «набор
+# сохраняется» нарушено.
+dir="$TMPROOT/lifecycle-outagedown"; fake_tools "$dir"
+FAKE_OUTAGE_DOWN=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'трафик остановился, пока API недоступен' "$dir/out"
+check $? "остановка трафика при отказе API даёт отказ (код $code)"
+
+# 82. Отказ, когда при недоступном API сняты пиеры: сохранность набора не доказана.
+dir="$TMPROOT/lifecycle-outagepeers"; fake_tools "$dir"
+FAKE_OUTAGE_PEERS=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'пиеры сняты, пока API недоступен' "$dir/out"
+check $? "снятые пиеры при отказе API дают отказ (код $code)"
+
+# 83. Рестарт узла: интерфейс пуст, набор применяется заново, ETag не меняется.
+dir="$TMPROOT/lifecycle-restart"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+[ "$code" -eq 0 ] \
+	&& grep -q ' restart node1' "$dir/log" \
+	&& grep -q '^ok   после рестарта узел применил тот же набор, хотя ETag не менялся' "$dir/out"
+check $? "после рестарта применён тот же набор (код $code)"
+
+# 84. ETag обязан совпасть: если набор на сервере менялся, проверка рестарта
+# измеряет уже не восстановление применённого набора.
+dir="$TMPROOT/lifecycle-etagchange"; fake_tools "$dir"
+FAKE_ETAG_CHANGES=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'ETag изменился' "$dir/out" \
+	&& ! grep -q 'после рестарта узел применил тот же набор' "$dir/out"
+check $? "изменившийся ETag даёт отказ (код $code)"
+
+# 85. Непрочитанное состояние узла — отдельный отказ: пустое значение до рестарта
+# совпало бы с пустым после и проверка прошла бы пустой.
+dir="$TMPROOT/lifecycle-etagfail"; fake_tools "$dir"
+FAKE_NODE_STATE='' lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'не удалось прочитать ETag набора узла до рестарта' "$dir/out"
+check $? "непрочитанное состояние узла даёт отказ (код $code)"
+
+# 86. ETag читается разбором JSON, а не шаблоном по тексту: в состоянии агента
+# значение записано с экранированными кавычками, и регулярка совпадала бы всегда.
+grep -qF 'json.load(sys.stdin)["applied"]["etag"]' "$E2E" \
+	&& ! grep -Eq 'state_etag\(\).*grep .*etag' "$E2E"
+check $? "ETag разбирается JSON-парсером, а не регуляркой"
+
+# 87. Отзыв профиля: DELETE принят с 204, пиер снят, трафик остановлен, а
+# измеренное время напечатано числом.
+dir="$TMPROOT/lifecycle-revoke"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+printed=$(grep -m1 -oE 'отзыв применился за [0-9]+' "$dir/out" | grep -oE '[0-9]+$')
+[ "$code" -eq 0 ] \
+	&& grep -qE 'X DELETE .*/api/v1/devices/e2e-device-child/profiles/e2e-server-1' "$dir/log" \
+	&& grep -q '^ok   профиль отозван' "$dir/out" \
+	&& [ -n "$printed" ] && [ "$printed" -le 30 ] \
+	&& grep -q '^ok   отзыв уложился в критерий' "$dir/out"
+check $? "отзыв применился и уложился в критерий (замерено ${printed} с, код $code)"
+
+# 88. Число вне критерия — отказ фазы: медленный отзыв не может быть засчитан как
+# успешный, и критерий остаётся работающей проверкой, а не декоративной строкой.
+dir="$TMPROOT/lifecycle-slowrevoke"; fake_tools "$dir"
+FAKE_REVOKE_DELAY=45 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'отзыв занял 4[0-9] с, критерий ≤ 30 с' "$dir/out" \
+	&& ! grep -q 'отзыв уложился в критерий' "$dir/out"
+check $? "отзыв дольше критерия отвергнут (код $code)"
+
+# 89. Отказ, зафиксированный до отзыва, в измерение не входит: иначе уже упавший
+# туннель выглядел бы мгновенным отзывом.
+dir="$TMPROOT/lifecycle-prefail"; fake_tools "$dir"
+FAKE_REVOKE_OFFSET=-45 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'момент остановки трафика опережает отзыв' "$dir/out"
+check $? "отказ до запроса отзыва даёт отдельный отказ (код $code)"
+
+# 90. Файл наблюдения без метки времени — не доказанный отзыв: фаза обязана
+# назвать причину, а не вычесть из пустого значения.
+dir="$TMPROOT/lifecycle-notimestamp"; fake_tools "$dir"
+FAKE_NO_TIMESTAMP=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'клиент не записал момент остановки трафика' "$dir/out" \
+	&& ! grep -q 'отзыв применился за' "$dir/out"
+check $? "пустая метка остановки даёт отказ (код $code)"
+
+# 91. Непрочитанное состояние пиеров не выдаётся за отсутствие пиеров: ожидание
+# обязано отказаться отдельно, а не считать набор пустым.
+dir="$TMPROOT/lifecycle-readfail"; fake_tools "$dir"
+FAKE_READ_FAIL=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'не удалось прочитать состояние пиеров узла' "$dir/out" \
+	&& ! grep -q 'draining: узел снял всех пиеров' "$dir/out"
+check $? "непрочитанное состояние пиеров даёт отдельный отказ (код $code)"
+
+# 92. Смена ключа не оставляет секрета в томе управления: заголовок запроса
+# закрыт для чужих читателей там, где файловая система хранит POSIX-режимы.
+dir="$TMPROOT/lifecycle-mode"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+mode_ok=1
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*) [ "$(stat -c %a "$dir/state-run/run/rotate.hdr")" = 600 ] || mode_ok=0 ;;
+esac
+[ "$code" -eq 0 ] && [ "$mode_ok" = 1 ] && ! grep -q 'e2e-privatesecret' "$dir/out"
+check $? "заголовок ротации закрыт, приватная часть вне вывода (код $code)"
 
 printf '%s\n' "проверок: $CASES, отказов: $FAILS"
 [ "$FAILS" -eq 0 ]

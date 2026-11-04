@@ -3,11 +3,12 @@
 # novavpn-e2e-runner, которому смонтированы исходники только для чтения, Docker
 # socket и защищённый том novavpn-e2e-control в /state.
 #
-# Фазы: all выполняет установку, контроль обхода, проверки туннеля, DNS и лимита
-# устройств; tunnel, dns и limit проходят тот же путь, но проверяют только своё
-# утверждение; down снимает только собственный стенд этого проекта. Неизвестная
-# фаза отвергается до любых обращений к Docker. На успехе стенд снимается, на
-# отказе остаётся для разбора; снять его можно только целью make e2e-down.
+# Фазы: all выполняет установку, контроль обхода, проверки туннеля, DNS,
+# жизненный цикл доступа и лимит устройств; tunnel, dns, limit и lifecycle проходят
+# тот же путь, но проверяют только своё утверждение; down снимает только собственный
+# стенд этого проекта. Неизвестная фаза отвергается до любых обращений к Docker. На
+# успехе стенд снимается, на отказе остаётся для разбора; снять его можно только
+# целью make e2e-down.
 set -uo pipefail
 umask 077
 
@@ -30,6 +31,8 @@ API=http://172.31.99.10:8080
 # свободный .99.2 — адрес узла, и создание узла падает с «Address already in
 # use». Остальные адреса сети перечислены в docker-compose.e2e.yml.
 ORCHESTRATOR_IP=172.31.99.4
+# NODE_STATE_FILE — файл состояния агента внутри контейнера узла (том node1-state).
+NODE_STATE_FILE=/var/lib/novavpn-node/state.json
 ATTACHED=0
 
 say() { printf '\n== %s\n' "$*"; }
@@ -96,6 +99,14 @@ node_exec() { compose exec -T node1 "$@"; }
 client_exec() { compose exec -T client1 "$@"; }
 node_run() { compose run --rm -T --no-deps node1 "$@"; }
 client_run() { compose run --rm -T --no-deps client1 "$@"; }
+
+# client_bg запускает команду в контейнере клиента откреплённо (exec -d): фоновое
+# наблюдение обязано пережить сессию запуска, а его отказ — быть различим.
+client_bg() { # текст команды для sh внутри контейнера
+	local rc=0
+	compose exec -d client1 sh -c "$1" >/dev/null || rc=$?
+	[ "$rc" -eq 0 ] || fail "откреплённый запуск команды в контейнере клиента не удался (код $rc)"
+}
 
 http_status() { # метод, адрес, файл-тела или -, файл-ответа, файл-заголовков или -
 	local method=$1 url=$2 body=$3 out=$4 hdr=$5
@@ -206,6 +217,67 @@ node_peer_present() { # публичный ключ клиента
 	local peers
 	peers=$(node_exec wg show wg0 peers) || return 2
 	printf '%s\n' "$peers" | grep -qx -- "$1"
+}
+
+# peer_address_owner печатает ключ пиера, которому выдан адрес: в WireGuard адрес
+# принадлежит одному пиеру. Код 1 — allowed-ips узла не прочитаны, пустой вывод при
+# коде 0 — адрес ни у кого.
+peer_address_owner() { # адрес
+	local list
+	list=$(node_exec wg show wg0 allowed-ips) || return 1
+	printf '%s\n' "$list" | awk -v a="$1" '$2 == a { print $1 }'
+}
+
+# peers_none, peers_at_least_one, peer_absent и peer_count различают исходы так же,
+# как node_peer_present: непрочитанный список не доказывает ни наличие, ни отсутствие
+# пиеров.
+peers_none() {
+	local peers
+	peers=$(node_exec wg show wg0 peers) || return 2
+	[ -z "$(printf '%s' "$peers" | tr -d '[:space:]')" ]
+}
+
+peers_at_least_one() {
+	local peers
+	peers=$(node_exec wg show wg0 peers) || return 2
+	printf '%s\n' "$peers" | grep -q .
+}
+
+peer_absent() { # публичный ключ клиента
+	local rc=0
+	node_peer_present "$1" || rc=$?
+	case "$rc" in
+	0) return 1 ;;
+	1) return 0 ;;
+	*) return 2 ;;
+	esac
+}
+
+peer_count() { # печатает число пиеров; код 1 — список не прочитан
+	local peers count
+	peers=$(node_exec wg show wg0 peers) || return 1
+	count=$(printf '%s\n' "$peers" | grep -c .) || count=0
+	printf '%s\n' "$count"
+}
+
+# wait_peer_state — ожидание с различимым кодом 2: непрочитанное состояние узла
+# даёт немедленный отдельный отказ, а не «за N с не выполнено».
+wait_peer_state() { # секунды, описание, команда...
+	local seconds=$1 what=$2
+	shift 2
+	local deadline=$(( $(date +%s) + seconds )) rc=0
+	while :; do
+		"$@" >/dev/null 2>&1
+		rc=$?
+		case "$rc" in
+		0) return 0 ;;
+		2) fail "не удалось прочитать состояние пиеров узла; ${what} не доказано" ;;
+		esac
+		if [ "$(date +%s)" -ge "$deadline" ]; then
+			fail "за ${seconds} с не выполнено: ${what}"
+		fi
+		sleep 2
+	done
 }
 probe_healthy_from_node() {
 	[ "$(node_exec wget -qO- -T 3 http://172.31.98.3:8080/healthz 2>/dev/null | tr -d '\r\n')" = "ok" ]
@@ -533,6 +605,15 @@ peer_allowed_ips() { # публичный ключ клиента
 	node_exec wg show wg0 allowed-ips | awk -v k="$1" '$1 == k { print $2 }'
 }
 
+# peer_holds_address — 0 адрес у ключа, 1 адрес другой или пуст, 2 allowed-ips не
+# прочитаны: именно код 2 нужен ожиданию, иначе сбой чтения выглядел бы как «адреса
+# ещё нет».
+peer_holds_address() { # публичный ключ клиента, адрес
+	local allowed
+	allowed=$(peer_allowed_ips "$1") || return 2
+	[ "$allowed" = "$2" ]
+}
+
 peer_handshake() { # публичный ключ клиента
 	node_exec wg show wg0 latest-handshakes | awk -v k="$1" '$1 == k { print $2 }'
 }
@@ -581,6 +662,20 @@ trigger_traffic() {
 		sleep 2
 	done
 	return 1
+}
+
+# proxy_egress печатает адрес egress из HTTP-запроса клиента к probe по имени либо
+# завершается не нулём, если сам запрос не выполнен.
+proxy_egress() {
+	client_exec curl -fsS --max-time 10 http://probe.e2e.test:8080/whoami | tr -d '\r\n'
+}
+
+# proxy_ok — тот же запрос с проверкой адреса; вердикт и формулировку отказа
+# печатает вызывающая фаза, поэтому туннель и жизненный цикл не расходятся.
+proxy_ok() {
+	local egress
+	egress=$(proxy_egress) || return 1
+	[ "$egress" = "172.31.98.2" ]
 }
 
 tunnel() {
@@ -646,7 +741,7 @@ tunnel() {
 	[ -n "${crx0:-}" ] && [ -n "${ctx0:-}" ] || fail "счётчики клиента не прочитаны"
 
 	local egress
-	egress=$(client_exec curl -fsS --max-time 10 http://probe.e2e.test:8080/whoami | tr -d '\r\n') ||
+	egress=$(proxy_egress) ||
 		fail "HTTP-запрос к probe через имя не выполнен"
 	[ "$egress" = "172.31.98.2" ] ||
 		fail "egress = $egress, ожидался адрес узла 172.31.98.2"
@@ -871,6 +966,235 @@ PY
 	ok "лимит 3: четвёртое устройство отклонено с device_limit_reached"
 }
 
+# ping_pause печатает паузу трафика в секундах: 0 — отказов не было, -1 — отказ был
+# и трафик не вернулся, 2 — строк наблюдения нет (пустой или нечитаемый журнал).
+ping_pause() { # файл журнала пингов
+	python3 - "$1" <<'PY'
+import sys
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    sys.exit(2)
+rows = [ln.split() for ln in lines if ln.strip()]
+if not rows:
+    sys.exit(2)
+first_fail = resume = None
+for row in rows:
+    if len(row) != 2 or not row[1].isdigit():
+        continue
+    state, ts = row[0], int(row[1])
+    if first_fail is None and state == "fail":
+        first_fail = ts
+    elif first_fail is not None and state == "ok":
+        resume = ts
+        break
+if first_fail is None:
+    print(0)
+elif resume is None:
+    print(-1)
+else:
+    print(resume - first_fail)
+PY
+}
+
+# node_state_etag печатает ETag применённого набора из состояния узла. Разбор —
+# JSON, а не регулярка: значение записано с экранированными кавычками, и шаблон по
+# "etag":"[^"]*" совпадал бы с префиксом всегда, то есть проверка была бы пустой.
+node_state_etag() {
+	local raw
+	raw=$(node_exec cat "$NODE_STATE_FILE") || return 1
+	printf '%s\n' "$raw" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin)["applied"]["etag"])
+except Exception:
+    sys.exit(2)'
+}
+
+# lifecycle проверяет обещания, которые иначе проверяют только временем: пауза при
+# смене ключа, эксклюзивность адреса, draining, отказ API, рестарт узла и отзыв не
+# дольше 30 с. Каждое измерение печатается числом, а число вне критерия — отказ фазы.
+lifecycle() {
+	# Access-токен живёт десять минут, а до этой фазы стоят контроль обхода, туннель
+	# и dns с лимитом, поэтому входится заново: draining и online идут под админской
+	# сессией, а ротация, конфиг и отзыв — под пользовательской. Тело входа
+	# собирается из файла пароля, а не из аргументов команды.
+	local status server_id device_id old_pub new_pub new_device pause
+	json_login user@e2e.test "$RUN_DIR/user.pass" "$RUN_DIR/lifecycle-login.json"
+	status=$(http_secret_post POST "$API/api/v1/auth/login" "$RUN_DIR/lifecycle-login.json" \
+		"$RUN_DIR/user-session.json") || fail "вход за свежей сессией жизненного цикла не выполнен"
+	expect_status "$status" 200 "свежая сессия жизненного цикла получена"
+	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/user.hdr"
+	json_login admin@e2e.test "$RUN_DIR/admin.pass" "$RUN_DIR/lifecycle-admin-login.json"
+	status=$(http_secret_post POST "$API/api/v1/admin/login" "$RUN_DIR/lifecycle-admin-login.json" \
+		"$RUN_DIR/admin-session.json") || fail "вход за свежей админской сессией не выполнен"
+	expect_status "$status" 200 "свежая админская сессия получена"
+	write_auth_header "$RUN_DIR/admin-session.json" "$RUN_DIR/admin.hdr"
+
+	# Идентификаторы setup живут в его локальных переменных, поэтому читаются из
+	# сохранённых ответов.
+	server_id=$(jget "$RUN_DIR/server-created.json" id) || fail "идентификатор сервера не прочитан"
+	device_id=$(jget "$RUN_DIR/device-created.json" id) || fail "идентификатор устройства не прочитан"
+
+	say "ротация: смена ключа на том же интерфейсе"
+	if ! old_pub=$(peer_address_owner '10.99.7.2/32'); then
+		fail "не удалось прочитать allowed-ips узла; владение адресом не доказано"
+	fi
+	[ -n "$old_pub" ] || fail "не найден старый ключ с адресом 10.99.7.2/32"
+	# Приватная половина остаётся в клиентском томе, наружу выходит только публичный
+	# ключ — по образцу device_register.
+	new_pub=$(client_exec sh -c \
+		'umask 077; wg genkey > /state/rotate.key; wg pubkey < /state/rotate.key' 2>/dev/null |
+		tr -d '\r\n') || fail "клиент не выдал ключ для ротации"
+	printf '%s\n' "$new_pub" | grep -Eq '^[A-Za-z0-9+/]{43}=$' ||
+		fail "клиент выдал некорректный публичный ключ для ротации"
+	python3 - "$new_pub" "$RUN_DIR/rotate.json" <<'PY'
+import json, sys
+with open(sys.argv[2], "w", encoding="utf-8") as f:
+    json.dump({"public_key": sys.argv[1]}, f)
+PY
+	chmod 600 "$RUN_DIR/rotate.json"
+	write_auth_header "$RUN_DIR/user-session.json" "$RUN_DIR/rotate.hdr" e2e-rotate-1
+	status=$(http_status POST "$API/api/v1/devices/$device_id/keys/rotate" \
+		"$RUN_DIR/rotate.json" "$RUN_DIR/rotate-created.json" "$RUN_DIR/rotate.hdr") ||
+		fail "запрос ротации ключа не выполнен"
+	expect_status "$status" 200 "ротация ключа принята API"
+	# Ответ ротации — устройство-потомок со своим идентификатором: с ним сверяется
+	# адрес и отзывается доступ дальше, а не с идентификатором предка.
+	new_device=$(jget "$RUN_DIR/rotate-created.json" id) ||
+		fail "ответ ротации не содержит идентификатора устройства-потомка"
+	status=$(http_status GET "$API/api/v1/devices/$new_device/profiles/$server_id/config" \
+		- "$RUN_DIR/rotate-config.conf" "$RUN_DIR/user.hdr") ||
+		fail "получение конфига потомка ротации не выполнено"
+	expect_status "$status" 200 "конфиг потомка ротации получен"
+	grep -q '^Address = 10\.99\.7\.2/32$' "$RUN_DIR/rotate-config.conf" ||
+		fail "после ротации у нового ключа другой адрес — профиль не унаследован"
+
+	# Наблюдение живёт до стоп-файла: exec -d отвязывает цикл от сессии запуска, а
+	# стоп-файл делает остановку детерминированной — никакого pkill по шаблону.
+	client_bg 'rm -f /state/ping.log /state/ping.stop
+while [ ! -e /state/ping.stop ]; do
+  if ping -c1 -W1 -q probe.e2e.test >/dev/null 2>&1; then
+    echo "ok $(date +%s)" >> /state/ping.log
+  else
+    echo "fail $(date +%s)" >> /state/ping.log
+  fi
+  sleep 1
+done'
+	sleep 3
+	client_exec sh -c 'wg set wg0 private-key /state/rotate.key' >/dev/null ||
+		fail "клиент не применил новый приватный ключ"
+	# 40 с: худший случай появления нового ключа на узле — 27,5 с (интервал 25 с плюс
+	# jitter) и первый handshake.
+	sleep 40
+	client_exec sh -c 'touch /state/ping.stop' >/dev/null || fail "не удалось остановить цикл пингов"
+	sleep 2
+	if ! client_exec cat /state/ping.log > "$RUN_DIR/ping.log"; then
+		fail "не удалось прочитать журнал пингов клиента: /state/ping.log в контейнере client1"
+	fi
+	if ! pause=$(ping_pause "$RUN_DIR/ping.log"); then
+		fail "пауза при смене ключа не измерена: в журнале пингов нет ни одной строки наблюдения"
+	fi
+	[ "$pause" != "-1" ] || fail "трафик не вернулся после смены ключа: возврата в журнале пингов нет"
+	printf 'ok   измеренная пауза при смене ключа: %s с (разрешение 1 с)\n' "$pause"
+
+	wait_peer_state 60 "новый ключ получил адрес 10.99.7.2/32" peer_holds_address "$new_pub" '10.99.7.2/32'
+	local old_allowed
+	old_allowed=$(peer_allowed_ips "$old_pub") ||
+		fail "не удалось прочитать allowed-ips узла; эксклюзивность адреса не доказана"
+	[ "$old_allowed" != "10.99.7.2/32" ] ||
+		fail "адрес остался у старого ключа: ядро отдаёт его только одному пиеру"
+	ok "адрес 10.99.7.2/32 у активного ключа, старый ключ без адреса"
+
+	wait_peer_state 120 "старый ключ снят после handshake нового" peer_absent "$old_pub"
+	ok "старый ключ снят после того, как API увидел handshake нового"
+
+	say "draining: desired пуст, пиеры сняты, возврат в online"
+	printf '{"status":"draining","reason":"стенд E2E: draining"}\n' > "$RUN_DIR/draining.json"
+	status=$(http_status POST "$API/api/v1/admin/servers/$server_id/maintenance" \
+		"$RUN_DIR/draining.json" "$RUN_DIR/draining-resp.json" "$RUN_DIR/admin.hdr") ||
+		fail "перевод сервера в draining не выполнен"
+	expect_status "$status" 200 "сервер переведён в draining"
+	wait_peer_state 60 "все пиеры сняты при draining" peers_none
+	ok "draining: узел снял всех пиеров"
+	printf '{"status":"online","reason":"стенд E2E: возврат из draining"}\n' > \
+		"$RUN_DIR/online-after-draining.json"
+	status=$(http_status POST "$API/api/v1/admin/servers/$server_id/maintenance" \
+		"$RUN_DIR/online-after-draining.json" "$RUN_DIR/online-after-draining-resp.json" \
+		"$RUN_DIR/admin.hdr") || fail "возврат сервера в online не выполнен"
+	expect_status "$status" 200 "сервер возвращён в online"
+	wait_peer_state 90 "пиер вернулся после online" peers_at_least_one
+	wait_for 90 "трафик вернулся после online" proxy_ok
+	ok "online: пиер и трафик вернулись"
+
+	say "отказ API: набор сохраняется, трафик не останавливается"
+	compose stop api >/dev/null || fail "не удалось остановить API"
+	# 35 с: больше худшего интервала опроса (27,5 с), чтобы узел успел записать
+	# недоступность desired set в журнал.
+	sleep 35
+	proxy_ok || fail "трафик остановился, пока API недоступен"
+	local count
+	if ! count=$(peer_count); then
+		fail "не удалось прочитать список пиеров узла; их сохранность при отказе API не доказана"
+	fi
+	[ "$count" -ge 1 ] || fail "пиеры сняты, пока API недоступен (пиеров: $count)"
+	local nodelog
+	if ! nodelog=$(compose logs --no-color node1 2>/dev/null); then
+		fail "не удалось прочитать журнал контейнера узла; запись о недоступности набора не доказана"
+	fi
+	printf '%s\n' "$nodelog" | grep -q 'получение желаемого набора не удалось' ||
+		fail "узел не записал в журнал недоступность desired set"
+	compose start api >/dev/null || fail "не удалось снова запустить API"
+	wait_for 90 "API снова отвечает" api_ready
+	ok "узел пережил отказ API: пиеров $count, трафик не прерывался"
+
+	say "рестарт узла: интерфейс пуст, набор применяется заново"
+	local etag_before etag_after
+	etag_before=$(node_state_etag) || fail "не удалось прочитать ETag набора узла до рестарта"
+	compose restart node1 >/dev/null || fail "рестарт контейнера узла не выполнен"
+	wait_peer_state 120 "пиер вернулся после рестарта узла" peers_at_least_one
+	wait_for 90 "трафик вернулся после рестарта узла" proxy_ok
+	etag_after=$(node_state_etag) || fail "не удалось прочитать ETag набора узла после рестарта"
+	[ -n "$etag_before" ] || fail "ETag до рестарта пуст: состояние узла не прочитано"
+	[ "$etag_before" = "$etag_after" ] ||
+		fail "ETag изменился ($etag_before → $etag_after): набор на сервере менялся, проверка не та"
+	ok "после рестарта узел применил тот же набор, хотя ETag не менялся"
+
+	say "отзыв: профиль снят, пиер уходит, трафик останавливается ≤ 30 с"
+	local revoked_at watch first_fail elapsed
+	# Отсчёт ведётся от момента запроса отзыва, и отказ, зафиксированный раньше, в
+	# измерение не входит: иначе уже упавший туннель выглядел бы мгновенным отзывом.
+	revoked_at=$(date +%s)
+	watch='rm -f /state/first_fail
+while [ ! -e /state/first_fail ]; do
+  if ! ping -c1 -W1 -q probe.e2e.test >/dev/null 2>&1; then
+    now=$(date +%s)
+    if [ "$now" -ge "$start" ]; then echo "$now" > /state/first_fail; fi
+  fi
+  sleep 1
+done'
+	client_bg "start=$revoked_at
+$watch"
+	status=$(http_status DELETE "$API/api/v1/devices/$new_device/profiles/$server_id" \
+		- "$RUN_DIR/revoke-resp.json" "$RUN_DIR/user.hdr") ||
+		fail "запрос отзыва профиля не выполнен"
+	expect_status "$status" 204 "профиль отозван"
+	wait_peer_state 120 "пиер снят после отзыва" peers_none
+	# 60 с, а не 30: ожидание лишь дожидается записи наблюдения, а критерий
+	# «≤ 30 с» проверяет измеренное число. При коротком ожидании отказ дольше 30 с
+	# отсекался бы раньше и сам критерий никогда не срабатывал.
+	wait_for 60 "ping зафиксировал остановку трафика" client_exec test -s /state/first_fail
+	if ! first_fail=$(client_exec cat /state/first_fail | tr -dc '0-9'); then
+		fail "не удалось прочитать момент остановки трафика: /state/first_fail в контейнере client1"
+	fi
+	[ -n "$first_fail" ] || fail "клиент не записал момент остановки трафика в /state/first_fail"
+	elapsed=$(( first_fail - revoked_at ))
+	printf 'ok   отзыв применился за %s с\n' "$elapsed"
+	[ "$elapsed" -ge 0 ] ||
+		fail "момент остановки трафика опережает отзыв (${elapsed} с): часы оркестратора и клиента расходятся"
+	[ "$elapsed" -le 30 ] || fail "отзыв занял ${elapsed} с, критерий ≤ 30 с"
+	ok "отзыв уложился в критерий"
+}
+
 cleanup() {
 	say "очистка собственного стенда"
 	release_self
@@ -944,16 +1268,16 @@ run_main() {
 		printf 'лишние аргументы; допустима одна фаза\n' >&2
 		exit 2
 	fi
-	# Позиционный аргумент принимает all, tunnel, dns, limit и down. Фаза из
-	# окружения, если задана, проверяется всегда и принимает all, tunnel, dns и
-	# limit: снятие стенда идёт исключительно через make e2e-down с его
-	# проверками тома и контейнеров.
+	# Позиционный аргумент принимает all, tunnel, dns, limit, lifecycle и down.
+	# Фаза из окружения, если задана, проверяется всегда и принимает all, tunnel,
+	# dns, limit и lifecycle: снятие стенда идёт исключительно через make e2e-down
+	# с его проверками тома и контейнеров.
 	local phase=${1:-}
 	if [ -n "${E2E_PHASE:-}" ]; then
 		case "$E2E_PHASE" in
-		all | tunnel | dns | limit) ;;
+		all | tunnel | dns | limit | lifecycle) ;;
 		*)
-			printf 'недопустимая фаза окружения: %s (допустимы all, tunnel, dns, limit)\n' \
+			printf 'недопустимая фаза окружения: %s (допустимы all, tunnel, dns, limit, lifecycle)\n' \
 				"${E2E_PHASE}" >&2
 			exit 2
 			;;
@@ -963,9 +1287,9 @@ run_main() {
 		phase=${E2E_PHASE:-all}
 	fi
 	case "$phase" in
-	all | tunnel | dns | limit | down) ;;
+	all | tunnel | dns | limit | lifecycle | down) ;;
 	*)
-		printf 'неизвестная фаза: %s (допустимы all, tunnel, dns, limit, down)\n' "$phase" >&2
+		printf 'неизвестная фаза: %s (допустимы all, tunnel, dns, limit, lifecycle, down)\n' "$phase" >&2
 		exit 2
 		;;
 	esac
@@ -977,11 +1301,16 @@ run_main() {
 	# туннель, сама проверка и очистка. Без контроля обхода и очистки фаза
 	# теряла бы и доказательство, и стенд.
 	case "$phase" in
+	# Фазы all идут в порядке setup, контроль обхода, туннель, DNS, жизненный
+	# цикл и лимит. Жизненный цикл впереди лимита, потому что он отзывает
+	# профиль устройства, созданного установкой: после отзыва счётчик активных
+	# устройств свободен, и лимит создаёт свои без конфликта с профилем.
 	all)
 		setup
 		negative_control
 		tunnel
 		dns
+		lifecycle
 		limit
 		cleanup
 		ok "фаза $phase пройдена"
@@ -998,6 +1327,14 @@ run_main() {
 		negative_control
 		tunnel
 		dns
+		cleanup
+		ok "фаза $phase пройдена"
+		;;
+	lifecycle)
+		setup
+		negative_control
+		tunnel
+		lifecycle
 		cleanup
 		ok "фаза $phase пройдена"
 		;;
