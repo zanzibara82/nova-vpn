@@ -1069,11 +1069,28 @@ PY
 	grep -q '^Address = 10\.99\.7\.2/32$' "$RUN_DIR/rotate-config.conf" ||
 		fail "после ротации у нового ключа другой адрес — профиль не унаследован"
 
+	# Адрес пробника разрешается один раз через dig: у форвардера стенда нет
+	# AAAA, а musl валит всё разрешение целиком (замер на стенде — 5,3 с «Try
+	# again» при исправном туннеле), поэтому пинг по имени проваливался бы
+	# независимо от состояния туннеля. Оба пинг-цикла ниже идут по адресу.
+	# Граница uplink-сети отсекает чужой ответ: пинг адреса вне стенда
+	# доказательством туннеля не был бы.
+	local probe_ip
+	probe_ip=$(client_exec dig +tries=1 +time=3 +noedns @10.99.7.1 probe.e2e.test 2>/dev/null |
+		tr -d '\r' | grep -oE 'IN[[:space:]]+A[[:space:]]+[0-9]+(\.[0-9]+){3}' |
+		tail -n 1 | awk '{print $NF}')
+	[ -n "$probe_ip" ] ||
+		fail "не удалось разрешить адрес пробника probe.e2e.test через резолвер узла"
+	case $probe_ip in
+	172.31.98.*) ;;
+	*) fail "адрес пробника $probe_ip вне uplink-сети стенда 172.31.98.0/24" ;;
+	esac
+
 	# Наблюдение живёт до стоп-файла: exec -d отвязывает цикл от сессии запуска, а
 	# стоп-файл делает остановку детерминированной — никакого pkill по шаблону.
 	client_bg 'rm -f /state/ping.log /state/ping.stop
 while [ ! -e /state/ping.stop ]; do
-  if ping -c1 -W1 -q probe.e2e.test >/dev/null 2>&1; then
+  if ping -c1 -W1 -q '"$probe_ip"' >/dev/null 2>&1; then
     echo "ok $(date +%s)" >> /state/ping.log
   else
     echo "fail $(date +%s)" >> /state/ping.log
@@ -1166,7 +1183,7 @@ done'
 	revoked_at=$(date +%s)
 	watch='rm -f /state/first_fail
 while [ ! -e /state/first_fail ]; do
-  if ! ping -c1 -W1 -q probe.e2e.test >/dev/null 2>&1; then
+  if ! ping -c1 -W1 -q '"$probe_ip"' >/dev/null 2>&1; then
     now=$(date +%s)
     if [ "$now" -ge "$start" ]; then echo "$now" > /state/first_fail; fi
   fi

@@ -1855,5 +1855,38 @@ esac
 [ "$code" -eq 0 ] && [ "$mode_ok" = 1 ] && ! grep -q 'e2e-privatesecret' "$dir/out"
 check $? "заголовок ротации закрыт, приватная часть вне вывода (код $code)"
 
+# 93. Наблюдение пингует адрес, а не имя: у форвардера стенда нет AAAA, и musl
+# валит всё разрешение целиком (замер на живом стенде — 5,3 с «Try again» при
+# исправном туннеле). Фаза обязана разрешить пробник через dig и пинговать
+# адрес в обоих циклах — наблюдении ротации и маркере отзыва.
+dir="$TMPROOT/lifecycle-resolve"; fake_tools "$dir"
+lifecycle_run "$dir"
+code=$?
+digs=$(grep -c 'dig +tries=1 +time=3 +noedns @10.99.7.1 probe.e2e.test' "$dir/log")
+pings=$(grep -c 'ping -c1 -W1 -q 172\.31\.98\.3' "$dir/log")
+[ "$code" -eq 0 ] && [ "$digs" -ge 1 ] && [ "$pings" -ge 2 ] \
+	&& ! grep -q 'ping -c1 -W1 -q probe\.e2e\.test' "$dir/log"
+check $? "пробник разрешён dig, оба пинг-цикла идут по адресу, имя не участвует (dig: $digs, ping: $pings, код $code)"
+
+# 94. Разрешение без A-ответа — громкий отказ до пингов, а не тихий возврат к
+# имени: пинг по имени на этом стенде проваливается всегда, и фаза обязана
+# остановиться, пока адрес не получен.
+dir="$TMPROOT/lifecycle-noresolve"; fake_tools "$dir"
+FAKE_DIG_TUNNEL_OUT=';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 51889' lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'не удалось разрешить адрес пробника' "$dir/out" \
+	&& ! grep -q 'ping -c1 -W1 -q' "$dir/log"
+check $? "разрешение без A-ответа даёт отказ до пингов (код $code)"
+
+# 95. Адрес пробника из чужой сети — отказ: подставной DNS может отдать что
+# угодно, и пинг чужого адреса выглядел бы доказательством туннеля.
+dir="$TMPROOT/lifecycle-strangeip"; fake_tools "$dir"
+FAKE_DIG_TUNNEL_OUT=';; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 51889
+probe.e2e.test.		0	IN	A	172.31.99.9' lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'вне uplink-сети стенда' "$dir/out" \
+	&& ! grep -q 'ping -c1 -W1 -q' "$dir/log"
+check $? "адрес пробника вне uplink-сети даёт отказ (код $code)"
+
 printf '%s\n' "проверок: $CASES, отказов: $FAILS"
 [ "$FAILS" -eq 0 ]
