@@ -47,7 +47,7 @@ docker-go-app = MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) \
 	-e NOVAVPN_REDIS_ADDR=$(REDIS_ADDR_INTEG) \
 	$(GO_IMAGE) go
 
-.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint ansible-lint unbound-check
+.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint ansible-lint unbound-check caddy-validate leakcheck
 unit:
 	$(docker-go) test -count=1 ./...
 
@@ -144,6 +144,17 @@ unbound-check:
 	    grep -qE "^[[:space:]]*log-local-actions:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
 	    grep -qE "^[[:space:]]*log-servfail:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
 	    unbound-checkconf /conf/unbound.conf'
+
+# Проверка конфигурации фронта без сети: сертификат здесь не выпускается.
+caddy-validate:
+	MSYS_NO_PATHCONV=1 docker run --rm \
+	  -v "$(CURDIR)/infrastructure/docker:/etc/caddy:ro" caddy:2.8.4-alpine \
+	  caddy validate --config /etc/caddy/Caddyfile.example --adapter caddyfile
+
+# Скрипт читает рабочее дерево через git, поэтому цель и запускается на хосте:
+# git и bash на этой машине есть, а в контейнере нет ни индекса git, ни дерева.
+leakcheck:
+	bash scripts/leakcheck.sh
 
 AGENT_VERSION ?= dev
 
