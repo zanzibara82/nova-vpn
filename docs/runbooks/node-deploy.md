@@ -81,9 +81,13 @@ ansible-playbook infrastructure/ansible/site.yml -e novavpn_node_enroll=false
 ## 7. Сервер и bootstrap-токен
 
 Администратор создаёт сервер с напечатанным ключом и выдаёт bootstrap-токен. Токен
-копируется на узел файлом `0600 root:root` (путь из `novavpn_node_bootstrap_file`,
-по умолчанию `/root/novavpn-bootstrap.token`), в инвентаре ставится
-`novavpn_node_enroll=true`. Токен одноразовый: повторная выдача — новый токен.
+копируется на узел файлом `0600 root:root` по пути из переменной
+`novavpn_node_bootstrap_file`. Значения по умолчанию у неё нет: в
+`roles/novavpn_node/defaults/main.yml` она перечислена среди обязательных без значения,
+а путь `/root/novavpn-bootstrap.token` стоит строкой в
+`infrastructure/ansible/inventory.example.ini` — то есть приходит из инвентаря, а не из
+роли, и менять его нужно там. В инвентаре ставится `novavpn_node_enroll=true`. Токен
+одноразовый: повторная выдача — новый токен.
 
 ## 8. Второй прогон
 

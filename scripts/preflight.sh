@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Запускается на целевом хосте от root до установки: проверяет хост, а не роль.
+# Нужны GNU coreutils (sort -V -C) и systemd (timedatectl): чужая ОС отвергается первой веткой case.
 set -euo pipefail
 FAIL=0
 ok()  { printf 'ok   %s\n' "$*"; }
 bad() { FAIL=1; printf 'FAIL %s\n' "$*" >&2; }
 
 [ "$(id -u)" -eq 0 ] || bad "нужен root"
-. /etc/os-release
+# Чтение защищено проверкой читаемости: без неё отсутствующий файл обрывал скрипт по
+# set -e молча, без строки причины, а это тот же класс отказа, что «нет команды dig».
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+else
+  bad "/etc/os-release не читается: дистрибутив не определён"
+fi
 case "${ID:-}" in
   debian|ubuntu) ok "ОС: ${PRETTY_NAME:-$ID}" ;;
   *) bad "ОС ${PRETTY_NAME:-неизвестна}: роль рассчитана на Debian/Ubuntu" ;;

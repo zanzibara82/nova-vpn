@@ -24,10 +24,18 @@ fi
 # скрипт создаёт и удавляет сам; это проверка восстановления дампа, а не секрет продукта.
 docker run -d --rm --name "$name" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=verify \
   postgres:17 >/dev/null
+# Ожидание базы с явным отказом: молчаливое истечение цикла уронило бы скрипт уже на
+# pg_restore и psql текстом контейнера, и по нему нельзя было бы отличить «база не
+# поднялась за 60 попыток» от «в дампе ошибка схемы».
+ready=no
 for _ in $(seq 1 60); do
-  docker exec "$name" pg_isready -U postgres -q && break
+  if docker exec "$name" pg_isready -U postgres -q >/dev/null 2>&1; then ready=yes; break; fi
   sleep 1
 done
+if [ "$ready" != yes ]; then
+  printf 'база не поднялась за 60 попыток: pg_isready не ответил, дамп не восстановлен\n' >&2
+  exit 1
+fi
 docker exec -i "$name" pg_restore -U postgres -d verify --no-owner --exit-on-error < "$dump"
 users=$(docker exec "$name" psql -U postgres -d verify -tAc 'select count(*) from users')
 servers=$(docker exec "$name" psql -U postgres -d verify -tAc 'select count(*) from vpn_servers')

@@ -119,6 +119,11 @@ ansible-lint:
 # Рендер шаблона реальным Jinja и проверка синтаксиса настоящим unbound-checkconf:
 # так «конфиг валиден» означает проверку, а не чтение глазами. Образ, версия
 # ansible-core и том кэша — общие с целью ansible-lint, чтобы цели не расходились.
+# Четыре grep перед проверкой синтаксиса — закрепки приватности §9.4: они держат
+# выключенными все режимы, которые заносят имена запросов в журнал (log-queries,
+# log-replies, log-local-actions, log-servfail). Синтаксически конфиг с любым из них
+# и со значением yes проходит unbound-checkconf, поэтому без grep цель осталась бы
+# зелёной при включённом журнале запросов.
 unbound-check:
 	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/work" \
 	  -v novavpn-pip-cache:/root/.cache/pip -w /work \
@@ -136,6 +141,8 @@ unbound-check:
 	    [ $$? -le 1 ] && \
 	    grep -qE "^[[:space:]]*log-queries:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
 	    grep -qE "^[[:space:]]*log-replies:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    grep -qE "^[[:space:]]*log-local-actions:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    grep -qE "^[[:space:]]*log-servfail:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
 	    unbound-checkconf /conf/unbound.conf'
 
 AGENT_VERSION ?= dev

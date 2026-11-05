@@ -1,3 +1,16 @@
+# systemd-resolved объявлен первым намеренно: порядок исполнения обработчиков при
+# meta: flush_handlers — по объявлению, а не по времени notify (замер
+# task-15fix-handler-order.log: уведомление пришло раньше, выполнение — позже). При
+# обратном порядке flush сначала перезапустил бы unbound с interface: 0.0.0.0 поверх
+# ещё занятого адреса 127.0.0.53:53, и правка порядка запуска не дала бы эффекта.
+- name: Перезапустить systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: restarted
+  # Хост без systemd-resolved: служба отсутствует, и это не отказ роли — drop-in к
+  # такому хосту не пишется, а notify до этого обработчика не доходит.
+  failed_when: false
+
 - name: Проверить конфигурацию unbound
   ansible.builtin.command: unbound-checkconf /etc/unbound/unbound.conf
   changed_when: false
@@ -8,9 +21,3 @@
     name: unbound
     state: restarted
   listen: Перезагрузить unbound
-
-- name: Перезапустить systemd-resolved
-  ansible.builtin.systemd:
-    name: systemd-resolved
-    state: restarted
-  failed_when: false
