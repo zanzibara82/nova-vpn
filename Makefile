@@ -1,4 +1,4 @@
-GO_IMAGE ?= golang:1.25-alpine
+GO_IMAGE ?= golang:1.26-alpine
 DB_IMAGE ?= postgres:17
 REDIS_IMAGE ?= redis:7
 API_IMAGE ?= redocly/cli:1.34.22
