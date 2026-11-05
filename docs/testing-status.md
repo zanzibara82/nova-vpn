@@ -64,7 +64,7 @@
 | Ворота по уязвимостям (инструментальный слой будущих целей 17): `govulncheck` v1.7.0 собирается на `golang:1.26-alpine` и после повышения `golang.org/x/net` не находит достижимых уязвимостей | `No vulnerabilities found.`, «0 vulnerabilities», код 0; 3 находки в требуемых модулях не вызываются кодом (`task-17a-vulncheck.log`) | одна команда внутри `golang:1.26-alpine` из раздела «Прогон A-3, задача 17a» |
 | Ворота форматирования: цель `fmt-check` ловит именно неотформатированный файл | зелёная — код 0 и пустой вывод; красная — временный неотформатированный `task17-red-fmt.go` уронил цель кодом 1, в выводе ровно одна строка с этим файлом (`task-17-red-fmt.log`, `task-17-green.log`) | `bash "$D/run-make.sh" fmt-check` |
 | Ворота workflow-файлов: цель `actionlint` ловит именно битый workflow | красная — копия заведомо битого workflow (job `broken` без `runs-on`) дала код 1 и ровно одну ошибку `[syntax-check]` на строке фикстуры при молчании про `ci.yml`; зелёная — код 0 и пустой вывод; объявленная метка `novavpn-e2e` описана в `.github/actionlint.yaml`, первый замер без этого файла — `task-17-actionlint-finding.log` (`task-17-red-actionlint.log`, `task-17-green.log`) | `bash "$D/run-make.sh" actionlint` |
-| Агрегат `lint` собирается из ровно шести целей и проходит на дереве | `make lint` — код 0: `vet` без вывода, `openapi.yaml: validated in 138ms`, `actionlint` молчит, `Passed: 0 failure(s), 0 warning(s) on 22 files`, `unbound-checkconf: no errors in /conf/unbound.conf`, `Valid configuration` (`task-17-green.log`) | `bash "$D/run-make.sh" lint` |
+| Агрегат `lint` собирается из ровно шести целей и проходит на дереве | `make lint` — код 0: `vet` без вывода, `openapi.yaml: validated`, `actionlint` молчит, `Passed: 0 failure(s), 0 warning(s) on 22 files`, `unbound-checkconf: no errors in /conf/unbound.conf`, `Valid configuration` (`task-17-green.log`) | `bash "$D/run-make.sh" lint` |
 | Ворота по уязвимостям как цель `vulncheck`: инструмент закреплён версией v1.7.0 | код 0, `No vulnerabilities found.` и строка «Your code is affected by 0 vulnerabilities»; отдельно 0 в импортируемых пакетах и 3 в требуемых модулях, которые код не вызывает (`task-17-green.log`) | `bash "$D/run-make.sh" vulncheck` |
 
 ## Последний прогон A-3, задача 8 — 2026-10-29
@@ -660,7 +660,7 @@ ansible-слоя от версии Go не зависят и в этом рау�
   "broken" [syntax-check]`, претензий к `ci.yml` нет (`task-17-red-actionlint.log`);
   после снятия фикстуры зелёный — код 0 и пустой вывод;
 - агрегат `lint` — код 0 по всем шести целям: `vet` без вывода,
-  `openapi.yaml: validated in 138ms`, `actionlint` без вывода, ansible-lint
+  `openapi.yaml: validated`, `actionlint` без вывода, ansible-lint
   `Passed: 0 failure(s), 0 warning(s) on 22 files` на профиле `production`,
   `unbound-checkconf: no errors in /conf/unbound.conf` при рендере 2818 байт, Caddy
   `Valid configuration` (`task-17-green.log`);
