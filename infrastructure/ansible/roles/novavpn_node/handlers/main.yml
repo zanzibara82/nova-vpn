@@ -1,5 +1,5 @@
 - name: Применить sysctl
-  ansible.builtin.command: sysctl --system
+  ansible.builtin.command: sysctl --load /etc/sysctl.d/90-novavpn.conf
   changed_when: true
 
 - name: Применить nftables

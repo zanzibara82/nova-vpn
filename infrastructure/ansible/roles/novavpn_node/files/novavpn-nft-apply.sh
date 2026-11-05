@@ -2,5 +2,16 @@
 # delete+add, а не только «nft -f»: повторный прогон с тем же шаблоном иначе
 # накапливал бы правила в таблице, и вторая копия NAT-правила осталась бы жить.
 set -euo pipefail
-nft delete table inet novavpn 2>/dev/null || true
+# Удаление проверяется, а не проглатывается: проглоченный сбой удаления (таблица
+# занята, не хватает прав, версия) догрузил бы правила второй копией в живую
+# таблицу. Поэтому таблица удаляется только если существует, и после удаления
+# явно проверяется, что её больше нет; настоящий сбой обрывает прогон до
+# загрузки нового набора.
+if nft list table inet novavpn >/dev/null 2>&1; then
+  nft delete table inet novavpn
+  if nft list table inet novavpn >/dev/null 2>&1; then
+    echo "таблица inet novavpn осталась после удаления" >&2
+    exit 1
+  fi
+fi
 nft -f /etc/novavpn-node/novavpn.nft

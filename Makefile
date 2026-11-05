@@ -2,6 +2,9 @@ GO_IMAGE ?= golang:1.25-alpine
 DB_IMAGE ?= postgres:17
 REDIS_IMAGE ?= redis:7
 API_IMAGE ?= redocly/cli:1.34.22
+ANSIBLE_IMAGE ?= python:3.12-slim
+ANSIBLE_CORE ?= 2.17.6
+ANSIBLE_LINT ?= 24.10.0
 
 # Хостовы порты dev-стека. Занятые по умолчанию — не гипотеза: на этой машине 5432
 # держит служба postgresql-x64-17, а 6379 — локальный redis, и connect с тестового
@@ -102,9 +105,13 @@ api-lint:
 
 # Статическая проверка без хоста: syntax-check всего playbook и линт роли.
 # Версии закреплены, чтобы «линт прошёл» не означало «прошёл на другой версии».
+# ANSIBLE_CONFIG задаёт файл настроек явно: ansible ищет его по переменной,
+# в текущем каталоге и системных путях, а цель бегает из корня репозитория.
 ansible-lint:
-	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/work" -w /work python:3.12-slim \
-	  sh -c 'pip install --quiet ansible-core==2.17.6 ansible-lint==24.10.0 && \
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/work" \
+	  -v novavpn-pip-cache:/root/.cache/pip -w /work \
+	  -e ANSIBLE_CONFIG=/work/infrastructure/ansible/ansible.cfg $(ANSIBLE_IMAGE) \
+	  sh -c 'pip install --quiet ansible-core==$(ANSIBLE_CORE) ansible-lint==$(ANSIBLE_LINT) && \
 	    ansible-playbook -i infrastructure/ansible/inventory.example.ini \
 	      infrastructure/ansible/site.yml --syntax-check && \
 	    ansible-lint infrastructure/ansible'

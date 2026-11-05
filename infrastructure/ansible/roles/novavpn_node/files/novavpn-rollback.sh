@@ -6,6 +6,11 @@ set -euo pipefail
 bin=/usr/local/bin/novavpn-node-agent
 if [ ! -x "$bin.prev" ]; then exit 0; fi
 if systemctl is-active --quiet novavpn-node-agent; then exit 0; fi
+# Неактивность не равна неудаче обновления: администратор мог остановить агент
+# осознанно. Краш виден по счётчику перезапусков systemd; при нуле перезапусков
+# считаем, что обновления не было, и выходим молча с кодом 0.
+restarts=$(systemctl show -p NRestarts --value novavpn-node-agent || true)
+if [ "${restarts:-0}" = "0" ]; then exit 0; fi
 systemctl stop novavpn-node-agent || true
 mv -f "$bin.prev" "$bin"
 systemctl start novavpn-node-agent

@@ -1,0 +1,15 @@
+# Гарантии роли (ip_forward, NAT, IPv6) должны действовать и после перезагрузки
+# узла: этот oneshot-юнит заново применяет свою таблицу при каждой загрузке,
+# до подготовки сети. Чужой /etc/nftables.conf не редактируется: правило
+# «не касаемся чужого набора» сильнее дешевизны.
+[Unit]
+Description=NovaVPN node apply own nftables table
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={{ novavpn_node_lib_dir }}/novavpn-nft-apply.sh
+
+[Install]
+WantedBy=multi-user.target

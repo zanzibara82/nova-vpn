@@ -1,7 +1,14 @@
 - name: Текущий бинарник на узле
   ansible.builtin.stat:
     path: "{{ novavpn_node_bin }}"
+    get_checksum: true
   register: node_bin_current
+
+- name: Нужен ли обмен бинарника
+  ansible.builtin.set_fact:
+    node_bin_update: >-
+      {{ not node_bin_current.stat.exists
+         or node_bin_current.stat.checksum != node_bin_src.stat.checksum }}
 
 - name: Сохранить предыдущий бинарник для отката
   ansible.builtin.copy:
@@ -19,6 +26,7 @@
     owner: root
     group: root
     mode: "0755"
+  when: node_bin_update | bool
 
 - name: Заменить бинарник
   ansible.builtin.copy:
@@ -27,11 +35,13 @@
     remote_src: true
     mode: "0755"
   register: node_bin_installed
+  when: node_bin_update | bool
 
 - name: Убрать временную копию
   ansible.builtin.file:
     path: "{{ novavpn_node_bin }}.new"
     state: absent
+  when: node_bin_update | bool
 
 - name: Включить агент в автозапуск
   ansible.builtin.systemd:
@@ -65,10 +75,16 @@
   until: node_active.ansible_facts.services.get('novavpn-node-agent.service', {}).state == 'running'
   retries: 20
   delay: 3
+  changed_when: false
   when: node_registration.stat.exists
 
 - name: Локальное состояние узла
   ansible.builtin.command: "{{ novavpn_node_bin }} status"
+  environment:
+    NOVAVPN_NODE_ENV: prod
+    NOVAVPN_NODE_API_URL: "{{ novavpn_node_api_url }}"
+    NOVAVPN_NODE_CA_FILE: "{{ novavpn_node_ca_file }}"
+    NOVAVPN_NODE_STATE_DIR: "{{ novavpn_node_state_dir }}"
   register: node_status
   changed_when: false
   when: node_registration.stat.exists

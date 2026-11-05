@@ -72,6 +72,7 @@
 - name: Исходный бинарник на управляющей машине
   ansible.builtin.stat:
     path: "{{ novavpn_node_binary_src }}"
+    get_checksum: true
   delegate_to: localhost
   become: false
   register: node_bin_src
@@ -112,3 +113,18 @@
     group: root
     mode: "0644"
   notify: Перезагрузить systemd
+
+- name: Юнит применения таблицы nftables при загрузке
+  ansible.builtin.template:
+    src: novavpn-nft-apply.service.j2
+    dest: /etc/systemd/system/novavpn-nft-apply.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Перезагрузить systemd
+
+- name: Включить юнит применения таблицы nftables
+  ansible.builtin.systemd:
+    name: novavpn-nft-apply
+    enabled: true
+    daemon_reload: true
