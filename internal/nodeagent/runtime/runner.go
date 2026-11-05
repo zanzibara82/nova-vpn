@@ -44,7 +44,6 @@ type Runner struct {
 	Applier            Applier
 	Store              Store
 	Log                *slog.Logger
-	Iface              string
 	Interval, TokenTTL time.Duration
 	Version            string
 	Now                func() time.Time
@@ -94,7 +93,8 @@ func (r *Runner) Step(ctx context.Context) error {
 		}
 		live, err = r.Applier.Snapshot()
 		if err != nil {
-			r.heartbeat(ctx, st, false)
+			r.reconciled = false
+			r.heartbeat(ctx, st, true)
 			return r.failure("получение снимка не удалось")
 		}
 	} else {
@@ -114,8 +114,9 @@ func (r *Runner) Step(ctx context.Context) error {
 		}
 		res, err := r.Applier.Apply(target)
 		if err != nil {
+			r.reconciled = false
 			r.failure("применение желаемого набора не удалось")
-			r.heartbeat(ctx, st, false)
+			r.heartbeat(ctx, st, true)
 			return nil
 		}
 		st.Applied = state.Applied{ConfigVersion: set.ConfigVersion, ETag: newETag, AppliedAt: r.Now().UTC(), Peers: len(set.Peers)}

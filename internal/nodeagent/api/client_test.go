@@ -203,6 +203,82 @@ func TestDesiredRejectsIncompleteSet(t *testing.T) {
 	}
 }
 
+func TestDesiredRejectsEveryAbsentRequiredField(t *testing.T) {
+	valid := map[string]any{
+		"server_id":      "s",
+		"config_version": 1,
+		"mtu":            1420,
+		"listen_port":    51820,
+		"tunnel_address": "10.99.0.1/24",
+		"dns_servers":    []string{"10.99.0.1"},
+		"keepalive_sec":  25,
+		"peers": []map[string]any{{"public_key": "k", "allowed_ips": []string{"10.99.0.2/32"},
+			"expires_at": "2026-11-27T10:00:00Z", "state": "active"}},
+		"measured_at": "2026-10-27T10:00:00Z",
+	}
+	for _, field := range []string{"server_id", "config_version", "mtu", "listen_port",
+		"tunnel_address", "dns_servers", "keepalive_sec", "peers", "measured_at"} {
+		field := field
+		t.Run(field, func(t *testing.T) {
+			body := make(map[string]any, len(valid))
+			for name, value := range valid {
+				body[name] = value
+			}
+			delete(body, field)
+			raw, err := json.Marshal(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"abc"`)
+				_, _ = w.Write(raw)
+			}))
+			defer srv.Close()
+			c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+			if _, _, _, err := c.Desired(context.Background(), "s", ""); err == nil {
+				t.Fatalf("ответ без обязательного поля %s принят как полный", field)
+			}
+		})
+	}
+}
+
+func TestDesiredDistinguishesAbsentPeersFromEmptyList(t *testing.T) {
+	prefix := `{"server_id":"s","config_version":1,"mtu":1420,"listen_port":51820,` +
+		`"tunnel_address":"10.99.0.1/24","dns_servers":["10.99.0.1"],"keepalive_sec":25,`
+	for _, tc := range []struct {
+		name    string
+		tail    string
+		drainOk bool
+	}{
+		{"нет поля peers", `"measured_at":"2026-10-27T10:00:00Z"}`, false},
+		{"peers равен null", `"peers":null,"measured_at":"2026-10-27T10:00:00Z"}`, false},
+		{"пустой массив peers законен", `"peers":[],"measured_at":"2026-10-27T10:00:00Z"}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("ETag", `"abc"`)
+				_, _ = w.Write([]byte(prefix + tc.tail))
+			}))
+			defer srv.Close()
+			c := mustClient(t, Config{BaseURL: srv.URL, Env: "dev", AllowInsecure: true})
+			set, _, _, err := c.Desired(context.Background(), "s", "")
+			if tc.drainOk {
+				if err != nil || len(set.Peers) != 0 {
+					t.Fatalf("набор без пиеров (draining) отвергнут: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ответ без peers принят и снял бы всех пиеров молча")
+			}
+			var se *StatusError
+			if errors.As(err, &se) {
+				t.Fatalf("отсутствие поля выдано за отказ сервера: %v", err)
+			}
+		})
+	}
+}
+
 func TestStatusErrorCarriesCode(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

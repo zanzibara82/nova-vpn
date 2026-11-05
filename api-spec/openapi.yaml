@@ -1175,8 +1175,9 @@ paths:
       summary: Heartbeat узла.
       description: >
         load1 и cpu_pct — nullable: неизмеренное не превращается в ноль (§13.4).
-        Свежесть heartbeat решает availability в каталоге: окно 90 с, три интервала
-        опроса по 30 с.
+        Свежесть heartbeat решает availability в каталоге: окно 90 с; интервал
+        опроса узла 25 с с разбросом 10 процентов (не больше 27,5 с), то есть
+        окно — примерно три с четвертью интервала в худшем случае.
       security: [{ nodeBearerAuth: [] }]
       requestBody:
         required: true

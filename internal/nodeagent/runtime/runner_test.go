@@ -71,7 +71,7 @@ func newFixture(t *testing.T) *fixture {
 		"new-peer": {PublicKey: "new-peer", RxBytes: 33, TxBytes: 44},
 	}}
 	f.rotated = api.NodeToken{ServerID: "node-a", NodeToken: generatedKey(t).String()}
-	f.r = Runner{API: f, Applier: f, Store: f, Iface: "wg0", Version: "test-version", Log: slog.New(slog.NewTextHandler(&f.logs, nil)), Now: func() time.Time { return f.now }}
+	f.r = Runner{API: f, Applier: f, Store: f, Version: "test-version", Log: slog.New(slog.NewTextHandler(&f.logs, nil)), Now: func() time.Time { return f.now }}
 	return f
 }
 
@@ -243,7 +243,7 @@ func TestStepRejectsUnconditional304(t *testing.T) {
 	}
 }
 
-func TestStepSnapshotFailureDoesNotReportZeros(t *testing.T) {
+func TestStepSnapshotFailureMarksStaleAndDropsETag(t *testing.T) {
 	f := newFixture(t)
 	f.stepOK(t)
 	st := f.st
@@ -254,8 +254,19 @@ func TestStepSnapshotFailureDoesNotReportZeros(t *testing.T) {
 		t.Fatal("отказ снимка скрыт")
 	}
 	traceIs(t, f, "load,token,desired,snapshot,heartbeat:node-a")
-	if len(f.reports) != 1 || f.st != st {
-		t.Fatal("отказ снимка изменил отчёт или состояние")
+	if len(f.reports) != 1 || f.st != st || f.r.reconciled {
+		t.Fatal("отказ снимка изменил отчёт или состояние либо оставил признак сходившегося набора")
+	}
+	heartbeatIs(t, f, 8, true, 0)
+	f.trace = nil
+	f.notModified = false
+	f.snapshotErr = nil
+	f.stepOK(t)
+	if f.requests[len(f.requests)-1].etag != "" {
+		t.Fatal("после отказа снимка запрос ушёл с ETag вместо полного набора")
+	}
+	if !slices.Contains(f.trace, "apply") || !f.r.reconciled {
+		t.Fatal("полный ответ после отказа снимка не пересобрал узел")
 	}
 	heartbeatIs(t, f, 8, false, 0)
 }
@@ -354,18 +365,14 @@ func TestStepApplyFailureDoesNotAcknowledgeNewETag(t *testing.T) {
 			f.applyErr = errors.New("apply failure")
 			f.stepOK(t)
 			traceIs(t, f, "load,token,desired,key,apply,heartbeat:node-a")
-			if f.st != st || len(f.reports) != reports || len(f.saved) != saves {
+			if f.st != st || len(f.reports) != reports || len(f.saved) != saves || f.r.reconciled {
 				t.Fatal("отказ применения подтверждён как успех")
 			}
-			heartbeatIs(t, f, st.Applied.ConfigVersion, false, 0)
+			heartbeatIs(t, f, st.Applied.ConfigVersion, true, 0)
 			f.applyErr = nil
 			f.stepOK(t)
-			want := ""
-			if warm {
-				want = "etag-8"
-			}
-			if f.requests[len(f.requests)-1].etag != want {
-				t.Fatal("запрошен ETag неприменённого набора")
+			if f.requests[len(f.requests)-1].etag != "" {
+				t.Fatal("отказ применения оставил ETag: следующий цикл обязан идти без условного запроса")
 			}
 		})
 	}

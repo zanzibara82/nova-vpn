@@ -133,8 +133,8 @@ func (c *Client) Desired(ctx context.Context, serverID, etag string) (DesiredSet
 	if etag != "" {
 		header = http.Header{"If-None-Match": []string{etag}}
 	}
-	var out DesiredSet
-	status, respHeader, err := c.do(ctx, http.MethodGet, "/internal/v1/nodes/"+url.PathEscape(serverID)+"/desired", nil, &out, c.token, header)
+	var wire desiredWire
+	status, respHeader, err := c.do(ctx, http.MethodGet, "/internal/v1/nodes/"+url.PathEscape(serverID)+"/desired", nil, &wire, c.token, header)
 	if err != nil {
 		return DesiredSet{}, "", false, err
 	}
@@ -145,18 +145,9 @@ func (c *Client) Desired(ctx context.Context, serverID, etag string) (DesiredSet
 	if status != http.StatusOK {
 		return DesiredSet{}, "", false, &StatusError{Status: status}
 	}
-	var missing []string
-	if out.ServerID == "" {
-		missing = append(missing, "server_id")
-	}
-	if out.TunnelAddress == "" {
-		missing = append(missing, "tunnel_address")
-	}
-	if out.MeasuredAt.IsZero() {
-		missing = append(missing, "measured_at")
-	}
-	if len(missing) > 0 {
-		return DesiredSet{}, "", false, fmt.Errorf("api: неполный набор: нет %s", strings.Join(missing, ", "))
+	out, err := wire.toDesiredSet()
+	if err != nil {
+		return DesiredSet{}, "", false, err
 	}
 	return out, newETag, false, nil
 }
@@ -276,6 +267,63 @@ type DesiredSet struct {
 	KeepaliveSec  int           `json:"keepalive_sec"`
 	Peers         []DesiredPeer `json:"peers"`
 	MeasuredAt    time.Time     `json:"measured_at"`
+}
+
+// desiredWire — контрактная форма desired-ответа: указатель на каждое обязательное
+// поле, чтобы отличить отсутствие поля от его законного значения. Пустой массив
+// peers допустим (draining), а отсутствующий или null peers снял бы всех пиеров
+// молча, поэтому он — ошибка ответа. Проверяются все девять полей, которые
+// объявлены обязательными в api-spec/openapi.yaml (схема DesiredSet).
+type desiredWire struct {
+	ServerID      *string        `json:"server_id"`
+	ConfigVersion *int64         `json:"config_version"`
+	MTU           *int           `json:"mtu"`
+	ListenPort    *int           `json:"listen_port"`
+	TunnelAddress *string        `json:"tunnel_address"`
+	DNSServers    *[]string      `json:"dns_servers"`
+	KeepaliveSec  *int           `json:"keepalive_sec"`
+	Peers         *[]DesiredPeer `json:"peers"`
+	MeasuredAt    *time.Time     `json:"measured_at"`
+}
+
+func (w desiredWire) toDesiredSet() (DesiredSet, error) {
+	var missing []string
+	if w.ServerID == nil || *w.ServerID == "" {
+		missing = append(missing, "server_id")
+	}
+	if w.ConfigVersion == nil {
+		missing = append(missing, "config_version")
+	}
+	if w.MTU == nil {
+		missing = append(missing, "mtu")
+	}
+	if w.ListenPort == nil {
+		missing = append(missing, "listen_port")
+	}
+	if w.TunnelAddress == nil || *w.TunnelAddress == "" {
+		missing = append(missing, "tunnel_address")
+	}
+	if w.DNSServers == nil {
+		missing = append(missing, "dns_servers")
+	}
+	if w.KeepaliveSec == nil {
+		missing = append(missing, "keepalive_sec")
+	}
+	if w.Peers == nil {
+		missing = append(missing, "peers")
+	}
+	if w.MeasuredAt == nil || w.MeasuredAt.IsZero() {
+		missing = append(missing, "measured_at")
+	}
+	if len(missing) > 0 {
+		return DesiredSet{}, fmt.Errorf("api: неполный набор: нет %s", strings.Join(missing, ", "))
+	}
+	return DesiredSet{
+		ServerID: *w.ServerID, ConfigVersion: *w.ConfigVersion, MTU: *w.MTU,
+		ListenPort: *w.ListenPort, TunnelAddress: *w.TunnelAddress,
+		DNSServers: *w.DNSServers, KeepaliveSec: *w.KeepaliveSec,
+		Peers: *w.Peers, MeasuredAt: *w.MeasuredAt,
+	}, nil
 }
 
 type DesiredPeer struct {

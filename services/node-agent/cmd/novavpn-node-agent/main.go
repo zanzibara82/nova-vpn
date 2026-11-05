@@ -208,7 +208,7 @@ func (c command) runNode(ctx context.Context, cfg config, store *state.Store, cl
 	applier := &wg.Applier{Link: wg.Netlink{}, Device: device, Iface: cfg.Iface}
 	runner := &runtime.Runner{
 		API: client, Applier: applier, Store: store,
-		Iface: cfg.Iface, Interval: cfg.Interval, TokenTTL: 24 * time.Hour,
+		Interval: cfg.Interval, TokenTTL: 24 * time.Hour,
 		Version: version, Now: time.Now, Log: slog.New(slog.NewJSONHandler(c.stderr, nil)),
 	}
 	if err := c.runLoop(ctx, runner); err != nil && !errors.Is(err, context.Canceled) {

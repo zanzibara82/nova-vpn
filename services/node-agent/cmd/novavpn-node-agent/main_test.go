@@ -610,7 +610,7 @@ func TestRunWiresRealComponentsAndClosesDevice(t *testing.T) {
 		if _, ok := r.API.(*api.Client); !ok {
 			t.Fatal("клиент API подменён")
 		}
-		if r.Iface != "wg9" || r.Interval != 3*time.Second || r.TokenTTL != 24*time.Hour || r.Version != version || r.Now == nil || r.Log == nil {
+		if r.Interval != 3*time.Second || r.TokenTTL != 24*time.Hour || r.Version != version || r.Now == nil || r.Log == nil {
 			t.Fatal("цикл собран не полностью")
 		}
 		before := time.Now()
