@@ -47,7 +47,7 @@ docker-go-app = MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) \
 	-e NOVAVPN_REDIS_ADDR=$(REDIS_ADDR_INTEG) \
 	$(GO_IMAGE) go
 
-.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint ansible-lint
+.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint ansible-lint unbound-check
 unit:
 	$(docker-go) test -count=1 ./...
 
@@ -115,6 +115,28 @@ ansible-lint:
 	    ansible-playbook -i infrastructure/ansible/inventory.example.ini \
 	      infrastructure/ansible/site.yml --syntax-check && \
 	    ansible-lint infrastructure/ansible'
+
+# Рендер шаблона реальным Jinja и проверка синтаксиса настоящим unbound-checkconf:
+# так «конфиг валиден» означает проверку, а не чтение глазами. Образ, версия
+# ansible-core и том кэша — общие с целью ansible-lint, чтобы цели не расходились.
+unbound-check:
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/work" \
+	  -v novavpn-pip-cache:/root/.cache/pip -w /work \
+	  -e ANSIBLE_CONFIG=/work/infrastructure/ansible/ansible.cfg $(ANSIBLE_IMAGE) \
+	  sh -c 'pip install --quiet ansible-core==$(ANSIBLE_CORE) && mkdir -p .scratch && \
+	    ansible localhost -c local -m ansible.builtin.template \
+	      -a "src=/work/infrastructure/ansible/roles/unbound/templates/unbound.conf.j2 dest=/work/.scratch/unbound.rendered.conf" \
+	      -e @/work/infrastructure/ansible/roles/unbound/defaults/main.yml \
+	      -e novavpn_node_pool=10.99.7.0/24'
+	MSYS_NO_PATHCONV=1 docker run --rm \
+	  -v "$(CURDIR)/.scratch/unbound.rendered.conf:/conf/unbound.conf:ro" alpine:3.20 \
+	  sh -c 'apk add --no-cache unbound >/dev/null && \
+	    mkdir -p /var/lib/unbound && \
+	    unbound-anchor -a /var/lib/unbound/root.key; \
+	    [ $$? -le 1 ] && \
+	    grep -qE "^[[:space:]]*log-queries:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    grep -qE "^[[:space:]]*log-replies:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    unbound-checkconf /conf/unbound.conf'
 
 AGENT_VERSION ?= dev
 

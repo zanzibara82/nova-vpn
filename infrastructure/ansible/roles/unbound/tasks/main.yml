@@ -1,0 +1,85 @@
+- name: Пакет unbound
+  ansible.builtin.apt:
+    name: unbound
+    state: present
+    update_cache: true
+
+- name: Каталог доверенного ключа DNSSEC
+  ansible.builtin.file:
+    path: /var/lib/unbound
+    state: directory
+    owner: unbound
+    group: unbound
+    mode: "0755"
+
+- name: Начальный файл доверенного ключа
+  ansible.builtin.command: unbound-anchor -a /var/lib/unbound/root.key
+  args:
+    creates: /var/lib/unbound/root.key
+  register: unbound_anchor
+  # Код 1 — «якорь записан», а не отказ: проверено на alpine:3.20 с unbound 1.20,
+  # первый вызов вернул 1 и оставил валидный root.key, повторный — 0. Модуль command
+  # считает любой непустой код ошибкой, и без failed_when роль падала бы на первом
+  # прогоне при уже созданном файле.
+  failed_when: unbound_anchor.rc not in [0, 1]
+  changed_when: unbound_anchor.rc == 1
+
+- name: Якорь DNSSEC на месте
+  ansible.builtin.stat:
+    path: /var/lib/unbound/root.key
+  register: unbound_anchor_file
+
+- name: Без якоря валидация DNSSEC не поднимется
+  ansible.builtin.assert:
+    that:
+      - unbound_anchor_file.stat.exists
+      - unbound_anchor_file.stat.size > 0
+    fail_msg: "unbound-anchor не создал /var/lib/unbound/root.key"
+
+- name: Отключить stub-резолвер systemd (он занимает 127.0.0.53:53)
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/novavpn-no-stub.conf
+    content: |
+      [Resolve]
+      DNSStubListener=no
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Перезапустить systemd-resolved
+
+- name: Тип файла resolv.conf
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: false
+  register: unbound_resolv
+
+- name: Убрать символическую ссылку resolv.conf
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    state: absent
+  when: unbound_resolv.stat.islnk | default(false)
+
+- name: Резолвер хоста — собственный unbound
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    content: |
+      nameserver 127.0.0.1
+      options edns0 trust-ad
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Конфигурация unbound
+  ansible.builtin.template:
+    src: unbound.conf.j2
+    dest: /etc/unbound/unbound.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Перезагрузить unbound
+
+- name: Служба unbound
+  ansible.builtin.systemd:
+    name: unbound
+    enabled: true
+    state: started

@@ -1,0 +1,16 @@
+- name: Проверить конфигурацию unbound
+  ansible.builtin.command: unbound-checkconf /etc/unbound/unbound.conf
+  changed_when: false
+  listen: Перезагрузить unbound
+
+- name: Перезапустить unbound
+  ansible.builtin.systemd:
+    name: unbound
+    state: restarted
+  listen: Перезагрузить unbound
+
+- name: Перезапустить systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: restarted
+  failed_when: false
