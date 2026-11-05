@@ -1,0 +1,34 @@
+- name: Состояние узла
+  ansible.builtin.stat:
+    path: "{{ novavpn_node_state_dir }}/state.json"
+  register: node_state
+
+- name: Показать публичный ключ для создания сервера
+  ansible.builtin.command: "{{ novavpn_node_bin }} init"
+  become: true
+  become_user: "{{ novavpn_node_user }}"
+  register: node_init
+  changed_when: false
+  when: not node_state.stat.exists
+
+- name: Публичный ключ узла
+  ansible.builtin.debug:
+    msg: "{{ node_init.stdout_lines }}"
+  when: not node_state.stat.exists
+
+- name: Прочитать bootstrap-токен
+  ansible.builtin.slurp:
+    src: "{{ novavpn_node_bootstrap_file }}"
+  register: node_bootstrap
+  no_log: true
+  when: not node_state.stat.exists and novavpn_node_enroll | bool
+
+- name: Зарегистрировать узел токеном из stdin
+  ansible.builtin.command:
+    cmd: "{{ novavpn_node_bin }} enroll"
+    stdin: "{{ node_bootstrap.content | b64decode }}"
+    creates: "{{ novavpn_node_state_dir }}/state.json"
+  become: true
+  become_user: "{{ novavpn_node_user }}"
+  no_log: true
+  when: not node_state.stat.exists and novavpn_node_enroll | bool

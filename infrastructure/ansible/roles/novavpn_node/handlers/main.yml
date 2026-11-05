@@ -1,0 +1,11 @@
+- name: Применить sysctl
+  ansible.builtin.command: sysctl --system
+  changed_when: true
+
+- name: Применить nftables
+  ansible.builtin.command: "{{ novavpn_node_lib_dir }}/novavpn-nft-apply.sh"
+  changed_when: true
+
+- name: Перезагрузить systemd
+  ansible.builtin.systemd:
+    daemon_reload: true

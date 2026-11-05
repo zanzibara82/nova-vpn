@@ -1,0 +1,114 @@
+- name: Пути совпадают с вписанными в скрипты и юнит
+  ansible.builtin.assert:
+    that:
+      - novavpn_node_bin == '/usr/local/bin/novavpn-node-agent'
+      - novavpn_node_config_dir == '/etc/novavpn-node'
+      - novavpn_node_state_dir == '/var/lib/novavpn-node'
+      - novavpn_node_lib_dir == '/usr/local/lib/novavpn'
+    fail_msg: >-
+      эти пути повторены в novavpn-rollback.sh, novavpn-nft-apply.sh и в юните
+      (StateDirectory=novavpn-node); менять их только вместе с файлами роли
+
+- name: Пакеты
+  ansible.builtin.apt:
+    name: [ca-certificates, nftables, procps, wireguard-tools]
+    state: present
+    update_cache: true
+
+- name: Группа узла
+  ansible.builtin.group:
+    name: "{{ novavpn_node_user }}"
+    system: true
+
+- name: Пользователь узла без входа в систему
+  ansible.builtin.user:
+    name: "{{ novavpn_node_user }}"
+    group: "{{ novavpn_node_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+    home: "{{ novavpn_node_state_dir }}"
+
+- name: Каталоги конфигурации, состояния и скриптов
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: "{{ novavpn_node_config_dir }}", owner: root, group: root, mode: "0750"}
+    - {path: "{{ novavpn_node_state_dir }}", owner: "{{ novavpn_node_user }}", group: "{{ novavpn_node_user }}", mode: "0700"}
+    - {path: "{{ novavpn_node_lib_dir }}", owner: root, group: root, mode: "0755"}
+
+- name: Файл sysctl
+  ansible.builtin.template:
+    src: 90-novavpn.conf.j2
+    dest: /etc/sysctl.d/90-novavpn.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Применить sysctl
+
+- name: Таблица nftables
+  ansible.builtin.template:
+    src: novavpn.nft.j2
+    dest: "{{ novavpn_node_config_dir }}/novavpn.nft"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: Применить nftables
+
+- name: Скрипты применения nft и отката
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ novavpn_node_lib_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [novavpn-nft-apply.sh, novavpn-rollback.sh]
+  notify: Применить nftables
+
+- name: Исходный бинарник на управляющей машине
+  ansible.builtin.stat:
+    path: "{{ novavpn_node_binary_src }}"
+  delegate_to: localhost
+  become: false
+  register: node_bin_src
+
+- name: Без бинарника регистрация невозможна
+  ansible.builtin.assert:
+    that: node_bin_src.stat.exists
+    fail_msg: "нет файла {{ novavpn_node_binary_src }} (соберите make node-image или cross-build)"
+
+- name: Бинарник агента на узле
+  ansible.builtin.stat:
+    path: "{{ novavpn_node_bin }}"
+  register: node_bin_dst
+
+- name: Первый бинарник агента
+  ansible.builtin.copy:
+    src: "{{ novavpn_node_binary_src }}"
+    dest: "{{ novavpn_node_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+  when: not node_bin_dst.stat.exists
+
+- name: Окружение агента
+  ansible.builtin.template:
+    src: agent.env.j2
+    dest: "{{ novavpn_node_config_dir }}/agent.env"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Перезагрузить systemd
+
+- name: Юнит агента
+  ansible.builtin.template:
+    src: novavpn-node.service.j2
+    dest: /etc/systemd/system/novavpn-node-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Перезагрузить systemd

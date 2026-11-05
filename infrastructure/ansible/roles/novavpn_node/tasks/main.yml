@@ -1,0 +1,23 @@
+- name: Проверить обязательные переменные и запрет http
+  ansible.builtin.assert:
+    that:
+      - novavpn_node_api_url is defined
+      - novavpn_node_pool is defined
+      - novavpn_node_uplink_iface is defined
+      - novavpn_node_binary_src is defined
+      - novavpn_node_api_url is match('^https://')
+    fail_msg: >-
+      нужны novavpn_node_api_url (только https), novavpn_node_pool,
+      novavpn_node_uplink_iface, novavpn_node_binary_src
+
+- name: Пакеты, каталоги, sysctl, nftables, юнит, первый бинарник
+  ansible.builtin.import_tasks: install.yml
+
+- name: Применить sysctl и nftables до первого запуска
+  ansible.builtin.meta: flush_handlers
+
+- name: Регистрация узла и ключ
+  ansible.builtin.import_tasks: enroll.yml
+
+- name: Обновление бинарника, запуск, откат
+  ansible.builtin.import_tasks: deploy.yml
