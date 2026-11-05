@@ -165,6 +165,10 @@ compose)
 			rm -f "$run/ping.log" "$run/ping.stop"
 			if [ "${FAKE_BG_EMPTY-0}" = 1 ]; then
 				: > "$run/ping.log"
+			elif [ "${FAKE_BG_GARBAGE-0}" = 1 ]; then
+				# Непустой журнал, где ни одна строка не является наблюдением:
+				# нулевая пауза и «данных нет» должны различаться.
+				printf 'broken\n?? nan\n' >> "$run/ping.log"
 			else
 				date +%s > "$state/base"
 				printf '0\n' > "$state/rows"
@@ -1887,6 +1891,16 @@ code=$?
 [ "$code" -ne 0 ] && grep -q 'вне uplink-сети стенда' "$dir/out" \
 	&& ! grep -q 'ping -c1 -W1 -q' "$dir/log"
 check $? "адрес пробника вне uplink-сети даёт отказ (код $code)"
+
+# 96. Журнал пингов непустой, но состоит только из нераспознанных строк: это не
+# «отказов не было». Пустой журнал уже даёт отдельный отказ (68), и различение
+# должно быть полным, иначе мусор читается как нулевая пауза.
+dir="$TMPROOT/lifecycle-garbage"; fake_tools "$dir"
+FAKE_BG_GARBAGE=1 lifecycle_run "$dir"
+code=$?
+[ "$code" -ne 0 ] && grep -q 'пауза при смене ключа не измерена' "$dir/out" \
+	&& ! grep -q 'измеренная пауза при смене ключа' "$dir/out"
+check $? "журнал только из нераспознанных строк даёт отдельный отказ (код $code)"
 
 printf '%s\n' "проверок: $CASES, отказов: $FAILS"
 [ "$FAILS" -eq 0 ]

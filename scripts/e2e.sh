@@ -967,7 +967,8 @@ PY
 }
 
 # ping_pause печатает паузу трафика в секундах: 0 — отказов не было, -1 — отказ был
-# и трафик не вернулся, 2 — строк наблюдения нет (пустой или нечитаемый журнал).
+# и трафик не вернулся, 2 — строк наблюдения нет (пустой или нечитаемый журнал),
+# 3 — журнал непустой, но ни одна строка не распознана как наблюдение.
 ping_pause() { # файл журнала пингов
 	python3 - "$1" <<'PY'
 import sys
@@ -979,15 +980,19 @@ rows = [ln.split() for ln in lines if ln.strip()]
 if not rows:
     sys.exit(2)
 first_fail = resume = None
+parsed = 0
 for row in rows:
     if len(row) != 2 or not row[1].isdigit():
         continue
+    parsed += 1
     state, ts = row[0], int(row[1])
     if first_fail is None and state == "fail":
         first_fail = ts
     elif first_fail is not None and state == "ok":
         resume = ts
         break
+if parsed == 0:
+    sys.exit(3)
 if first_fail is None:
     print(0)
 elif resume is None:
@@ -1109,7 +1114,7 @@ done'
 		fail "не удалось прочитать журнал пингов клиента: /state/ping.log в контейнере client1"
 	fi
 	if ! pause=$(ping_pause "$RUN_DIR/ping.log"); then
-		fail "пауза при смене ключа не измерена: в журнале пингов нет ни одной строки наблюдения"
+		fail "пауза при смене ключа не измерена: журнал пингов пуст или ни одна его строка не распознана как наблюдение"
 	fi
 	[ "$pause" != "-1" ] || fail "трафик не вернулся после смены ключа: возврата в журнале пингов нет"
 	printf 'ok   измеренная пауза при смене ключа: %s с (разрешение 1 с)\n' "$pause"
