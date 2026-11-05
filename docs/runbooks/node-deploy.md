@@ -42,7 +42,7 @@ git log -p --all | grep -IE 'PRIVATE KEY'
 
 ## 4. Сборка артефакта на сборочной машине
 
-Сборка идёт в контейнере `golang:1.25-alpine` (как в `Dockerfile.node-agent`), а
+Сборка идёт в контейнере `golang:1.26-alpine` (как в `Dockerfile.node-agent`), а
 `GOOS` и `GOARCH` задают потому, что собирает Windows/WSL, а работать узел будет на
 Linux:
 
