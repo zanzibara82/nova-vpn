@@ -47,7 +47,7 @@ docker-go-app = MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) \
 	-e NOVAVPN_REDIS_ADDR=$(REDIS_ADDR_INTEG) \
 	$(GO_IMAGE) go
 
-.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint ansible-lint unbound-check caddy-validate leakcheck
+.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint ansible-lint unbound-check caddy-validate leakcheck vulncheck actionlint lint fmt-check
 unit:
 	$(docker-go) test -count=1 ./...
 
@@ -55,6 +55,12 @@ unit:
 # а здесь важна обычная сборка пакетов.
 vet:
 	$(docker-go) vet ./...
+
+# gofmt, а не goimports: критерий — форматирование, а не порядок групп импортов,
+# и лишний инструмент в воротах не должен решать, что считать правильным.
+fmt-check:
+	MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) $(GO_IMAGE) \
+	  sh -c 'out=$$(gofmt -l .); if [ -n "$$out" ]; then printf "%s\n" "$$out"; exit 1; fi'
 
 mod:
 	$(docker-go) mod tidy
@@ -155,6 +161,19 @@ caddy-validate:
 # git и bash на этой машине есть, а в контейнере нет ни индекса git, ни дерева.
 leakcheck:
 	bash scripts/leakcheck.sh
+
+# govulncheck закреплён по версии: «уязвимостей нет» должно означать проверку
+# конкретным инструментом, а не тем, что скачалось сегодня.
+vulncheck:
+	MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) $(GO_IMAGE) \
+	  sh -c 'go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 && /go/bin/govulncheck ./...'
+
+actionlint:
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/repo" -w /repo rhysd/actionlint:1.7.7
+
+# Агрегат повторяет локальные ворота: без unit (отдельный job) и без vulncheck
+# (сетевой медленный отказ не должен тонуть в линте).
+lint: vet api-lint actionlint ansible-lint unbound-check caddy-validate
 
 AGENT_VERSION ?= dev
 

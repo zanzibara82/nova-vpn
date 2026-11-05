@@ -62,6 +62,10 @@
 | Проверка утечек секретов в рабочем дереве: приватные ключи, конфиг WireGuard с закрытым ключом, рабочие env-файлы, значение JWT-секрета и флаг отключения TLS в прод-конфигурации | зелёный на дереве — шесть строк `ok` и `утечек не найдено`, код 0 (`task-16-green.log`); красный на отслеживаемой фикстуре — три отказа ровно на проверках ключа, закрытого ключа WireGuard и JWT-секрета, итог `проверка не пройдена`, код 1 (`task-16-red.log`) | `make leakcheck` на хосте: цель вызывает `bash scripts/leakcheck.sh`, а скрипт читает индекс git рабочего дерева |
 | комплект юнитов и статического анализа на инструментальной базе Go 1.26 (`golang:1.26-alpine`) | `make unit` — 16 пакетов `ok`, 0 отказов; `make vet` — без вывода; обе команды кодом 0 (`task-17a-gates.log`) | `bash "$D/run-make.sh" vet unit` |
 | Ворота по уязвимостям (инструментальный слой будущих целей 17): `govulncheck` v1.7.0 собирается на `golang:1.26-alpine` и после повышения `golang.org/x/net` не находит достижимых уязвимостей | `No vulnerabilities found.`, «0 vulnerabilities», код 0; 3 находки в требуемых модулях не вызываются кодом (`task-17a-vulncheck.log`) | одна команда внутри `golang:1.26-alpine` из раздела «Прогон A-3, задача 17a» |
+| Ворота форматирования: цель `fmt-check` ловит именно неотформатированный файл | зелёная — код 0 и пустой вывод; красная — временный неотформатированный `task17-red-fmt.go` уронил цель кодом 1, в выводе ровно одна строка с этим файлом (`task-17-red-fmt.log`, `task-17-green.log`) | `bash "$D/run-make.sh" fmt-check` |
+| Ворота workflow-файлов: цель `actionlint` ловит именно битый workflow | красная — копия заведомо битого workflow (job `broken` без `runs-on`) дала код 1 и ровно одну ошибку `[syntax-check]` на строке фикстуры при молчании про `ci.yml`; зелёная — код 0 и пустой вывод; объявленная метка `novavpn-e2e` описана в `.github/actionlint.yaml`, первый замер без этого файла — `task-17-actionlint-finding.log` (`task-17-red-actionlint.log`, `task-17-green.log`) | `bash "$D/run-make.sh" actionlint` |
+| Агрегат `lint` собирается из ровно шести целей и проходит на дереве | `make lint` — код 0: `vet` без вывода, `openapi.yaml: validated in 138ms`, `actionlint` молчит, `Passed: 0 failure(s), 0 warning(s) on 22 files`, `unbound-checkconf: no errors in /conf/unbound.conf`, `Valid configuration` (`task-17-green.log`) | `bash "$D/run-make.sh" lint` |
+| Ворота по уязвимостям как цель `vulncheck`: инструмент закреплён версией v1.7.0 | код 0, `No vulnerabilities found.` и строка «Your code is affected by 0 vulnerabilities»; отдельно 0 в импортируемых пакетах и 3 в требуемых модулях, которые код не вызывает (`task-17-green.log`) | `bash "$D/run-make.sh" vulncheck` |
 
 ## Последний прогон A-3, задача 8 — 2026-10-29
 
@@ -625,10 +629,73 @@ compose-файлах (`docker-compose.dev.yml:55`, `docker-compose.e2e.yml:92`),
 базе через стенд не прогонялась). Оффлайн-набор `scripts_test.sh` и цели
 ansible-слоя от версии Go не зависят и в этом раунде не повторялись.
 
+## Прогон A-3, задача 17 — 2026-11-05
+
+Поверх BASE `1595278` (1595278955ff9146066a20694c59658c65772050) собраны ворота CI.
+Созданы `.github/workflows/ci.yml` и `.github/actionlint.yaml`, в `Makefile` добавлены
+цели `vulncheck`, `actionlint`, `fmt-check` и агрегат `lint`. Workflow не придумывает
+новых ворот: его шаги вызывают те же `make`-цели и тот же контейнер
+`golang:1.26-alpine`, `actions/setup-go` нигде не используется, директиву `go 1.26.0`
+из `go.mod` удовлетворяет тулчейн контейнера.
+
+Сверка с постановкой: `govulncheck` закреплён версией `@v1.7.0` (версия `v1.1.3` из
+плана не собирается на образе Go 1.26 — замер контроллера `task-17-govulncheck-113-on126.log`).
+Координаты базы в job `integration` выведены из `Makefile`, а не дублируются цифрами: шаги
+`make migrate-up` и `make integration` передают `POSTGRES_HOST_PORT=5432` и
+`REDIS_HOST_PORT=6379` явно, `services:` публикует ровно эти порты, логин, пароль и база
+(`nova`/`nova`/`novavpn`) совпадают с `DB_URL_INTEG`. Агрегат `lint` — ровно шесть целей
+плана: `vet`, `api-lint`, `actionlint`, `ansible-lint`, `unbound-check`, `caddy-validate`,
+без `unit` (отдельный job) и без `vulncheck` (требует сети и установки инструмента, его
+медленный отказ не должен тонуть в линте). `fmt-check` — отдельный шаг CI. Секрет JWT
+генерируется раннером в шаге «Окружение»; команда генерации сверена локально в Git Bash:
+44 символа, совпадение с алфавитом base64, значение в журнал не записано
+(`task-17-secret-gen.log`); литералов секрета в workflow нет.
+
+Чувствительность новых целей доказана красным прогоном, затем зелёным:
+- красный `fmt-check`: временный неотформатированный `task17-red-fmt.go` в дереве — цель
+  упала `Error 1` (итог обёртки 2), в выводе ровно одна строка с этим файлом
+  (`task-17-red-fmt.log`); после снятия фикстуры зелёный — код 0 и пустой вывод;
+- красный `actionlint`: копия заведомо битого workflow рядом с `ci.yml` — код 1 (обёртки
+  2), ровно одна ошибка `task17-red-fixture.yml:4:3 "runs-on" section is missing in job
+  "broken" [syntax-check]`, претензий к `ci.yml` нет (`task-17-red-actionlint.log`);
+  после снятия фикстуры зелёный — код 0 и пустой вывод;
+- агрегат `lint` — код 0 по всем шести целям: `vet` без вывода,
+  `openapi.yaml: validated in 138ms`, `actionlint` без вывода, ansible-lint
+  `Passed: 0 failure(s), 0 warning(s) on 22 files` на профиле `production`,
+  `unbound-checkconf: no errors in /conf/unbound.conf` при рендере 2818 байт, Caddy
+  `Valid configuration` (`task-17-green.log`);
+- `vulncheck` — код 0, `No vulnerabilities found.` и «Your code is affected by 0
+  vulnerabilities», плюс 0 в импортируемых пакетах и 3 в требуемых модулях, которые код
+  не вызывает (`task-17-green.log`).
+
+Находка F-1: первый прогон `actionlint` упал и на доставленном `ci.yml` —
+`ci.yml:97:35: label "novavpn-e2e" is unknown [runner-label]`
+(`task-17-actionlint-finding.log`). `rhysd/actionlint:1.7.7` не знает собственных меток
+self-hosted раннеров, а предписанные метки менять запрещено. Противоречие закрыто
+штатным механизмом инструмента: `.github/actionlint.yaml` объявляет эту метку; это
+четвёртый файл задачи помимо трёх перечисленных в постановке.
+
+Не проверено этим прогоном и остаётся `not-run` (строки таблицы ниже): живой прогон
+workflow на GitHub (задача не пушит); окружение job `integration` на раннере (`services:`
+с их проверками готовности, свободные порты, разрешение `host.docker.internal`,
+сгенерированный `.env.dev` — живые `make migrate-up` и `make integration` против базы в
+этой задаче не запускались); job `e2e` только объявлен — раннера с меткой `novavpn-e2e`
+нет, `make e2e` и проект `novavpn-e2e` не трогались. Ни один шаг workflow не собирает
+образы (`api-image` и `node-image` в нём не вызываются), поэтому рецепт сборки через
+BuildKit в этой задаче не требовался; сборка образов на базе `golang:1.26-alpine`
+доказана прогоном задачи 17a (`task-17a-review-images-buildx.log`).
+
+Команды и журналы: `D = .superpowers/sdd/2026-10-27-novavpn-cycle-a3-node-runtime`,
+прогоны через `run-make.sh`; журналы `task-17-red-fmt.log`, `task-17-red-actionlint.log`,
+`task-17-actionlint-finding.log`, `task-17-green.log`, `task-17-secret-gen.log`.
+
 ## not-run (не проверено — и не заявляется как проверенное)
 
 | что | почему не проверялось | где появится |
 | --- | --- | --- |
+| CI: живой прогон workflow `.github/workflows/ci.yml` на GitHub | пуш и публикация этой задачей запрещены (пуш делает только пользователь по явной команде), поэтому прогон workflow начать было нельзя; локально прогнаны цели, которые workflow вызывает, а сам файл проверен целью `actionlint` | после первого пуша по команде пользователя; учёт в задаче 18 |
+| Job `integration` на раннере: `services` postgres:17 и redis:7 с проверками готовности, свободные порты, разрешение `host.docker.internal`, `make migrate-up` и `make integration` против живых базы и кэша | в этой задаче живые прогоны `make integration` и dev-стек запрещены, а порты 5432 и 6379 на этой машине заняты локальными службами: путь раннера отличается от локального пути приёмки | задача 18 (локальная приёмка своим путём) и первый живой прогон CI |
+| Job `e2e` workflow | job только объявлен: раннера с метками `self-hosted`, `linux` и `novavpn-e2e` нет, живой `make e2e` и проект `novavpn-e2e` в этой задаче не трогались | задача 18 (живой стенд) и регистрация self-hosted раннера с меткой |
 | Интеграционный набор на инструментальной базе Go 1.26 (`make integration`) | задача 17a поднимала только инструментальный слой: живые PostgreSQL и Redis не поднимались, поэтому на `golang:1.26-alpine` в этом раунде повторялись только юниты, `vet`, сканер уязвимостей и связанные оффлайн-цели | цикл A-3, задача 18 |
 | Живой стенд на пересобранных под Go 1.26 образах (`make e2e`) | образы api, узла и оба нагрузочных слоя стенда собраны на новом базовом образе и справка агента напечатана, но весь стенд (туннель, DNS, жизненный цикл) на пересобранных образах не прогонялся | цикл A-3, задача 18 |
 | Задача 10: версия узла в отчёте о состоянии живым прогоном не прочитана | поле с версией закреплено модульным тестом на подставном API (`internal/nodeagent/runtime/runner_test.go`), но на стенде никто не сверял версию, которую узел передал серверу; путь отзыва до пиера закрыт живым прогоном задачи 13 — `task-13b-live.log` | цикл A-3, задача 18: приёмка сверяет состояние узла через admin |
