@@ -5,6 +5,13 @@
 [Unit]
 Description=NovaVPN node apply own nftables table
 After=network-pre.target
+# Явное ребро порядка: этот oneshot обязан завершиться до подъёма
+# network-online.target, иначе агент (он стоит After=network-online.target и
+# Wants=network-online.target) мог бы создать туннель до применения правил
+# forwarding и masquerade. Без ребра порядок держится только на соглашении,
+# что network-pre раньше network-online, и на нагруженной перезагрузке оно не
+# гарантировано.
+Before=network-online.target
 
 [Service]
 Type=oneshot

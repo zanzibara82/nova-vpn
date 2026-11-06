@@ -5,8 +5,9 @@
 # занятые ресурсы, чужие подсети и ошибки чтения сетей, чужой стенд, очистка,
 # повреждённый ключ, неожиданный конфиг API, порядок NAT/DNS, чтение списка
 # пиеров и ожидание пиера в туннеле, порядок фаз dns и limit, порядок перехвата
-# DNS-трафика, чувствительность положительного контроля и лимит устройств по коду
-# ошибки). Путь пакетов доказывает живой прогон.
+# DNS-трафика, чувствительность положительного контроля, лимит устройств по коду
+# ошибки и явный порядок systemd-юнитов роли узла). Путь пакетов доказывает живой
+# прогон.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -25,6 +26,10 @@ E2E_COMPOSE=${E2E_COMPOSE:-$ROOT/infrastructure/docker/docker-compose.e2e.yml}
 # Конфиг резолвера узла тоже подставляемый: статическая проверка правки журнала
 # гоняется против копии с включённым логированием запросов.
 UNBOUND_CONF=${UNBOUND_CONF:-$ROOT/infrastructure/docker/e2e/unbound.conf}
+# Шаблоны systemd-юнитов роли узла тоже подставляемые: проверка порядка старта
+# гоняется против копии с убранным ребром, не трогая настоящие файлы.
+NODE_UNIT=${NODE_UNIT:-$ROOT/infrastructure/ansible/roles/novavpn_node/templates/novavpn-node.service.j2}
+NFT_UNIT=${NFT_UNIT:-$ROOT/infrastructure/ansible/roles/novavpn_node/templates/novavpn-nft-apply.service.j2}
 
 FAILS=0
 CASES=0
@@ -1901,6 +1906,50 @@ code=$?
 [ "$code" -ne 0 ] && grep -q 'пауза при смене ключа не измерена' "$dir/out" \
 	&& ! grep -q 'измеренная пауза при смене ключа' "$dir/out"
 check $? "журнал только из нераспознанных строк даёт отдельный отказ (код $code)"
+
+# --- Роль узла: порядок systemd-юнитов ---
+#
+# Правила фильтра (своя таблица nftables: forwarding и masquerade) обязаны
+# действовать к моменту, когда агент поднимает туннель. На перезагрузке порядок
+# держит только граф зависимостей: соглашение «network-pre раньше network-online»
+# ничего не гарантирует, если ни один юнит не связан с другим явно. Рёбра
+# закреплены статически по шаблонам роли, а не по живой systemd-графу: живой
+# прогон перезагрузки узла остаётся not-run (задача 19).
+#
+# unit_edges_ok читает оба файла целиком: копировать сюда список директив
+# нельзя, иначе проверка следила бы за текстом проверки, а не за ролью.
+unit_edges_ok() { # файл_агента файл_nft
+	grep -Eq '^[[:space:]]*After=[^#]*novavpn-nft-apply\.service' "$1" \
+		&& grep -Eq '^[[:space:]]*Wants=[^#]*novavpn-nft-apply\.service' "$1" \
+		&& grep -Eq '^[[:space:]]*After=[^#]*network-online\.target' "$1" \
+		&& grep -Eq '^[[:space:]]*Wants=[^#]*network-online\.target' "$1" \
+		&& grep -Eq '^[[:space:]]*Before=[^#]*network-online\.target' "$2" \
+		&& grep -Eq '^[[:space:]]*After=[^#]*network-pre\.target' "$2" \
+		&& grep -Eq '^Type=oneshot$' "$2" \
+		&& grep -Eq '^RemainAfterExit=yes$' "$2"
+}
+
+# 97. Агент ждёт юнит применения таблицы: Wants тянет его в транзакцию, After
+# ставит применение фильтра до подъёма туннеля.
+unit_edges_ok "$NODE_UNIT" "$NFT_UNIT"
+check $? "юнит агента ждёт novavpn-nft-apply, юнит фильтра стоит до network-online.target"
+
+# 98. Ребро смотрит на имя установленного юнита, а не на имя шаблона: install.yml
+# кладёт шаблон в /etc/systemd/system/novavpn-nft-apply.service, и расхождение
+# имён дало бы агенту несуществующую зависимость.
+grep -Eq 'dest: /etc/systemd/system/novavpn-nft-apply\.service' \
+	"$ROOT/infrastructure/ansible/roles/novavpn_node/tasks/install.yml" \
+	&& grep -Eq '^[[:space:]]*(After|Wants)=[^#]*novavpn-nft-apply\.service' "$NODE_UNIT"
+check $? "имя юнита в рёбрах агента совпадает с dest из install.yml"
+
+# 99. Прежнее соглашение о двух целях не потеряно: агент по-прежнему ждёт
+# network-online.target, а юнит фильтра по-прежнему oneshot с RemainAfterExit=yes
+# (без него «завершён» не означает «правила на месте»).
+grep -Eq '^[[:space:]]*After=[^#]*network-online\.target' "$NODE_UNIT" \
+	&& grep -Eq '^[[:space:]]*Wants=[^#]*network-online\.target' "$NODE_UNIT" \
+	&& grep -Eq '^Type=oneshot$' "$NFT_UNIT" \
+	&& grep -Eq '^RemainAfterExit=yes$' "$NFT_UNIT"
+check $? "агент ждёт network-online.target, фильтр остаётся oneshot с RemainAfterExit"
 
 printf '%s\n' "проверок: $CASES, отказов: $FAILS"
 [ "$FAILS" -eq 0 ]

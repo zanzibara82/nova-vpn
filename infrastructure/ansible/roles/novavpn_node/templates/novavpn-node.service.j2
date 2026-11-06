@@ -1,5 +1,12 @@
 [Unit]
 Description=NovaVPN node agent
+# Порядок подъёма держится на графе зависимостей, а не на соглашении о двух
+# целях: агент ждёт свою таблицу nftables явно. Wants нужен потому, что на
+# перезагрузке юнит применения фильтра не попадает в транзакцию сам по себе, а
+# без него After= ничего не удерживает. systemd складывает повторные ключи
+# After= и Wants=, поэтому соседняя строка про network-online.target не затирается.
+After=novavpn-nft-apply.service
+Wants=novavpn-nft-apply.service
 After=network-online.target
 Wants=network-online.target
 

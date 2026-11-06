@@ -70,8 +70,14 @@ cp inventory.example.ini inventory.ini
 
 ## 6. Первый прогон без регистрации
 
+Шаги ниже идут из текущей директории `infrastructure/ansible`, в неё шаг 5 уже
+сделал `cd`; пути к playbook и инвентарю — относительные, а `ansible.cfg`
+подхватывается из этой же директории. Заполненный `inventory.ini` передаётся
+ключом `-i` явно: без ключа `ansible.cfg` подставит отслеживаемый пример
+`inventory.example.ini`, а не файл оператора.
+
 ```bash
-ansible-playbook infrastructure/ansible/site.yml -e novavpn_node_enroll=false
+ansible-playbook site.yml -i inventory.ini -e novavpn_node_enroll=false
 ```
 
 Ожидание: роль ставит пакеты, sysctl, таблицу nftables, юниты и бинарник, печатает
@@ -92,7 +98,7 @@ ansible-playbook infrastructure/ansible/site.yml -e novavpn_node_enroll=false
 ## 8. Второй прогон
 
 ```bash
-ansible-playbook infrastructure/ansible/site.yml
+ansible-playbook site.yml -i inventory.ini
 ```
 
 Ожидание: узел регистрируется, бинарник обновляется, взводится таймер отката, агент
