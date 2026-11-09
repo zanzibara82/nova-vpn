@@ -1,9 +1,12 @@
-GO_IMAGE ?= golang:1.25-alpine
+GO_IMAGE ?= golang:1.26-alpine
 DB_IMAGE ?= postgres:17
 REDIS_IMAGE ?= redis:7
 API_IMAGE ?= redocly/cli:1.34.22
+ANSIBLE_IMAGE ?= python:3.12-slim
+ANSIBLE_CORE ?= 2.17.6
+ANSIBLE_LINT ?= 24.10.0
 
-# Хостовы порты dev-стека. Занятые по умолчанию — не гипотеза: на этой машине 5432
+# Порты dev-стека на хосте. Занятые по умолчанию — не гипотеза: на этой машине 5432
 # держит служба postgresql-x64-17, а 6379 — локальный redis, и connect с тестового
 # контейнера уходит в чужой сервер (SASL-ошибка на несуществующую роль). Порты
 # переопределяют одной строкой: make integration POSTGRES_HOST_PORT=5433.
@@ -44,7 +47,7 @@ docker-go-app = MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) \
 	-e NOVAVPN_REDIS_ADDR=$(REDIS_ADDR_INTEG) \
 	$(GO_IMAGE) go
 
-.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint
+.PHONY: unit vet integration mod sqlc-generate migrate-up migrate-down run-dev up-dev down-dev api-lint ansible-lint unbound-check caddy-validate leakcheck vulncheck actionlint lint fmt-check
 unit:
 	$(docker-go) test -count=1 ./...
 
@@ -52,6 +55,12 @@ unit:
 # а здесь важна обычная сборка пакетов.
 vet:
 	$(docker-go) vet ./...
+
+# gofmt, а не goimports: критерий — форматирование, а не порядок групп импортов,
+# и лишний инструмент в воротах не должен решать, что считать правильным.
+fmt-check:
+	MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) $(GO_IMAGE) \
+	  sh -c 'out=$$(gofmt -l .) || exit $$?; if [ -n "$$out" ]; then printf "%s\n" "$$out"; exit 1; fi'
 
 mod:
 	$(docker-go) mod tidy
@@ -99,3 +108,202 @@ sqlc-generate:
 
 api-lint:
 	docker run --rm -v "$(CURDIR)/api-spec:/spec" $(API_IMAGE) lint /spec/openapi.yaml
+
+# Статическая проверка без хоста: syntax-check всего playbook и линт роли.
+# Версии закреплены, чтобы «линт прошёл» не означало «прошёл на другой версии».
+# ANSIBLE_CONFIG задаёт файл настроек явно: ansible ищет его по переменной,
+# в текущем каталоге и системных путях, а цель бегает из корня репозитория.
+ansible-lint:
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/work" \
+	  -v novavpn-pip-cache:/root/.cache/pip -w /work \
+	  -e ANSIBLE_CONFIG=/work/infrastructure/ansible/ansible.cfg $(ANSIBLE_IMAGE) \
+	  sh -c 'pip install --quiet ansible-core==$(ANSIBLE_CORE) ansible-lint==$(ANSIBLE_LINT) && \
+	    ansible-playbook -i infrastructure/ansible/inventory.example.ini \
+	      infrastructure/ansible/site.yml --syntax-check && \
+	    ansible-lint infrastructure/ansible'
+
+# Рендер шаблона реальным Jinja и проверка синтаксиса настоящим unbound-checkconf:
+# так «конфиг валиден» означает проверку, а не чтение глазами. Образ, версия
+# ansible-core и том кэша — общие с целью ansible-lint, чтобы цели не расходились.
+# Четыре grep перед проверкой синтаксиса — закрепки приватности §9.4: они держат
+# выключенными все режимы, которые заносят имена запросов в журнал (log-queries,
+# log-replies, log-local-actions, log-servfail). Синтаксически конфиг с любым из них
+# и со значением yes проходит unbound-checkconf, поэтому без grep цель осталась бы
+# зелёной при включённом журнале запросов.
+unbound-check:
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/work" \
+	  -v novavpn-pip-cache:/root/.cache/pip -w /work \
+	  -e ANSIBLE_CONFIG=/work/infrastructure/ansible/ansible.cfg $(ANSIBLE_IMAGE) \
+	  sh -c 'pip install --quiet ansible-core==$(ANSIBLE_CORE) && mkdir -p .scratch && \
+	    ansible localhost -c local -m ansible.builtin.template \
+	      -a "src=/work/infrastructure/ansible/roles/unbound/templates/unbound.conf.j2 dest=/work/.scratch/unbound.rendered.conf" \
+	      -e @/work/infrastructure/ansible/roles/unbound/defaults/main.yml \
+	      -e novavpn_node_pool=10.99.7.0/24'
+	MSYS_NO_PATHCONV=1 docker run --rm \
+	  -v "$(CURDIR)/.scratch/unbound.rendered.conf:/conf/unbound.conf:ro" alpine:3.20 \
+	  sh -c 'apk add --no-cache unbound >/dev/null && \
+	    mkdir -p /var/lib/unbound && \
+	    unbound-anchor -a /var/lib/unbound/root.key; \
+	    [ $$? -le 1 ] && \
+	    grep -qE "^[[:space:]]*log-queries:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    grep -qE "^[[:space:]]*log-replies:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    grep -qE "^[[:space:]]*log-local-actions:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    grep -qE "^[[:space:]]*log-servfail:[[:space:]]*no[[:space:]]*$$" /conf/unbound.conf && \
+	    unbound-checkconf /conf/unbound.conf'
+
+# Проверка конфигурации фронта без сети: сертификат здесь не выпускается.
+caddy-validate:
+	MSYS_NO_PATHCONV=1 docker run --rm \
+	  -v "$(CURDIR)/infrastructure/docker:/etc/caddy:ro" caddy:2.8.4-alpine \
+	  caddy validate --config /etc/caddy/Caddyfile.example --adapter caddyfile
+
+# Скрипт читает рабочее дерево через git, поэтому цель и запускается на хосте:
+# git и bash на этой машине есть, а в контейнере нет ни индекса git, ни дерева.
+leakcheck:
+	bash scripts/leakcheck.sh
+
+# govulncheck закреплён по версии: «уязвимостей нет» должно означать проверку
+# конкретным инструментом, а не тем, что скачалось сегодня.
+vulncheck:
+	MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) $(GO_IMAGE) \
+	  sh -c 'go install golang.org/x/vuln/cmd/govulncheck@v1.7.0 && /go/bin/govulncheck ./...'
+
+actionlint:
+	MSYS_NO_PATHCONV=1 docker run --rm -v "$(CURDIR):/repo" -w /repo rhysd/actionlint:1.7.7
+
+# Агрегат повторяет локальные ворота: без unit (отдельный job) и без vulncheck
+# (сетевой медленный отказ не должен тонуть в линте).
+lint: vet api-lint actionlint ansible-lint unbound-check caddy-validate
+
+AGENT_VERSION ?= dev
+
+.PHONY: api-image node-image node-help
+api-image:
+	MSYS_NO_PATHCONV=1 docker build -t novavpn-api:dev -f Dockerfile.api .
+
+node-image:
+	MSYS_NO_PATHCONV=1 docker build --build-arg AGENT_VERSION=$(AGENT_VERSION) -t novavpn-node-agent:dev -f Dockerfile.node-agent .
+
+node-help:
+	MSYS_NO_PATHCONV=1 docker run --rm --network none --cap-add NET_ADMIN --cap-add NET_RAW novavpn-node-agent:dev --help
+
+# Стенд E2E. Оркестратор — одноразовый доверенный контейнер alpine:3.20:
+# исходники только для чтения, Docker socket только ему, защищённый том
+# novavpn-e2e-control в /state. Службы стенда socket не получают. run-make.sh
+# передаёт CURDIR путём хоста Docker, поэтому том исходников строится от него.
+E2E_CONTROL_VOL  := novavpn-e2e-control
+E2E_RUNNER       := novavpn-e2e-runner
+E2E_RUNNER_DOWN  := novavpn-e2e-runner-down
+E2E_ORCH_IMAGE   := alpine:3.20
+E2E_ORCH_PACKAGES := make bash python3 curl docker-cli docker-cli-compose docker-cli-buildx
+E2E_ORCH_FLAGS   := --label novavpn.e2e.project=novavpn-e2e \
+	-v "$(CURDIR):/work:ro" \
+	-v "$(E2E_CONTROL_VOL):/state" \
+	-v /var/run/docker.sock:/var/run/docker.sock \
+	-w /work
+
+.PHONY: e2e e2e-down
+e2e:
+	@if MSYS_NO_PATHCONV=1 docker ps -a \
+		--filter "label=com.docker.compose.project=novavpn-e2e" \
+		--format '{{.Names}}' | grep -q .; then \
+		echo "проект novavpn-e2e занят; сначала выполните make e2e-down" >&2; exit 1; \
+	fi
+	@for net in novavpn-e2e_harness novavpn-e2e_uplink; do \
+		if MSYS_NO_PATHCONV=1 docker network inspect "$$net" >/dev/null 2>&1; then \
+			echo "сеть $$net уже существует; сначала выполните make e2e-down" >&2; exit 1; \
+		fi; \
+	done
+	@if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
+		echo "контейнер $(E2E_RUNNER) уже существует; сначала выполните make e2e-down" >&2; exit 1; \
+	fi
+	@nets=$$(MSYS_NO_PATHCONV=1 docker network ls --format '{{.Name}}') || { \
+		echo "не удалось прочитать подсети Docker" >&2; exit 1; }; \
+	for net in $$nets; do \
+		subs=$$(MSYS_NO_PATHCONV=1 docker network inspect --format \
+			'{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$$net") || { \
+			echo "не удалось прочитать подсети Docker" >&2; exit 1; }; \
+		for sub in $$subs; do \
+			case "$$sub" in ''|*:*) continue ;; esac; \
+			for ours in 172.31.99.0/24 172.31.98.0/24; do \
+				rc=$$(awk -v x="$$ours" -v y="$$sub" 'function bounds(s, p, ip, i, n, base, bits) { if (s ~ /[^0-9.\/]/) return 0; n = split(s, p, "/"); if (n != 2) return 0; if (p[2] + 0 > 32) return 0; if (split(p[1], ip, ".") != 4) return 0; for (i = 1; i <= 4; i++) { if (ip[i] == "" || ip[i] + 0 > 255) return 0 } base = 0; for (i = 1; i <= 4; i++) base = base * 256 + ip[i]; bits = 2 ^ (32 - p[2]); lo = int(base / bits) * bits; hi = lo + bits - 1; return 1 } BEGIN { if (!bounds(x)) { print 2; exit } xl = lo; xh = hi; if (!bounds(y)) { print 2; exit } if (xl <= hi && lo <= xh) { print 1 } else { print 0 } }') || rc=2; \
+				case "$$rc" in \
+				0) ;; \
+				1) echo "сеть $$net занимает подсеть $$sub; пересечение с нашей подсетью $$ours" >&2; \
+					exit 1 ;; \
+				*) echo "не удалось прочитать подсети Docker" >&2; exit 1 ;; \
+				esac; \
+			done; \
+		done; \
+	done
+	@if MSYS_NO_PATHCONV=1 docker volume inspect $(E2E_CONTROL_VOL) >/dev/null 2>&1; then \
+		label=$$(MSYS_NO_PATHCONV=1 docker volume inspect --format \
+			'{{ index .Labels "novavpn.e2e.project" }}' $(E2E_CONTROL_VOL) 2>/dev/null || true); \
+		if [ "$$label" != "novavpn-e2e" ]; then \
+			echo "том $(E2E_CONTROL_VOL) существует без метки владельца" >&2; exit 1; \
+		fi; \
+	else \
+		MSYS_NO_PATHCONV=1 docker volume create \
+			--label novavpn.e2e.project=novavpn-e2e $(E2E_CONTROL_VOL) >/dev/null; \
+	fi
+	@MSYS_NO_PATHCONV=1 docker run --rm --name $(E2E_RUNNER) $(E2E_ORCH_FLAGS) \
+		-e E2E_ORCHESTRATOR=1 $(E2E_ORCH_IMAGE) sh -ec \
+		'apk add --no-cache $(E2E_ORCH_PACKAGES) >/dev/null && exec bash scripts/e2e.sh all'; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+		MSYS_NO_PATHCONV=1 docker volume rm $(E2E_CONTROL_VOL) >/dev/null || rc=1; \
+	fi; \
+	exit $$rc
+
+# Снимает только собственный проект, runner и control-том при подтверждённых
+# метках. Если защищённого тома нет, команда сначала перечисляет оставшиеся
+# ресурсы и отказывает, ничего не трогая; чужой runner не трогается.
+e2e-down:
+	@if ! MSYS_NO_PATHCONV=1 docker volume inspect $(E2E_CONTROL_VOL) >/dev/null 2>&1; then \
+		found=""; \
+		names=$$(MSYS_NO_PATHCONV=1 docker ps -a \
+			--filter "label=com.docker.compose.project=novavpn-e2e" \
+			--format '{{.Names}}') || { \
+			echo "не удалось прочитать контейнеры проекта" >&2; exit 1; }; \
+		[ -n "$$names" ] && found="$$found контейнеры $$(printf '%s ' $$names)"; \
+		if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
+			found="$$found контейнер $(E2E_RUNNER)"; \
+		fi; \
+		for net in novavpn-e2e_harness novavpn-e2e_uplink; do \
+			if MSYS_NO_PATHCONV=1 docker network inspect "$$net" >/dev/null 2>&1; then \
+				found="$$found сеть $$net"; \
+			fi; \
+		done; \
+		for vol in novavpn-e2e-postgres-data novavpn-e2e-node1-state novavpn-e2e-client1-state; do \
+			if MSYS_NO_PATHCONV=1 docker volume inspect "$$vol" >/dev/null 2>&1; then \
+				found="$$found том $$vol"; \
+			fi; \
+		done; \
+		if [ -n "$$found" ]; then \
+			echo "том $(E2E_CONTROL_VOL) отсутствует, но ресурсы проекта найдены:$$found; разберите вручную" >&2; \
+			exit 1; \
+		fi; \
+		echo "том $(E2E_CONTROL_VOL) отсутствует; снимать нечего" >&2; exit 0; \
+	fi; \
+	if MSYS_NO_PATHCONV=1 docker container inspect $(E2E_RUNNER) >/dev/null 2>&1; then \
+		label=$$(MSYS_NO_PATHCONV=1 docker inspect --format \
+			'{{ index .Config.Labels "novavpn.e2e.project" }}' $(E2E_RUNNER)); \
+		if [ "$$label" = "novavpn-e2e" ]; then \
+			MSYS_NO_PATHCONV=1 docker rm -f $(E2E_RUNNER) >/dev/null; \
+		else \
+			echo "чужой контейнер $(E2E_RUNNER) без метки владельца" >&2; exit 1; \
+		fi; \
+	fi; \
+	label=$$(MSYS_NO_PATHCONV=1 docker volume inspect --format \
+		'{{ index .Labels "novavpn.e2e.project" }}' $(E2E_CONTROL_VOL) 2>/dev/null || true); \
+	if [ "$$label" != "novavpn-e2e" ]; then \
+		echo "том $(E2E_CONTROL_VOL) существует без метки владельца" >&2; exit 1; \
+	fi; \
+	MSYS_NO_PATHCONV=1 docker run --rm --name $(E2E_RUNNER_DOWN) $(E2E_ORCH_FLAGS) \
+		$(E2E_ORCH_IMAGE) sh -ec \
+		'apk add --no-cache $(E2E_ORCH_PACKAGES) >/dev/null && exec bash scripts/e2e.sh down'; \
+	rc=$$?; \
+	if [ $$rc -eq 0 ]; then \
+		MSYS_NO_PATHCONV=1 docker volume rm $(E2E_CONTROL_VOL) >/dev/null || rc=1; \
+	fi; \
+	exit $$rc

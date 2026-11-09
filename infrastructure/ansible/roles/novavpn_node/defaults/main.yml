@@ -1,0 +1,15 @@
+novavpn_node_user: novavpn
+novavpn_node_state_dir: /var/lib/novavpn-node
+novavpn_node_config_dir: /etc/novavpn-node
+novavpn_node_lib_dir: /usr/local/lib/novavpn
+novavpn_node_bin: /usr/local/bin/novavpn-node-agent
+novavpn_node_interface: wg0
+novavpn_node_ca_file: /etc/ssl/certs/ca-certificates.crt
+novavpn_node_rollback_delay_sec: 180
+# Обязательные, без значений по умолчанию: пул и адрес API нельзя угадать.
+# novavpn_node_api_url
+# novavpn_node_pool
+# novavpn_node_uplink_iface
+# novavpn_node_binary_src
+# novavpn_node_bootstrap_file
+novavpn_node_enroll: false

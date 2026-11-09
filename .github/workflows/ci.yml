@@ -1,0 +1,104 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Форматирование
+        run: make fmt-check
+      - name: Вет
+        run: make vet
+      - name: Контракт API
+        run: make api-lint
+      - name: Workflow-файлы
+        run: make actionlint
+      - name: Ansible
+        run: make ansible-lint
+      - name: unbound
+        run: make unbound-check
+      - name: Caddy
+        run: make caddy-validate
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make unit
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: nova
+          POSTGRES_PASSWORD: nova
+          POSTGRES_DB: novavpn
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nova -d novavpn"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      # Схему создают миграции, а не тесты: интеграционные тесты пишут в готовые
+      # таблицы (helpers_test.go), и на пустой базе первый же INSERT упал бы.
+      # Файл окружения собирается из примера, секрет генерируется здесь и в
+      # репозиторий не попадает.
+      - name: Окружение
+        run: |
+          cp infrastructure/docker/.env.dev.example infrastructure/docker/.env.dev
+          printf 'NOVAVPN_JWT_SECRET=%s\n' "$(head -c 32 /dev/urandom | base64)" \
+            >> infrastructure/docker/.env.dev
+      # Порты передаются явно и совпадают с services: расхождение молча
+      # уведёт тесты в чужой сервер.
+      - name: Миграции
+        run: make migrate-up POSTGRES_HOST_PORT=5432 REDIS_HOST_PORT=6379
+      - run: make integration POSTGRES_HOST_PORT=5432 REDIS_HOST_PORT=6379
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Утечки секретов
+        run: make leakcheck
+      - name: Известные уязвимости
+        run: make vulncheck
+
+  e2e:
+    # Только по требованию и только на машине с модулем wireguard: hosted-раннер
+    # не даёт гарантий ни по модулю, ни по NET_ADMIN во вложенном Docker.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, novavpn-e2e]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Модуль wireguard
+        run: sudo modprobe wireguard
+      - name: Стенд E2E
+        run: make e2e

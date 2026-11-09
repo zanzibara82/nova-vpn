@@ -1,0 +1,22 @@
+# Гарантии роли (ip_forward, NAT, IPv6) должны действовать и после перезагрузки
+# узла: этот oneshot-юнит заново применяет свою таблицу при каждой загрузке,
+# до подготовки сети. Чужой /etc/nftables.conf не редактируется: правило
+# «не касаемся чужого набора» сильнее дешевизны.
+[Unit]
+Description=NovaVPN node apply own nftables table
+After=network-pre.target
+# Явное ребро порядка: этот oneshot обязан завершиться до подъёма
+# network-online.target, иначе агент (он стоит After=network-online.target и
+# Wants=network-online.target) мог бы создать туннель до применения правил
+# forwarding и masquerade. Без ребра порядок держится только на соглашении,
+# что network-pre раньше network-online, и на нагруженной перезагрузке оно не
+# гарантировано.
+Before=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={{ novavpn_node_lib_dir }}/novavpn-nft-apply.sh
+
+[Install]
+WantedBy=multi-user.target

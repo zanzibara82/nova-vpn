@@ -1,0 +1,7 @@
+- name: NovaVPN — узел
+  hosts: novavpn_nodes
+  become: true
+  gather_facts: true
+  roles:
+    - novavpn_node
+    - unbound

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"os"
 	"regexp"
 	"strconv"
@@ -524,10 +525,29 @@ func TestLiveResponsesMatchContract(t *testing.T) {
 		// --- A-2: контракт узла ---
 		{"/internal/v1/nodes/{server_id}/desired", http.MethodGet, 200, func(t *testing.T, e *env) *http.Response {
 			own := e.node(t, e.server(t).ID)
-			resp, _ := raw(t, e, http.MethodGet, nodePath(own.serverID, "/desired"), nil,
+			resp, body := raw(t, e, http.MethodGet, nodePath(own.serverID, "/desired"), nil,
 				authHdr(own.token))
 			if etag := resp.Header.Get("ETag"); etag == "" {
 				t.Errorf("desired set answer has no ETag")
+			}
+			var out struct {
+				TunnelAddress string `json:"tunnel_address"`
+			}
+			if err := json.Unmarshal(body, &out); err != nil {
+				t.Fatalf("разбор desired: %v", err)
+			}
+			if out.TunnelAddress == "" {
+				t.Fatal("в desired нет адреса узла tunnel_address")
+			}
+			prefix, err := netip.ParsePrefix(out.TunnelAddress)
+			if err != nil {
+				t.Fatalf("tunnel_address не является CIDR: %q: %v", out.TunnelAddress, err)
+			}
+			if prefix.Bits() != 24 {
+				t.Errorf("маска tunnel_address = %d, ожидалась 24", prefix.Bits())
+			}
+			if prefix.Addr() != netip.MustParseAddr("10.99.90.1") {
+				t.Errorf("адрес узла = %s, ожидался 10.99.90.1", prefix.Addr())
 			}
 			return resp
 		}},
@@ -557,7 +577,7 @@ func TestLiveResponsesMatchContract(t *testing.T) {
 			own := e.node(t, e.server(t).ID)
 			resp, _ := raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"),
 				map[string]any{"agent_version": "contract", "agent_uptime_sec": 1,
-					"load1": 0.1, "cpu_pct": 1.0, "applied_config_version": 0},
+					"load1": 0.1, "cpu_pct": 1.0, "applied_config_version": 0, "stale": false},
 				authHdr(own.token))
 			return resp
 		}},

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"log/slog"
 	"math"
+	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/novavpn/novavpn/internal/connections"
 	"github.com/novavpn/novavpn/internal/db"
 	"github.com/novavpn/novavpn/internal/servers"
 	"github.com/novavpn/novavpn/internal/telemetry"
@@ -131,6 +134,159 @@ func TestTelemetryObservedDeltasAndHandshake(t *testing.T) {
 	}
 	if !strings.Contains(f.logs.String(), "counters reset") || strings.Contains(f.logs.String(), f.device.PublicKey) {
 		t.Fatal("сброс не отражён в журнале либо раскрыт ключ")
+	}
+}
+
+func TestHeartbeatStaleMarksHealthStale(t *testing.T) {
+	e := newEnv(t)
+	srv := e.server(t)
+	own := e.node(t, srv.ID)
+	hb := map[string]any{
+		"agent_version": "test", "agent_uptime_sec": 10,
+		"load1": nil, "cpu_pct": nil, "applied_config_version": 7,
+	}
+	for _, stale := range []bool{true, false, true} {
+		hb["stale"] = stale
+		resp, body := raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"), hb, authHdr(own.token))
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("heartbeat при stale=%t: %d %s, ожидался 204", stale, resp.StatusCode, body)
+		}
+		h, err := e.q.ServerHealthOf(context.Background(), srv.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := db.HealthStatusOk
+		if stale {
+			want = db.HealthStatusStale
+		}
+		if h.Status != want {
+			t.Fatalf("статус при stale=%t = %q, ожидался %q", stale, h.Status, want)
+		}
+		if h.AgentVersion == nil || *h.AgentVersion != "test" || h.AgentUptimeSec == nil || *h.AgentUptimeSec != 10 || h.AppliedConfigVersion != 7 || h.Load1 != nil || h.CpuPct != nil {
+			t.Fatalf("неверные поля heartbeat: %+v", h)
+		}
+	}
+}
+
+func TestTelemetryObservedPreservesStaleUntilHeartbeat(t *testing.T) {
+	for _, source := range []string{"heartbeat", "sweeper"} {
+		t.Run(source, func(t *testing.T) {
+			e := newEnv(t)
+			f := e.withProfile(t)
+			own := e.node(t, f.server.ID)
+			ctx := context.Background()
+			load, cpu := 1.125, 25.5
+			hb := telemetry.Heartbeat{AgentVersion: "1.2.3", AgentUptimeSec: 123,
+				Load1: &load, CPUPct: &cpu, AppliedConfigVersion: 9, Stale: source == "heartbeat"}
+			resp, body := raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"), hb, authHdr(own.token))
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("первый heartbeat: %d %s", resp.StatusCode, body)
+			}
+			if source == "sweeper" {
+				if _, err := pool(t).Exec(ctx, "UPDATE server_health SET observed_at = now() - interval '200 seconds' WHERE server_id = $1", own.serverID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := connections.NewStore(pool(t)).SweepStale(ctx, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+				if n := nodeStaleEvents(t, pool(t), own.serverID); n != 1 {
+					t.Fatalf("событий node_stale: %d, ожидалось 1", n)
+				}
+			}
+			h, err := e.q.ServerHealthOf(ctx, own.serverID)
+			if err != nil || h.Status != db.HealthStatusStale {
+				t.Fatalf("до observed ожидался stale: %+v / %v", h, err)
+			}
+			hs := time.Now().UTC().Add(-time.Second)
+			for _, counts := range []struct{ rx, tx, version int64 }{{5000, 2000, 7}, {6000, 2500, 8}} {
+				before := h.ObservedAt
+				rep := telemetry.ObservedReport{ConfigVersion: counts.version,
+					InterfaceRxBytes: counts.rx, InterfaceTxBytes: counts.tx,
+					Peers: []telemetry.PeerStat{{PublicKey: f.device.PublicKey, LatestHandshake: &hs, RxBytes: counts.rx, TxBytes: counts.tx}}}
+				resp, body = raw(t, e, http.MethodPost, nodePath(own.serverID, "/observed"), rep, authHdr(own.token))
+				if resp.StatusCode != http.StatusNoContent {
+					t.Fatalf("observed: %d %s", resp.StatusCode, body)
+				}
+				h, err = e.q.ServerHealthOf(ctx, own.serverID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if h.Status != db.HealthStatusStale {
+					t.Errorf("observed снял stale: %q", h.Status)
+				}
+				if h.AgentVersion == nil || *h.AgentVersion != "1.2.3" || h.AgentUptimeSec == nil || *h.AgentUptimeSec != 123 || h.Load1 == nil || *h.Load1 != "1.125" || h.CpuPct == nil || *h.CpuPct != "25.50" {
+					t.Fatalf("observed стёр поля heartbeat: %+v", h)
+				}
+				if h.PeersConfigured != 1 || h.PeersHandshaked != 1 || h.InterfaceRxBytes != counts.rx || h.InterfaceTxBytes != counts.tx || h.AppliedConfigVersion != counts.version || !h.ObservedAt.After(before) {
+					t.Fatalf("observed не обновил измерения: %+v", h)
+				}
+			}
+			hb.Stale = false
+			resp, body = raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"), hb, authHdr(own.token))
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("восстанавливающий heartbeat: %d %s", resp.StatusCode, body)
+			}
+			h, err = e.q.ServerHealthOf(ctx, own.serverID)
+			if err != nil || h.Status != db.HealthStatusOk || h.AppliedConfigVersion != 9 || h.PeersConfigured != 1 || h.PeersHandshaked != 1 || h.InterfaceRxBytes != 6000 || h.InterfaceTxBytes != 2500 {
+				t.Fatalf("heartbeat не восстановил ok или стёр observed: %+v / %v", h, err)
+			}
+		})
+	}
+}
+
+func TestHeartbeatRequiresExplicitStale(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		present bool
+		value   any
+	}{
+		{name: "missing"},
+		{name: "null", present: true},
+		{name: "string", present: true, value: "true"},
+		{name: "number", present: true, value: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			own := e.node(t, e.server(t).ID)
+			hb := map[string]any{
+				"agent_version": "test", "agent_uptime_sec": 10,
+				"load1": 1.125, "cpu_pct": 25.5, "applied_config_version": 7, "stale": true,
+			}
+			resp, body := raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"), hb, authHdr(own.token))
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("heartbeat(true): %d %s", resp.StatusCode, body)
+			}
+			before, err := e.q.ServerHealthOf(context.Background(), own.serverID)
+			if err != nil || before.Status != db.HealthStatusStale {
+				t.Fatalf("heartbeat(true) не установил stale: %+v / %v", before, err)
+			}
+			hb["agent_version"], hb["agent_uptime_sec"] = "changed", 20
+			hb["load1"], hb["cpu_pct"], hb["applied_config_version"] = nil, nil, 8
+			delete(hb, "stale")
+			if tc.present {
+				hb["stale"] = tc.value
+			}
+			resp, body = raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"), hb, authHdr(own.token))
+			if resp.StatusCode != http.StatusBadRequest || codeOf(t, body) != "invalid_request" {
+				t.Errorf("некорректный stale: %d %s, ожидался 400 invalid_request", resp.StatusCode, body)
+			}
+			after, err := e.q.ServerHealthOf(context.Background(), own.serverID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(before, after) {
+				t.Errorf("некорректный heartbeat изменил health: до %+v, после %+v", before, after)
+			}
+			hb["stale"] = false
+			resp, body = raw(t, e, http.MethodPost, nodePath(own.serverID, "/heartbeat"), hb, authHdr(own.token))
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("heartbeat(false): %d %s", resp.StatusCode, body)
+			}
+			after, err = e.q.ServerHealthOf(context.Background(), own.serverID)
+			if err != nil || after.Status != db.HealthStatusOk || after.AgentVersion == nil || *after.AgentVersion != "changed" || after.AgentUptimeSec == nil || *after.AgentUptimeSec != 20 || after.AppliedConfigVersion != 8 || after.Load1 != nil || after.CpuPct != nil || !after.ObservedAt.After(before.ObservedAt) {
+				t.Fatalf("heartbeat(false) не принят полностью: %+v / %v", after, err)
+			}
+		})
 	}
 }
 

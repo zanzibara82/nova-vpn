@@ -1,0 +1,8 @@
+# Собственная таблица узла. Имя интерфейса не используется: Compose не гарантирует
+# порядок eth0/eth1, поэтому правило ограничено адресами туннеля и uplink-сети.
+table ip novavpn {
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 10.99.7.0/24 ip daddr 172.31.98.0/24 masquerade
+    }
+}

@@ -229,7 +229,7 @@ paths:
           description: Устройство зарегистрировано.
           headers:
             Idempotency-Replayed:
-              description: Присутствует при повторе того же ключа.
+              description: Присутствует при повторе того же запроса с тем же ключом.
               schema: { type: string, enum: ["true"] }
           content:
             application/json:
@@ -347,7 +347,7 @@ paths:
           description: Устройство-потомок создано, профили предка в overlap-окне.
           headers:
             Idempotency-Replayed:
-              description: Присутствует при повторе того же ключа.
+              description: Присутствует при повторе того же запроса с тем же ключом.
               schema: { type: string, enum: ["true"] }
           content:
             application/json:
@@ -399,7 +399,7 @@ paths:
           description: Профиль выдан.
           headers:
             Idempotency-Replayed:
-              description: Присутствует при повторе того же ключа.
+              description: Присутствует при повторе того же запроса с тем же ключом.
               schema: { type: string, enum: ["true"] }
           content:
             application/json:
@@ -1175,8 +1175,9 @@ paths:
       summary: Heartbeat узла.
       description: >
         load1 и cpu_pct — nullable: неизмеренное не превращается в ноль (§13.4).
-        Свежесть heartbeat решает availability в каталоге: окно 90 с, три интервала
-        опроса по 30 с.
+        Свежесть heartbeat решает availability в каталоге: окно 90 с; интервал
+        опроса узла 25 с с разбросом 10 процентов (не больше 27,5 с), то есть
+        окно — примерно три с четвертью интервала в худшем случае.
       security: [{ nodeBearerAuth: [] }]
       requestBody:
         required: true
@@ -1262,7 +1263,9 @@ components:
       name: Idempotency-Key
       in: header
       required: true
-      description: Ключ повторозащищённости (спецификация §5.2). Без него запрос отклоняется.
+      description: >
+        Ключ повторозащищённости (спецификация §5.2). Без него запрос отклоняется.
+        Повтор сравнивает метод, путь и тело; несовпадение даёт 409 idempotency_key_conflict.
       schema: { type: string, minLength: 1, maxLength: 200 }
     DeviceID:
       name: id
@@ -1867,6 +1870,7 @@ components:
         - config_version
         - mtu
         - listen_port
+        - tunnel_address
         - dns_servers
         - keepalive_sec
         - peers
@@ -1876,6 +1880,9 @@ components:
         config_version: { type: integer, format: int64 }
         mtu: { type: integer }
         listen_port: { type: integer }
+        tunnel_address:
+          type: string
+          description: "Адрес узла в туннеле с маской пула, например 10.99.7.1/24"
         dns_servers:
           type: array
           items: { type: string }
@@ -1914,10 +1921,24 @@ components:
         tx_bytes: { type: integer, format: int64, maximum: 1125899906842624 }
     Heartbeat:
       type: object
-      required: [agent_version, agent_uptime_sec, load1, cpu_pct, applied_config_version]
+      required: [agent_version, agent_uptime_sec, load1, cpu_pct, applied_config_version, stale]
       properties:
         agent_version: { type: string }
         agent_uptime_sec: { type: integer, format: int64 }
         load1: { type: ["number", "null"], description: "null — не измеряли" }
         cpu_pct: { type: ["number", "null"], description: "null — не измеряли" }
         applied_config_version: { type: integer, format: int64 }
+        stale:
+          type: boolean
+          description: >
+            true — последний цикл сходки не завершился (отказ получения
+            желаемого набора, снимка или применения; с 2026-11-05 любой
+            незавершившийся цикл, а не только недоступный API); узел
+            продолжает обслуживать текущих клиентов на последнем применённом
+            наборе. Следующий цикл идёт без If-None-Match и ждёт полный ответ,
+            а не согласование по 304, только когда локальное состояние стало
+            неизвестным или неверным: после ответа 304 без условного запроса,
+            после отказа снимка, после отказа применения и после отказа записи
+            применённого набора. При отказе получения набора признак сходки и
+            применённый ETag сохраняются, а цикл повторяется с условным
+            запросом.

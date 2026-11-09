@@ -1,0 +1,35 @@
+- name: Проверить обязательные переменные и запрет http
+  ansible.builtin.assert:
+    that:
+      - novavpn_node_api_url is defined
+      - novavpn_node_pool is defined
+      - novavpn_node_uplink_iface is defined
+      - novavpn_node_binary_src is defined
+      - novavpn_node_api_url is match('^https://')
+    fail_msg: >-
+      нужны novavpn_node_api_url (только https), novavpn_node_pool,
+      novavpn_node_uplink_iface, novavpn_node_binary_src
+
+- name: Проверить форму пула и имён интерфейсов
+  ansible.builtin.assert:
+    that:
+      - novavpn_node_pool is match('^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$')
+      - novavpn_node_interface is match('^[A-Za-z0-9_.-]{1,15}$')
+      - novavpn_node_uplink_iface is match('^[A-Za-z0-9_.-]{1,15}$')
+    fail_msg: >-
+      novavpn_node_pool должен быть CIDR вида 10.99.7.0/24, а имена интерфейсов —
+      не длиннее 15 символов из букв, цифр, подчёркивания, точки и дефиса:
+      эти значения подставляются в файл таблицы nftables, и опечатка в них
+      обнаружилась бы только при отказе применения набора
+
+- name: Пакеты, каталоги, sysctl, nftables, юнит, первый бинарник
+  ansible.builtin.import_tasks: install.yml
+
+- name: Применить sysctl и nftables до первого запуска
+  ansible.builtin.meta: flush_handlers
+
+- name: Регистрация узла и ключ
+  ansible.builtin.import_tasks: enroll.yml
+
+- name: Обновление бинарника, запуск, откат
+  ansible.builtin.import_tasks: deploy.yml

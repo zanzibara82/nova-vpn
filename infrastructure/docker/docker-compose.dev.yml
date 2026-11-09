@@ -25,3 +25,37 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+  api:
+    profiles: ["node"]
+    image: novavpn-api:dev
+    build:
+      context: ../..
+      dockerfile: Dockerfile.api
+    env_file:
+      - path: ${NOVAVPN_NODE_DEV_ENV_FILE:-.env.node}
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  node-agent:
+    profiles: ["node"]
+    image: novavpn-node-agent:dev
+    build:
+      context: ../..
+      dockerfile: Dockerfile.node-agent
+    depends_on:
+      api:
+        condition: service_started
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      NOVAVPN_NODE_ENV: dev
+      NOVAVPN_NODE_API_URL: http://api:8080
+      NOVAVPN_NODE_ALLOW_INSECURE_API: "true"
+      NOVAVPN_NODE_STATE_DIR: /var/lib/novavpn-node
+    volumes:
+      - novavpn-node-state:/var/lib/novavpn-node
+
+volumes:
+  novavpn-node-state:

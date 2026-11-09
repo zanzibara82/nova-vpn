@@ -1,0 +1,8 @@
+galaxy_info:
+  role_name: novavpn_node
+  author: NovaVPN Dev
+  description: Установка узла NovaVPN — systemd, sysctl, своя таблица nftables и авто-откат обновления
+  license: Proprietary
+  min_ansible_version: "2.15"
+
+dependencies: []

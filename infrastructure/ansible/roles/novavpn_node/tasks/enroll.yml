@@ -1,0 +1,55 @@
+- name: Состояние узла
+  ansible.builtin.stat:
+    path: "{{ novavpn_node_state_dir }}/state.json"
+  register: node_state
+
+- name: Показать публичный ключ для создания сервера
+  ansible.builtin.command: "{{ novavpn_node_bin }} init"
+  become: true
+  become_user: "{{ novavpn_node_user }}"
+  environment:
+    NOVAVPN_NODE_ENV: prod
+    NOVAVPN_NODE_API_URL: "{{ novavpn_node_api_url }}"
+    NOVAVPN_NODE_CA_FILE: "{{ novavpn_node_ca_file }}"
+    NOVAVPN_NODE_STATE_DIR: "{{ novavpn_node_state_dir }}"
+  register: node_init
+  changed_when: false
+  when: not node_state.stat.exists
+
+- name: Публичный ключ узла
+  ansible.builtin.debug:
+    msg: "{{ node_init.stdout_lines }}"
+  when: not node_state.stat.exists
+
+- name: Прочитать bootstrap-токен
+  ansible.builtin.slurp:
+    src: "{{ novavpn_node_bootstrap_file }}"
+  register: node_bootstrap
+  no_log: true
+  when: not node_state.stat.exists and novavpn_node_enroll | bool
+
+- name: Зарегистрировать узел токеном из stdin
+  ansible.builtin.command:
+    cmd: "{{ novavpn_node_bin }} enroll"
+    stdin: "{{ node_bootstrap.content | b64decode }}"
+    creates: "{{ novavpn_node_state_dir }}/state.json"
+  become: true
+  become_user: "{{ novavpn_node_user }}"
+  environment:
+    NOVAVPN_NODE_ENV: prod
+    NOVAVPN_NODE_API_URL: "{{ novavpn_node_api_url }}"
+    NOVAVPN_NODE_CA_FILE: "{{ novavpn_node_ca_file }}"
+    NOVAVPN_NODE_STATE_DIR: "{{ novavpn_node_state_dir }}"
+  no_log: true
+  register: node_enroll
+  ignore_errors: true
+  when: not node_state.stat.exists and novavpn_node_enroll | bool
+
+- name: Прервать прогон при отказе регистрации с подсказкой
+  ansible.builtin.fail:
+    msg: >-
+      регистрация узла не выполнена: проверьте, что bootstrap-токен свежий и не
+      использован, что адрес API доступен с узла по https, и что переменные
+      NOVAVPN_NODE_API_URL, NOVAVPN_NODE_CA_FILE, NOVAVPN_NODE_STATE_DIR
+      переданы задаче верно; значения в журнале скрыты намеренно
+  when: node_enroll.failed | default(false)

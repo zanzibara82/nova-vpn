@@ -1,0 +1,41 @@
+[Unit]
+Description=NovaVPN node agent
+# Порядок подъёма держится на графе зависимостей, а не на соглашении о двух
+# целях: агент ждёт свою таблицу nftables явно. Wants нужен потому, что на
+# перезагрузке юнит применения фильтра не попадает в транзакцию сам по себе, а
+# без него After= ничего не удерживает. systemd складывает повторные ключи
+# After= и Wants=, поэтому соседняя строка про network-online.target не затирается.
+After=novavpn-nft-apply.service
+Wants=novavpn-nft-apply.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ novavpn_node_user }}
+Group={{ novavpn_node_user }}
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+EnvironmentFile={{ novavpn_node_config_dir }}/agent.env
+StateDirectory=novavpn-node
+StateDirectoryMode=0700
+UMask=0077
+ExecStart={{ novavpn_node_bin }} run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
