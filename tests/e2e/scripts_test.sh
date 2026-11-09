@@ -6,8 +6,8 @@
 # повреждённый ключ, неожиданный конфиг API, порядок NAT/DNS, чтение списка
 # пиеров и ожидание пиера в туннеле, порядок фаз dns и limit, порядок перехвата
 # DNS-трафика, чувствительность положительного контроля, лимит устройств по коду
-# ошибки и явный порядок systemd-юнитов роли узла). Путь пакетов доказывает живой
-# прогон.
+# ошибки и явный порядок systemd-юнитов роли узла, код возврата ворот форматирования).
+# Путь пакетов доказывает живой прогон.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -1950,6 +1950,52 @@ grep -Eq '^[[:space:]]*After=[^#]*network-online\.target' "$NODE_UNIT" \
 	&& grep -Eq '^Type=oneshot$' "$NFT_UNIT" \
 	&& grep -Eq '^RemainAfterExit=yes$' "$NFT_UNIT"
 check $? "агент ждёт network-online.target, фильтр остаётся oneshot с RemainAfterExit"
+
+# --- Ворота форматирования: код возврата gofmt ---
+# Извлекается оболочка самой цели, а не её пересказ: подставной gofmt проверяет,
+# что ошибка инструмента не превращается в успешную проверку пустого вывода.
+fmt_shell=$(awk -v q="'" '
+	/^fmt-check:/ { active = 1; next }
+	active && /^\t/ {
+		line = $0
+		sub(/^\t */, "", line)
+		sub(/ \\$/, "", line)
+		recipe = recipe line
+		next
+	}
+	active { exit }
+	END {
+		pattern = "sh -c " q "[^" q "]+" q
+		if (match(recipe, pattern)) {
+			command = substr(recipe, RSTART + 7, RLENGTH - 8)
+			gsub(/\$\$/, "$", command)
+			print command
+		}
+	}
+' "$ROOT/Makefile")
+
+fmt_gate_run() { # код_gofmt вывод_gofmt
+	printf 'gofmt() { printf "%%s" "%s"; return %s; }; %s' "$2" "$1" "$fmt_shell" \
+		| sh > "$TMPROOT/fmt-gate.out" 2>&1
+}
+
+# 100. Чистое дерево проходит.
+fmt_gate_run 0 ''
+code=$?
+[ "$code" -eq 0 ] && [ ! -s "$TMPROOT/fmt-gate.out" ]
+check $? "fmt-check пропускает чистый вывод gofmt (код $code)"
+
+# 101. Список неотформатированных файлов печатается и даёт отказ.
+fmt_gate_run 0 'internal/example.go\n'
+code=$?
+[ "$code" -ne 0 ] && grep -q 'internal/example.go' "$TMPROOT/fmt-gate.out"
+check $? "fmt-check печатает список файлов и отказывает (код $code)"
+
+# 102. Ошибка gofmt без stdout не считается чистым деревом.
+fmt_gate_run 2 ''
+code=$?
+[ "$code" -eq 2 ]
+check $? "fmt-check передаёт код ошибки gofmt без вывода (код $code)"
 
 printf '%s\n' "проверок: $CASES, отказов: $FAILS"
 [ "$FAILS" -eq 0 ]

@@ -74,6 +74,42 @@ func TestDeviceLimitIsHard(t *testing.T) {
 	}
 }
 
+func TestDeviceNameCountsCharacters(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cases := []struct {
+		name    string
+		value   string
+		invalid bool
+	}{
+		{name: "пустое", invalid: true},
+		{name: "ASCII 1", value: "x"},
+		{name: "ASCII 64", value: strings.Repeat("x", 64)},
+		{name: "ASCII 65", value: strings.Repeat("x", 65), invalid: true},
+		{name: "кириллица 33", value: strings.Repeat("я", 33)},
+		{name: "кириллица 64", value: strings.Repeat("я", 64)},
+		{name: "кириллица 65", value: strings.Repeat("я", 65), invalid: true},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, q := newDeviceSvc(t)
+			user := seedUser(t, ctx, q, true)
+			device, err := svc.Register(ctx, user, devices.RegisterInput{
+				PublicKey: keyAt(i), Platform: "linux", Name: tc.value,
+			})
+			if tc.invalid {
+				if !errors.Is(err, devices.ErrInvalidName) {
+					t.Fatalf("err = %v, want ErrInvalidName", err)
+				}
+				return
+			}
+			if err != nil || device.Name != tc.value {
+				t.Fatalf("register: err=%v, имя=%q, ожидалось %q", err, device.Name, tc.value)
+			}
+		})
+	}
+}
+
 func list0ID(t *testing.T, ctx context.Context, user uuid.UUID) uuid.UUID {
 	t.Helper()
 	svc, _ := newDeviceSvc(t)

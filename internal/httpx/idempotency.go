@@ -24,9 +24,9 @@ type Idempotency struct {
 
 func NewIdempotency(store IdempotencyStore) *Idempotency { return &Idempotency{store: store} }
 
-// Middleware защищает критическую операцию (спецификация §5.2): повтор с тем же
-// Idempotency-Key возвращает первый результат; конфликт тела — 409; незавершённый
-// первый вызов — 409 in_progress, а не тихое ожидание.
+// Middleware защищает критическую операцию (спецификация §5.2): повтор того же
+// запроса с тем же Idempotency-Key возвращает первый результат; другой метод, путь
+// или тело — 409; незавершённый первый вызов — 409 in_progress, а не тихое ожидание.
 func (i *Idempotency) Middleware(route string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -51,17 +51,22 @@ func (i *Idempotency) Middleware(route string) func(http.Handler) http.Handler {
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			hash := sha256.Sum256(body)
+			// Путь входит в отпечаток: один ключ и тело для разных устройств — разные
+			// запросы, иначе повтор вернул бы профиль не того устройства.
+			digest := sha256.New()
+			_, _ = io.WriteString(digest, r.Method+"\n"+r.URL.RequestURI()+"\n")
+			_, _ = digest.Write(body)
+			hash := digest.Sum(nil)
 
-			existing, found, err := i.store.Claim(r.Context(), userID, route, key, hash[:])
+			existing, found, err := i.store.Claim(r.Context(), userID, route, key, hash)
 			if err != nil {
 				WriteError(w, r, http.StatusInternalServerError, ErrInternal, "idempotency claim failed", nil)
 				return
 			}
 			if found {
-				if !bytes.Equal(existing.RequestHash, hash[:]) {
+				if !bytes.Equal(existing.RequestHash, hash) {
 					WriteError(w, r, http.StatusConflict, ErrIdempotencyConflict,
-						"Idempotency-Key was already used with a different request body", nil)
+						"Idempotency-Key was already used with a different request", nil)
 					return
 				}
 				if existing.CompletedAt == nil {
@@ -108,6 +113,7 @@ func (c *captureWriter) WriteHeader(status int) {
 func (c *captureWriter) Write(p []byte) (int, error) {
 	// Сохраняем тело для повтора и одновременно отдаём его клиенту.
 	c.body.Write(p)
-	c.completed = true
+	// Запись тела не отменяет отказ 5xx: слот должен освободиться для повтора.
+	c.completed = c.status < 500
 	return c.ResponseWriter.Write(p)
 }

@@ -6,7 +6,7 @@ ANSIBLE_IMAGE ?= python:3.12-slim
 ANSIBLE_CORE ?= 2.17.6
 ANSIBLE_LINT ?= 24.10.0
 
-# Хостовы порты dev-стека. Занятые по умолчанию — не гипотеза: на этой машине 5432
+# Порты dev-стека на хосте. Занятые по умолчанию — не гипотеза: на этой машине 5432
 # держит служба postgresql-x64-17, а 6379 — локальный redis, и connect с тестового
 # контейнера уходит в чужой сервер (SASL-ошибка на несуществующую роль). Порты
 # переопределяют одной строкой: make integration POSTGRES_HOST_PORT=5433.
@@ -60,7 +60,7 @@ vet:
 # и лишний инструмент в воротах не должен решать, что считать правильным.
 fmt-check:
 	MSYS_NO_PATHCONV=1 docker run --rm $(DOCKER_FLAGS) $(GO_IMAGE) \
-	  sh -c 'out=$$(gofmt -l .); if [ -n "$$out" ]; then printf "%s\n" "$$out"; exit 1; fi'
+	  sh -c 'out=$$(gofmt -l .) || exit $$?; if [ -n "$$out" ]; then printf "%s\n" "$$out"; exit 1; fi'
 
 mod:
 	$(docker-go) mod tidy

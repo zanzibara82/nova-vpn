@@ -229,7 +229,7 @@ paths:
           description: Устройство зарегистрировано.
           headers:
             Idempotency-Replayed:
-              description: Присутствует при повторе того же ключа.
+              description: Присутствует при повторе того же запроса с тем же ключом.
               schema: { type: string, enum: ["true"] }
           content:
             application/json:
@@ -347,7 +347,7 @@ paths:
           description: Устройство-потомок создано, профили предка в overlap-окне.
           headers:
             Idempotency-Replayed:
-              description: Присутствует при повторе того же ключа.
+              description: Присутствует при повторе того же запроса с тем же ключом.
               schema: { type: string, enum: ["true"] }
           content:
             application/json:
@@ -399,7 +399,7 @@ paths:
           description: Профиль выдан.
           headers:
             Idempotency-Replayed:
-              description: Присутствует при повторе того же ключа.
+              description: Присутствует при повторе того же запроса с тем же ключом.
               schema: { type: string, enum: ["true"] }
           content:
             application/json:
@@ -1263,7 +1263,9 @@ components:
       name: Idempotency-Key
       in: header
       required: true
-      description: Ключ повторозащищённости (спецификация §5.2). Без него запрос отклоняется.
+      description: >
+        Ключ повторозащищённости (спецификация §5.2). Без него запрос отклоняется.
+        Повтор сравнивает метод, путь и тело; несовпадение даёт 409 idempotency_key_conflict.
       schema: { type: string, minLength: 1, maxLength: 200 }
     DeviceID:
       name: id
