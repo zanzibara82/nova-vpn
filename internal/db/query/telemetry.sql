@@ -1,6 +1,5 @@
 -- name: UpsertServerHealth :exec
--- Один узел = одна строка наблюдаемого состояния; heartbeat и observed пишут её
--- одними руками, поэтому наивный INSERT убивал бы второй отчёт того же узла.
+-- Только тестовые данные; отчёты пишут MarkObservedHealth и MarkServerHealth, сохраняя независимые поля.
 INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
                            interface_rx_bytes, interface_tx_bytes, load1, cpu_pct,
                            applied_config_version, status, agent_version, agent_uptime_sec)
@@ -47,6 +46,7 @@ SELECT server_id, observed_at, peers_configured, peers_handshaked,
 FROM server_health WHERE server_id = $1;
 
 -- name: MarkObservedHealth :exec
+-- Восстанавливает status только heartbeat(false), в том числе после sweeper.
 INSERT INTO server_health (server_id, observed_at, peers_configured, peers_handshaked,
                            interface_rx_bytes, interface_tx_bytes, applied_config_version, status)
 VALUES ($1, $2, $3, $4, $5, $6, $7, 'ok')
@@ -56,19 +56,20 @@ ON CONFLICT (server_id) DO UPDATE SET
     peers_handshaked = EXCLUDED.peers_handshaked,
     interface_rx_bytes = EXCLUDED.interface_rx_bytes,
     interface_tx_bytes = EXCLUDED.interface_tx_bytes,
-    applied_config_version = EXCLUDED.applied_config_version,
-    status = 'ok';
+    applied_config_version = EXCLUDED.applied_config_version;
 
 -- name: MarkServerHealth :exec
 INSERT INTO server_health (server_id, observed_at, load1, cpu_pct,
                            applied_config_version, status, agent_version, agent_uptime_sec)
-VALUES ($1, $2, $3, $4, $5, 'ok', $6, $7)
+VALUES (sqlc.arg(server_id), sqlc.arg(observed_at), sqlc.arg(load1), sqlc.arg(cpu_pct),
+        sqlc.arg(applied_config_version), sqlc.arg(status)::health_status,
+        sqlc.arg(agent_version), sqlc.arg(agent_uptime_sec))
 ON CONFLICT (server_id) DO UPDATE SET
     observed_at = EXCLUDED.observed_at,
     load1 = EXCLUDED.load1,
     cpu_pct = EXCLUDED.cpu_pct,
     applied_config_version = EXCLUDED.applied_config_version,
-    status = 'ok',
+    status = EXCLUDED.status,
     agent_version = EXCLUDED.agent_version,
     agent_uptime_sec = EXCLUDED.agent_uptime_sec;
 

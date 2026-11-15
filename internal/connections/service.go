@@ -263,7 +263,7 @@ func (s *Service) Revoke(ctx context.Context, userID, deviceID, serverID uuid.UU
 }
 
 // List — профили устройства. Проверка владельца здесь, а не «вызывающий handler
-// проверил»: сервис вызывается и из задач 6..13, и из тестов, и одно забытое
+// проверил»: сервис вызывается и из задач 6..13, и из тестов, и одна забытая
 // проверка превращается в чтение чужих адресов.
 func (s *Service) List(ctx context.Context, userID, deviceID uuid.UUID) ([]db.VpnProfile, error) {
 	if _, err := s.ownedDevice(ctx, deviceID, userID); err != nil {

@@ -268,7 +268,7 @@ func TestDesiredComputeServerStateAndMetadata(t *testing.T) {
 	q := db.New(p)
 	user := seedUser(t, ctx, q, true)
 	device := seedDevice(t, ctx, q, user, 0)
-	srv := seedServer(t, ctx, q, "10.97.5.0/24")
+	srv := seedServer(t, ctx, q, "10.97.5.0/29")
 	seedProfile(t, ctx, q, device.ID, srv.ID, "10.97.5.2", time.Hour)
 	if _, err := p.Exec(ctx, "UPDATE vpn_servers SET mtu = 1380, listen_port = 51971, keepalive_sec = 17, config_version = 42 WHERE id = $1", srv.ID); err != nil {
 		t.Fatal(err)
@@ -289,6 +289,9 @@ func TestDesiredComputeServerStateAndMetadata(t *testing.T) {
 			}
 			if got.ServerID != srv.ID.String() || got.ConfigVersion != stored.ConfigVersion || got.MTU != 1380 || got.ListenPort != 51971 || got.KeepaliveSec != 17 || !slices.Equal(got.DNSServers, []string{"10.97.5.1"}) || !got.MeasuredAt.Equal(now) || got.MeasuredAt.Location() != time.UTC {
 				t.Fatalf("неверные параметры узла: %+v", got)
+			}
+			if got.TunnelAddress != "10.97.5.1/29" {
+				t.Fatalf("адрес узла = %q, ожидался 10.97.5.1/29", got.TunnelAddress)
 			}
 			if status == db.MaintenanceStatusOnline {
 				if len(got.Peers) != 1 {

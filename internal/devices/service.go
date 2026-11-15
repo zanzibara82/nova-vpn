@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -63,7 +64,7 @@ func (s *Service) Register(ctx context.Context, userID uuid.UUID, in RegisterInp
 	if !ValidPlatform(in.Platform) {
 		return db.Device{}, ErrInvalidPlatform
 	}
-	if l := len(in.Name); l < 1 || l > 64 {
+	if l := utf8.RuneCountInString(in.Name); l < 1 || l > 64 {
 		return db.Device{}, ErrInvalidName
 	}
 

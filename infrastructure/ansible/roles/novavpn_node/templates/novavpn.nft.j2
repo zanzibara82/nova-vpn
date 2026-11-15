@@ -1,0 +1,15 @@
+# Своя таблица целиком, политика forward — accept: главный фильтр входящего —
+# хостовый firewall оператора, и роль не меняет чужую политику молча.
+table inet novavpn {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    ct state established,related accept
+    iifname "{{ novavpn_node_interface }}" oifname "{{ novavpn_node_uplink_iface }}" accept
+    iifname "{{ novavpn_node_uplink_iface }}" oifname "{{ novavpn_node_interface }}" accept
+  }
+
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr {{ novavpn_node_pool }} oifname "{{ novavpn_node_uplink_iface }}" masquerade
+  }
+}

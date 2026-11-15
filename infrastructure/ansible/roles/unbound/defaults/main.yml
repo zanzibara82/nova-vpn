@@ -1,0 +1,3 @@
+unbound_num_threads: 2
+unbound_msg_cache: 32m
+unbound_rrset_cache: 64m

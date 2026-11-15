@@ -58,6 +58,7 @@ type Heartbeat struct {
 	Load1                *float64 `json:"load1"`
 	CPUPct               *float64 `json:"cpu_pct"`
 	AppliedConfigVersion int64    `json:"applied_config_version"`
+	Stale                bool     `json:"stale"`
 }
 
 type Service struct {
@@ -167,9 +168,14 @@ func (s *Service) IngestHeartbeat(ctx context.Context, serverID uuid.UUID, hb He
 	if hb.AgentUptimeSec < 0 || hb.AppliedConfigVersion < 0 || !validMetric(hb.Load1, 999) || !validMetric(hb.CPUPct, 100) {
 		return ErrInvalidReport
 	}
+	status := db.HealthStatusOk
+	if hb.Stale {
+		status = db.HealthStatusStale
+	}
 	if err := db.New(s.pool).MarkServerHealth(ctx, db.MarkServerHealthParams{
 		ServerID: serverID, ObservedAt: now, Load1: numeric(hb.Load1), CpuPct: numeric(hb.CPUPct),
-		AppliedConfigVersion: hb.AppliedConfigVersion, AgentVersion: &hb.AgentVersion, AgentUptimeSec: &hb.AgentUptimeSec,
+		AppliedConfigVersion: hb.AppliedConfigVersion, Status: status,
+		AgentVersion: &hb.AgentVersion, AgentUptimeSec: &hb.AgentUptimeSec,
 	}); err != nil {
 		return fmt.Errorf("telemetry: ingest heartbeat: %w", err)
 	}

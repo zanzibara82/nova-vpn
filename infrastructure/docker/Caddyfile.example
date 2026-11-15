@@ -1,0 +1,36 @@
+{
+	# ACME без явного email не регистрируется: адрес нужен для уведомлений о
+	# продлении и для отзыва сертификата.
+	email ops@novavpn.example
+	admin off
+}
+
+# Публичный API и внутренний контракт узла — один и тот же хост: у узла нет
+# отдельного «доверенного» порта без TLS, он ходит на https:// и проверяет
+# сертификат обычным образом (спецификация §4.4).
+api.novavpn.example {
+	encode zstd gzip
+
+	reverse_proxy api:8080 {
+		# API намеренно не читает X-Forwarded-For: этот заголовок контролирует
+		# клиент, и доверие к нему позволило бы подделать ключ rate limit.
+		# Заголовки ниже оставлены для журналов и диагностики, но IP в API —
+		# адрес прокси (см. ограничение §13).
+		header_up X-Real-IP {remote_host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/api.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		format json
+	}
+}

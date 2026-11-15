@@ -28,6 +28,7 @@ type DesiredSet struct {
 	ConfigVersion int64     `json:"config_version"`
 	MTU           int       `json:"mtu"`
 	ListenPort    int       `json:"listen_port"`
+	TunnelAddress string    `json:"tunnel_address"`
 	DNSServers    []string  `json:"dns_servers"`
 	KeepaliveSec  int       `json:"keepalive_sec"`
 	Peers         []Peer    `json:"peers"`
@@ -48,6 +49,10 @@ type candidate struct {
 
 var ErrServerUnknown = errors.New("servers: server not found")
 
+func TunnelAddress(pool netip.Prefix) string {
+	return netip.PrefixFrom(connections.NodeTunnelAddress(pool), pool.Bits()).String()
+}
+
 func Compute(ctx context.Context, q *db.Queries, serverID uuid.UUID, now time.Time) (DesiredSet, error) {
 	srv, err := q.ServerByID(ctx, serverID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -59,8 +64,9 @@ func Compute(ctx context.Context, q *db.Queries, serverID uuid.UUID, now time.Ti
 	out := DesiredSet{
 		ServerID: serverID.String(), ConfigVersion: srv.ConfigVersion,
 		MTU: int(srv.Mtu), ListenPort: int(srv.ListenPort),
-		DNSServers:   []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()},
-		KeepaliveSec: int(srv.KeepaliveSec), Peers: []Peer{}, MeasuredAt: now.UTC(),
+		TunnelAddress: TunnelAddress(srv.AddressPoolV4),
+		DNSServers:    []string{connections.NodeTunnelAddress(srv.AddressPoolV4).String()},
+		KeepaliveSec:  int(srv.KeepaliveSec), Peers: []Peer{}, MeasuredAt: now.UTC(),
 	}
 	if srv.MaintenanceStatus != db.MaintenanceStatusOnline {
 		return out, nil

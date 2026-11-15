@@ -1,0 +1,102 @@
+- name: Текущий бинарник на узле
+  ansible.builtin.stat:
+    path: "{{ novavpn_node_bin }}"
+    get_checksum: true
+  register: node_bin_current
+
+- name: Нужен ли обмен бинарника
+  ansible.builtin.set_fact:
+    node_bin_update: >-
+      {{ not node_bin_current.stat.exists
+         or node_bin_current.stat.checksum != node_bin_src.stat.checksum }}
+
+- name: Сохранить предыдущий бинарник для отката
+  ansible.builtin.copy:
+    src: "{{ novavpn_node_bin }}"
+    dest: "{{ novavpn_node_bin }}.prev"
+    remote_src: true
+    mode: "0755"
+  when: node_bin_current.stat.exists
+  changed_when: false
+
+- name: Положить новый бинарник рядом
+  ansible.builtin.copy:
+    src: "{{ novavpn_node_binary_src }}"
+    dest: "{{ novavpn_node_bin }}.new"
+    owner: root
+    group: root
+    mode: "0755"
+  when: node_bin_update | bool
+
+- name: Заменить бинарник
+  ansible.builtin.copy:
+    src: "{{ novavpn_node_bin }}.new"
+    dest: "{{ novavpn_node_bin }}"
+    remote_src: true
+    mode: "0755"
+  register: node_bin_installed
+  when: node_bin_update | bool
+
+- name: Убрать временную копию
+  ansible.builtin.file:
+    path: "{{ novavpn_node_bin }}.new"
+    state: absent
+  when: node_bin_update | bool
+
+- name: Включить агент в автозапуск
+  ansible.builtin.systemd:
+    name: novavpn-node-agent
+    enabled: true
+    daemon_reload: true
+
+- name: Состояние регистрации узла
+  ansible.builtin.stat:
+    path: "{{ novavpn_node_state_dir }}/state.json"
+  register: node_registration
+
+- name: Перезапустить агент
+  ansible.builtin.systemd:
+    name: novavpn-node-agent
+    state: restarted
+  when: node_registration.stat.exists
+
+- name: Взвести таймер отката
+  ansible.builtin.command:
+    cmd: >-
+      systemd-run --unit=novavpn-rollback-{{ ansible_facts.date_time.epoch }}
+      --on-active={{ novavpn_node_rollback_delay_sec }}
+      {{ novavpn_node_lib_dir }}/novavpn-rollback.sh
+  changed_when: true
+  when: node_registration.stat.exists
+
+- name: Дождаться активного состояния
+  ansible.builtin.service_facts:
+  register: node_active
+  until: node_active.ansible_facts.services.get('novavpn-node-agent.service', {}).state == 'running'
+  retries: 20
+  delay: 3
+  changed_when: false
+  when: node_registration.stat.exists
+
+- name: Локальное состояние узла
+  ansible.builtin.command: "{{ novavpn_node_bin }} status"
+  environment:
+    NOVAVPN_NODE_ENV: prod
+    NOVAVPN_NODE_API_URL: "{{ novavpn_node_api_url }}"
+    NOVAVPN_NODE_CA_FILE: "{{ novavpn_node_ca_file }}"
+    NOVAVPN_NODE_STATE_DIR: "{{ novavpn_node_state_dir }}"
+  register: node_status
+  changed_when: false
+  when: node_registration.stat.exists
+
+- name: Состояние узла
+  ansible.builtin.debug:
+    msg: "{{ node_status.stdout_lines }}"
+  when: node_registration.stat.exists
+
+- name: Снять таймер отката после успешного старта
+  ansible.builtin.systemd:
+    name: "novavpn-rollback-{{ ansible_facts.date_time.epoch }}.timer"
+    state: stopped
+  failed_when: false
+  when: node_registration.stat.exists

@@ -18,6 +18,8 @@
 id_ed25519*
 secrets/
 infrastructure/ansible/*.retry
+infrastructure/ansible/inventory.ini
+artifacts/
 
 # Приватные ключи WireGuard, создаваемые узлом локально
 etc_priv/

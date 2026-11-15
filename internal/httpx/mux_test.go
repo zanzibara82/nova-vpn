@@ -197,9 +197,11 @@ func TestEnvelopeTrailingSlashIsNotFound(t *testing.T) {
 }
 
 func TestEnvelopeKeepsServeMuxPathCleanupRedirect(t *testing.T) {
-	// "/api/v1//devices" Go чистит и отвечает 301 сам; pattern при этом —
-	// зарегистрированный маршрут. Envelope обязан пропустить этот handler:
-	// редирект не скрывает токенов и не ломает формат ошибок (тела у 301 нет).
+	// Редирект при чистке пути "/api/v1//devices" пишет сама библиотека языка,
+	// а не конверт: pattern при этом — зарегистрированный маршрут. С Go 1.26
+	// этот редирект — 307 (метод и тело сохраняются), а не прежний 301.
+	// Envelope обязан пропустить этот handler: Location остаётся
+	// "/api/v1/devices", редирект не скрывает токенов и не ломает формат ошибок.
 	var buf bytes.Buffer
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/devices", func(http.ResponseWriter, *http.Request) {})
@@ -207,8 +209,8 @@ func TestEnvelopeKeepsServeMuxPathCleanupRedirect(t *testing.T) {
 	w := httptest.NewRecorder()
 	chain(mux, slog.New(slog.NewJSONHandler(&buf, nil))).ServeHTTP(w,
 		httptest.NewRequest(http.MethodGet, "/api/v1//devices", nil))
-	if w.Code != http.StatusMovedPermanently {
-		t.Fatalf("status = %d %q, want 301", w.Code, w.Body.String())
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d %q, want 307", w.Code, w.Body.String())
 	}
 	if loc := w.Header().Get("Location"); loc != "/api/v1/devices" {
 		t.Errorf("Location = %q, want /api/v1/devices", loc)

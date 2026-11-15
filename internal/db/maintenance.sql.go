@@ -126,8 +126,9 @@ UPDATE server_health SET status = 'stale'
  RETURNING server_id
 `
 
-// «Узел не присылал heartbeat 3 интервала» (3 × 30 с = 90 с, §4.3). Возвращает
-// server_id, чтобы на каждый переход записать событие node_stale.
+// Окно 90 с (§4.3): при интервале опроса узла 25 с с разбросом 10 процентов
+// (не больше 27,5 с) это примерно три с четвертью интервала в худшем случае.
+// Возвращает server_id, чтобы на каждый переход записать событие node_stale.
 func (q *Queries) MarkStaleHealth(ctx context.Context) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, markStaleHealth)
 	if err != nil {

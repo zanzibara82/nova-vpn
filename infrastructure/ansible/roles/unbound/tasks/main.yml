@@ -1,0 +1,131 @@
+- name: Пакет unbound
+  ansible.builtin.apt:
+    name: unbound
+    state: present
+    update_cache: true
+
+- name: Каталог доверенного ключа DNSSEC
+  ansible.builtin.file:
+    path: /var/lib/unbound
+    state: directory
+    owner: unbound
+    group: unbound
+    mode: "0755"
+
+- name: Начальный файл доверенного ключа
+  ansible.builtin.command: unbound-anchor -a /var/lib/unbound/root.key
+  args:
+    creates: /var/lib/unbound/root.key
+  register: unbound_anchor
+  # Код 1 — «якорь записан», а не отказ: проверено на alpine:3.20 с unbound 1.20,
+  # первый вызов вернул 1 и оставил валидный root.key, повторный — 0. Модуль command
+  # считает любой непустой код ошибкой, и без failed_when роль падала бы на первом
+  # прогоне при уже созданном файле.
+  failed_when: unbound_anchor.rc not in [0, 1]
+  changed_when: unbound_anchor.rc == 1
+
+- name: Якорь DNSSEC на месте
+  ansible.builtin.stat:
+    path: /var/lib/unbound/root.key
+  register: unbound_anchor_file
+
+- name: Без якоря валидация DNSSEC не поднимется
+  ansible.builtin.assert:
+    that:
+      - unbound_anchor_file.stat.exists
+      - unbound_anchor_file.stat.size > 0
+    fail_msg: "unbound-anchor не создал /var/lib/unbound/root.key"
+
+# Наличие systemd-resolved судим по файлу пакета /etc/systemd/resolved.conf, а не по
+# каталогу /etc/systemd/resolved.conf.d. Замеры этого раунда (task-15fix-resolved-*.log):
+# файла нет ни в debian:bookworm-slim, ни в debian:12, ни в ubuntu:24.04, а после
+# apt-get install systemd-resolved он появляется вместе с содержимым пакета, тогда как
+# каталога drop-in после установки всё равно нет. Значит отсутствие каталога не различает
+# «резолвера нет» и «каталог надо создать», и по каталогу решение принимать нельзя.
+- name: Установлен ли на хосте systemd-resolved
+  ansible.builtin.stat:
+    path: /etc/systemd/resolved.conf
+  register: unbound_resolved_package
+
+# Причина пропуска печатается: молчаливый пропуск читался бы как «stub отключили».
+- name: Пропуск задач про systemd-resolved на хосте без него
+  ansible.builtin.debug:
+    msg: >-
+      /etc/systemd/resolved.conf не найден: systemd-resolved на хосте не установлен,
+      поэтому каталог drop-in не создаётся, DNSStubListener=no не пишется и служба не
+      перезапускается — отключать нечего, unbound занимает 53 без конфликта.
+  when: not unbound_resolved_package.stat.exists
+
+- name: Каталог drop-in systemd-resolved
+  ansible.builtin.file:
+    path: /etc/systemd/resolved.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: unbound_resolved_package.stat.exists
+
+- name: Отключить stub-резолвер systemd (он занимает 127.0.0.53:53)
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/novavpn-no-stub.conf
+    content: |
+      [Resolve]
+      DNSStubListener=no
+    owner: root
+    group: root
+    mode: "0644"
+  # Модуль copy не создаёт родительский каталог, поэтому он заводится предыдущей
+  # задачей. Без этого на голом Debian 12 прогон падал здесь, и до шаблона конфига и до
+  # взвода unbound дело не доходило: узел оставался без DNS, хотя роль выглядела
+  # завершённой.
+  when: unbound_resolved_package.stat.exists
+  notify: Перезапустить systemd-resolved
+
+- name: Тип файла resolv.conf
+  ansible.builtin.stat:
+    path: /etc/resolv.conf
+    follow: false
+  register: unbound_resolv
+
+- name: Убрать символическую ссылку resolv.conf
+  ansible.builtin.file:
+    path: /etc/resolv.conf
+    state: absent
+  when: unbound_resolv.stat.islnk | default(false)
+
+- name: Резолвер хоста — собственный unbound
+  ansible.builtin.copy:
+    dest: /etc/resolv.conf
+    content: |
+      nameserver 127.0.0.1
+      options edns0 trust-ad
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Конфигурация unbound
+  ansible.builtin.template:
+    src: unbound.conf.j2
+    dest: /etc/unbound/unbound.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Перезагрузить unbound
+
+# Обработчик перезапуска systemd-resolved обязан отработать до привязки interface:
+# 0.0.0.0: на хосте с активным stub'ом первый старт unbound получает конфликт адреса
+# (список 0.0.0.0 пересекается с занятым 127.0.0.53:53) и задача state: started падает,
+# а помогать начинал только второй прогон плейбука. Без flush_handlers обработчики
+# дожидались бы конца плея, то есть уже состоявшейся задачи службы.
+# Порядок исполнения обработчиков при flush_handlers — по объявлению в handlers, а не
+# по времени уведомления: замер task-15fix-handler-order.log (ansible-core 2.17.6,
+# localhost), где уведомление первого обработчика пришло раньше, а выполнено оно было
+# третьим. Поэтому systemd-resolved объявлен первым в handlers/main.yml.
+- name: Отработать обработчикам DNS до взвода службы
+  ansible.builtin.meta: flush_handlers
+
+- name: Служба unbound
+  ansible.builtin.systemd:
+    name: unbound
+    enabled: true
+    state: started

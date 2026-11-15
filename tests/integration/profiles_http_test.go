@@ -160,6 +160,17 @@ func TestProfilesHTTPIssueReplayAndConflicts(t *testing.T) {
 		t.Errorf("адресов после повтора = %d, want 1", rows)
 	}
 
+	// Тот же ключ и тело, но другое устройство в пути: сохранённый профиль первого
+	// устройства не является результатом запроса для второго.
+	otherDevice := seedDevice(t, ctx, q, user, 1).ID
+	w = issueViaHTTP(t, h, user, otherDevice, srv.ID, key)
+	if w.Code != http.StatusConflict || decodeErr(t, w).Error.Code != "idempotency_key_conflict" {
+		t.Fatalf("ключ переиспользован для другого устройства: %d %s", w.Code, w.Body)
+	}
+	if profiles, err := q.CountActiveProfilesByDevice(ctx, otherDevice); err != nil || profiles != 0 {
+		t.Fatalf("у второго устройства профилей = %d, err=%v; конфликт не должен выдавать профиль", profiles, err)
+	}
+
 	// Тот же ключ, другое тело — конфликт, а не тихий повтор.
 	other := seedServer(t, ctx, q, "10.96.51.0/29")
 	setServerOnline(t, ctx, q, other.ID)
@@ -176,7 +187,7 @@ func TestProfilesHTTPIssueReplayAndConflicts(t *testing.T) {
 
 	// Сервер не online — отдельный код: «выбери другой сервер», а не «повтори этот».
 	maint := seedServer(t, ctx, q, "10.96.52.0/29")
-	w = issueViaHTTP(t, h, user, seedDevice(t, ctx, q, user, 1).ID, maint.ID, uuid.NewString())
+	w = issueViaHTTP(t, h, user, seedDevice(t, ctx, q, user, 2).ID, maint.ID, uuid.NewString())
 	if w.Code != http.StatusConflict || decodeErr(t, w).Error.Code != "server_not_available" {
 		t.Fatalf("выдача на maintenance: %d %s", w.Code, w.Body)
 	}

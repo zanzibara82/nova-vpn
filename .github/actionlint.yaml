@@ -1,0 +1,5 @@
+# Собственная метка раннера стенда E2E: без неё actionlint считает novavpn-e2e
+# неизвестной и роняет цель actionlint на валидном workflow.
+self-hosted-runner:
+  labels:
+    - novavpn-e2e

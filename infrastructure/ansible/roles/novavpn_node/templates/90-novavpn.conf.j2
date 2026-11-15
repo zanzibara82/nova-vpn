@@ -1,0 +1,9 @@
+# Форвардинг нужен только для туннеля; IPv6 выключен целиком (§8, ADR-007).
+# rp_filter=2: обратный путь пакетов из интернета идёт не тем интерфейсом, что
+# прямой (ответ приходит с uplink, а маршрут до пула — через {{ novavpn_node_interface }}),
+# и строгая проверка 1 отсортировала бы такой трафик молча.
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2

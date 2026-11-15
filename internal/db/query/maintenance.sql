@@ -12,8 +12,9 @@ WHERE p.status = 'active' AND p.expires_at <= now()
 ORDER BY p.id;
 
 -- name: MarkStaleHealth :many
--- «Узел не присылал heartbeat 3 интервала» (3 × 30 с = 90 с, §4.3). Возвращает
--- server_id, чтобы на каждый переход записать событие node_stale.
+-- Окно 90 с (§4.3): при интервале опроса узла 25 с с разбросом 10 процентов
+-- (не больше 27,5 с) это примерно три с четвертью интервала в худшем случае.
+-- Возвращает server_id, чтобы на каждый переход записать событие node_stale.
 UPDATE server_health SET status = 'stale'
  WHERE status = 'ok' AND observed_at < now() - interval '90 seconds'
  RETURNING server_id;

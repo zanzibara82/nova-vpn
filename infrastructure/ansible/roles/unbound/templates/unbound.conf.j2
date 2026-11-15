@@ -1,0 +1,55 @@
+# Рекурсия от корня, DNSSEC включён. Форвардера нет: на стенде он есть только
+# потому, что у стенда нет гарантированного выхода в интернет, и это ограничение
+# стенда, а не свойство unbound.
+server:
+    verbosity: 1
+    # Привязка к одному адресу невозможна: адрес туннеля появляется позже, чем стартует
+    # демон, потому что устройство создаёт агент после запуска службы, а bind на ещё не
+    # существующий адрес — это стартовая гонка, в которой демон не поднимается вовсе.
+    # Поэтому слушаем 0.0.0.0, и сокет выходит на публичный адрес тоже; чужих клиентов
+    # держит access-control ниже — замер task-15-acl-probe2.log (alpine:3.20,
+    # unbound 1.20.0): «пул allow + 0.0.0.0/0 refuse» чужому отказывает REFUSED, один
+    # refuse без пула — не отвечает даже своему. Второй слой — хостовый firewall, он
+    # обязан дропать 53/udp и 53/tcp с uplink; проверяется по docs/runbooks/node-deploy.md.
+    interface: 0.0.0.0
+    port: 53
+    do-ip4: yes
+    do-ip6: no
+    prefer-ip4: yes
+    do-udp: yes
+    do-tcp: yes
+    username: "unbound"
+    directory: "/etc/unbound"
+    chroot: ""
+    logfile: ""
+    use-syslog: no
+    # §8: содержимое запросов не журналируется ни в какой форме.
+    log-queries: no
+    log-replies: no
+    log-local-actions: no
+    log-servfail: no
+    extended-statistics: no
+    # Отвечаем только клиентам туннеля; всё остальное — отказ.
+    # 127.0.0.0/8 отдельно не открываем: замер task-15-acl-probe2.log (alpine:3.20, unbound 1.20.0)
+    # — «пул allow + 0.0.0.0/0 refuse» отвечает и с 127.0.0.1, один refuse — нет (§8: имя API резолвит узел).
+    access-control: {{ novavpn_node_pool }} allow
+    access-control: 0.0.0.0/0 refuse
+    hide-identity: yes
+    hide-version: yes
+    qname-minimisation: yes
+    minimal-responses: yes
+    prefetch: yes
+    rrset-roundrobin: yes
+    edns-buffer-size: 1232
+    max-udp-size: 1232
+    num-threads: {{ unbound_num_threads }}
+    msg-cache-size: {{ unbound_msg_cache }}
+    rrset-cache-size: {{ unbound_rrset_cache }}
+    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+    harden-dnssec-stripped: yes
+    harden-below-nxdomain: yes
+    harden-referral-path: yes
+    val-clean-additional: yes
+
+remote-control:
+    control-enable: no
