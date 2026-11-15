@@ -460,7 +460,8 @@ type routeCase struct {
 // блокировка. Один литерал на весь контур, чтобы одинаковые строки не разъезжались.
 // Числа в want/code — не «как удобно», а как обещано в api-spec/openapi.yaml;
 // расхождение ловит живая сверка контракта, а не этот список.
-func publicCases() []routeCase {
+// publicSessionCases — строки участника про устройства, /me и сессии.
+func publicSessionCases() []routeCase {
 	return []routeCase{
 		{"GET /devices аноним", http.StatusUnauthorized, "unauthenticated", func(t *testing.T, e *env) int {
 			resp, _ := raw(t, e, http.MethodGet, "/api/v1/devices", nil, nil)
@@ -705,6 +706,16 @@ func publicCases() []routeCase {
 				map[string]string{"refresh_token": strings.Repeat("q", 48)}, nil)
 			return resp.StatusCode
 		}},
+	}
+}
+
+// publicResourceCases — строки участника про каталог, устройства и профили: 45
+// вызовов. Разделение с сессиями вынужденное и замеренное: базовый бакет "any" —
+// 60 в запасе плюс 5 в секунду, а вся секция участника делала 77 вызовов. На
+// быстром раннере она укладывалась в 2,6 с, бюджет выходил 73, и последние строки
+// получали 429. Каждая половина ниже запаса 60 даже при нулевом времени секции.
+func publicResourceCases() []routeCase {
+	return []routeCase{
 
 		// --- A-2: каталог серверов ---
 		// Каталог закрыт аутентификацией, но не подпиской: истёкшая подписка и
@@ -1225,11 +1236,11 @@ func merge(a, b map[string]string) map[string]string {
 
 // matrixSection — один прогон матрицы: свой роутер и свой чистый Redis (isolatedRedis
 // чистит девятую базу при сборке роутера). Разделение вынужденное и замеренное: базовый
-// бакет "any" — 300 в минуту с burst 60, то есть длительная скорость 5 запросов в
-// секунду. Вся матрица A-2 в одном прогоне делает около 160 вызовов за считанные
-// секунды и честно упирается в собственный лимит, а не в проверяемое право. Каждый
-// контур — отдельный сценарий со своим бюджетом, и 429 внутри него по-прежнему
-// обрывает прогон.
+// бакет "any" — 300 в минуту с burst 60, то есть запас 60 и затем 5 запросов в секунду.
+// Секция участника делала 77 вызовов: на медленной машине её 13 с покрывали бюджет, а
+// на CI она уложилась в 2,6 с — бюджет 73, и последние строки получили 429. Поэтому
+// контуры и участник разделены так, чтобы каждая секция укладывалась в запас 60 даже
+// при нулевом времени, а 429 внутри секции по-прежнему обрывает прогон.
 type matrixSection struct {
 	name string
 	// journalRoutes — маршруты, строки которых обязаны быть в журнале этого прогона.
@@ -1241,7 +1252,8 @@ type matrixSection struct {
 
 func matrixSections() []matrixSection {
 	return []matrixSection{
-		{"участник", []string{"/api/v1/devices", "/api/v1/me"}, publicCases},
+		{"участник: сессии", []string{"/api/v1/me"}, publicSessionCases},
+		{"участник: ресурсы", []string{"/api/v1/devices"}, publicResourceCases},
 		{"администратор", []string{"/api/v1/admin"}, adminCases},
 		{"узел", []string{"/internal/v1/nodes"}, nodeCases},
 	}
