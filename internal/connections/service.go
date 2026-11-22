@@ -57,9 +57,12 @@ var (
 // блокировку; на четвёртом отказ отдаётся клиенту как есть.
 const issueAttempts = 3
 
-func isUniqueViolation(err error) bool {
+// isUniqueViolation смотрит и на код, и на имя ограничения: в транзакции выдачи
+// 23505 ожидается только от партиального индекса активных профилей, и чужое
+// нарушение уникальности обязано стать 500, а не «профиль уже активен».
+func isUniqueViolation(err error, constraint string) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
 }
 
 // Service — выдача и отзыв профилей. Держит и пул, и Queries: чтения (устройство,
@@ -156,7 +159,7 @@ func (s *Service) Issue(ctx context.Context, userID, deviceID, serverID uuid.UUI
 				// Гонка двух параллельных выдач на пару (устройство, сервер), а не
 				// «неизвестная ошибка БД»: уникальность держит индекс из 0002, и
 				// признание её здесь дешевле, чем разбор состояния после отказа.
-				if isUniqueViolation(err) {
+				if isUniqueViolation(err, "profiles_one_active_per_device_server") {
 					return ErrAlreadyActive
 				}
 				return fmt.Errorf("connections: вставка профиля: %w", err)

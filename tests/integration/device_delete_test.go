@@ -361,7 +361,7 @@ func TestDeleteDeviceForeignAndUnknownAreIdentical(t *testing.T) {
 	}
 }
 
-func TestDeleteDeviceKeepsRowButHidesFromList(t *testing.T) {
+func TestDeleteDeviceKeepsRowAndShowsItInList(t *testing.T) {
 	ctx := context.Background()
 	p := pool(t)
 	q := db.New(p)
@@ -373,17 +373,25 @@ func TestDeleteDeviceKeepsRowButHidesFromList(t *testing.T) {
 		t.Fatalf("отзыв = %d %s", w.Code, w.Body)
 	}
 
-	// Контракт A-1: GET /devices отдаёт живых, поэтому отозванное устройство из
-	// списка исчезает. Исчезнуть из базы оно не имеет права: по строкам судят, когда
-	// доступ перестал существовать, и аудит ссылаются на device_id.
+	// Контракт GET /devices: «все устройства пользователя, включая отозванные».
+	// Отозванное остаётся в списке с заполненным revoked_at — иначе клиент не
+	// отличит «удалено» от «никогда не было». Из базы оно тоже не исчезает: по
+	// строкам судят, когда доступ перестал существовать, и аудит ссылаются на device_id.
 	list, err := svc.List(ctx, user)
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	for _, d := range list {
-		if d.ID == device {
-			t.Error("отозванное устройство вернулось в списке живых")
+	var listed *db.Device
+	for i := range list {
+		if list[i].ID == device {
+			listed = &list[i]
 		}
+	}
+	if listed == nil {
+		t.Fatal("отозванное устройство пропало из списка участника")
+	}
+	if listed.RevokedAt == nil {
+		t.Error("отозванное устройство в списке без revoked_at")
 	}
 	var exists bool
 	if err := p.QueryRow(ctx,

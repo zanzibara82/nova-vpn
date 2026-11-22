@@ -14,8 +14,10 @@ SELECT id, slug, device_limit, server_selector, traffic_quota_bytes, trial_days
 FROM subscription_plans WHERE slug = $1;
 
 -- name: InsertSubscription :one
+-- source — параметр, а не константа: выдача по trial_days — это 'trial', а
+-- бессрочная выдача по умолчанию — 'manual'; отчётность цикла D судит по этой метке.
 INSERT INTO subscriptions (id, user_id, plan_id, status, starts_at, ends_at, source)
-VALUES ($1, $2, $3, 'active', $4, $5, 'manual')
+VALUES ($1, $2, $3, 'active', $4, $5, $6)
 RETURNING id;
 
 -- name: InsertPlan :one

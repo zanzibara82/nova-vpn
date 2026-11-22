@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/netip"
 	"regexp"
@@ -42,6 +43,10 @@ const (
 func base64Key(key [32]byte) string {
 	return base64.StdEncoding.EncodeToString(key[:])
 }
+
+// errPeersActive — инвариант §7.6 не прошёл уже внутри транзакции: между чтением и
+// удалением появился активный профиль. Наружу это тот же 409 с числом пиеров.
+var errPeersActive = errors.New("admin: server still has active profiles")
 
 type locationBody struct {
 	CountryCode string `json:"country_code"`
@@ -138,18 +143,20 @@ func (h *Handler) createServer(w http.ResponseWriter, r *http.Request) {
 
 	serverID := uuid.New()
 	var created db.VpnServer
+	var createdLoc db.ServerLocation
 	err := audit.Do(r.Context(), h.pool, audit.Action{
 		AdminID: adminID, Action: db.AuditActionServerCreated,
 		TargetType: "server", TargetID: serverID.String(),
 		Reason:    optionalReason(in.Reason, db.AuditActionServerCreated),
 		RequestID: requestIDForAction(r),
 	}, func(tx *db.Queries) error {
-		locationID, err := ensureLocation(r.Context(), tx, in.Location)
+		loc, err := ensureLocation(r.Context(), tx, in.Location)
 		if err != nil {
 			return err
 		}
+		createdLoc = loc
 		srv, err := tx.InsertServer(r.Context(), db.InsertServerParams{
-			ID: serverID, LocationID: locationID, Name: in.Name,
+			ID: serverID, LocationID: loc.ID, Name: in.Name,
 			AdvertisedHost: in.AdvertisedHost, ListenPort: in.ListenPort,
 			PublicKey: key, AddressPoolV4: pool, Mtu: mtu, KeepaliveSec: keepalive,
 			Provider: in.Provider, Region: in.Region, CapacityMbps: in.CapacityMbps,
@@ -172,7 +179,7 @@ func (h *Handler) createServer(w http.ResponseWriter, r *http.Request) {
 	}
 	// maintenance_status и config_version приходят из схемы («зарегистрирован» ≠
 	// «работает», версия 0): ответа ради их подменять здесь нечем.
-	h.write(w, r, http.StatusCreated, serverViewOf(created, 0))
+	h.write(w, r, http.StatusCreated, serverViewOf(created, createdLoc, 0))
 }
 
 func (h *Handler) getServer(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +199,11 @@ func (h *Handler) getServer(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, err)
 		return
 	}
+	loc, err := h.q.LocationByID(r.Context(), srv.LocationID)
+	if err != nil {
+		h.internal(w, r, err)
+		return
+	}
 	peers, err := h.q.CountActiveProfilesOnServer(r.Context(), id)
 	if err != nil {
 		h.internal(w, r, err)
@@ -201,12 +213,12 @@ func (h *Handler) getServer(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil:
 		h.write(w, r, http.StatusOK, serverDetail{
-			serverRow: serverViewOf(srv, int32(peers)), Health: healthViewOf(health)})
+			serverRow: serverViewOf(srv, loc, int32(peers)), Health: healthViewOf(health)})
 		return
 	case noRows(err):
 		// null, а не нули: §13.4 запрещает превращать отсутствие замера в «ноль
 		// пиеров» — оператор прочитал бы исправный узел как пустой.
-		h.write(w, r, http.StatusOK, serverDetail{serverRow: serverViewOf(srv, int32(peers))})
+		h.write(w, r, http.StatusOK, serverDetail{serverRow: serverViewOf(srv, loc, int32(peers))})
 		return
 	default:
 		h.internal(w, r, err)
@@ -236,6 +248,7 @@ func (h *Handler) patchServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var updated db.VpnServer
+	var updatedLoc db.ServerLocation
 	var version int64
 	err := audit.Do(r.Context(), h.pool, audit.Action{
 		AdminID: adminID, Action: db.AuditActionServerUpdated,
@@ -258,6 +271,13 @@ func (h *Handler) patchServer(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		updated = srv
+		updatedLoc, err = tx.LocationByID(r.Context(), srv.LocationID)
+		if noRows(err) {
+			return ErrLocationGone
+		}
+		if err != nil {
+			return err
+		}
 		// MTU и keepalive живут в [Peer] каждого клиента, поэтому правка без bump'а
 		// оставила бы узлу прежний набор при уже изменённых полях сервера.
 		v, err := tx.BumpServerConfigVersion(r.Context(), id)
@@ -276,7 +296,7 @@ func (h *Handler) patchServer(w http.ResponseWriter, r *http.Request) {
 		h.internal(w, r, err)
 		return
 	}
-	view := serverViewOf(updated, int32(peers))
+	view := serverViewOf(updated, updatedLoc, int32(peers))
 	// Версия из bump'а, а не из строки до него: UpdateServerFields возвращает
 	// VpnServer с прежним config_version, и показать её — значит соврать на единицу.
 	view.ConfigVersion = version
@@ -305,22 +325,6 @@ func (h *Handler) setMaintenance(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	current, err := h.q.ServerByID(r.Context(), id)
-	if noRows(err) {
-		h.refuse(w, r, ErrServerUnknown)
-		return
-	}
-	if err != nil {
-		h.internal(w, r, err)
-		return
-	}
-	// retired — конец, а не пауза. Обратный переход означал бы, что узел с уже
-	// выведенной конфигурацией снова начинает набирать пиеров сам собой.
-	if current.MaintenanceStatus == db.MaintenanceStatusRetired &&
-		status == db.MaintenanceStatusOnline {
-		h.refuse(w, r, ErrRetiredToOnline)
-		return
-	}
 	// §9 различает «вытеснение» и «правку»: по аудит-логу оператор должен видеть,
 	// что началось вытеснение, а не что кто-то поменял поле.
 	action := db.AuditActionServerUpdated
@@ -328,11 +332,30 @@ func (h *Handler) setMaintenance(w http.ResponseWriter, r *http.Request) {
 		action = db.AuditActionServerDrained
 	}
 	var view maintenanceView
-	err = audit.Do(r.Context(), h.pool, audit.Action{
+	err := audit.Do(r.Context(), h.pool, audit.Action{
 		AdminID: adminID, Action: action,
 		TargetType: "server", TargetID: id.String(),
 		Reason: reason, RequestID: requestIDForAction(r),
 	}, func(tx *db.Queries) error {
+		// Чтение и переход — под замком строки сервера: тот же advisory-замок держат
+		// выдача профиля и отзыв узлового токена, поэтому между проверкой и UPDATE
+		// не может вклиниться ни новый пиер, ни сброс retired соседней мутацией.
+		if err := tx.LockServerRow(r.Context(), id.String()); err != nil {
+			return err
+		}
+		current, err := tx.ServerByID(r.Context(), id)
+		if noRows(err) {
+			return ErrServerUnknown
+		}
+		if err != nil {
+			return err
+		}
+		// retired — конец, а не пауза. Обратный переход означал бы, что узел с уже
+		// выведенной конфигурацией снова начинает набирать пиеров сам собой.
+		if current.MaintenanceStatus == db.MaintenanceStatusRetired &&
+			status == db.MaintenanceStatusOnline {
+			return ErrRetiredToOnline
+		}
 		row, err := tx.SetServerMaintenance(r.Context(), db.SetServerMaintenanceParams{
 			ID: id, MaintenanceStatus: status,
 		})
@@ -396,11 +419,26 @@ func (h *Handler) deleteServer(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	var peersAfter int64
 	err = audit.Do(r.Context(), h.pool, audit.Action{
 		AdminID: adminID, Action: db.AuditActionServerDeleted,
 		TargetType: "server", TargetID: id.String(),
 		Reason: reason, RequestID: requestIDForAction(r),
 	}, func(tx *db.Queries) error {
+		// Предварительное чтение выше назвало число пиеров человеку; инвариант §7.6
+		// подтверждается здесь под замком сервера — иначе профиль, выданный между
+		// проверкой и DELETE, был бы стёрт молча, без события отзыва.
+		if err := tx.LockServerRow(r.Context(), id.String()); err != nil {
+			return err
+		}
+		peers, err := tx.CountActiveProfilesOnServer(r.Context(), id)
+		if err != nil {
+			return err
+		}
+		if peers > 0 {
+			peersAfter = peers
+			return errPeersActive
+		}
 		// Терминальные остатки удаляются без событий на них: superseded без живого
 		// преемника желаемый набор уже не отдаёт, а revoked и expired доступа не дают
 		// вовсе, и писать «профиль отозван» о мёртвом означало бы научить аудит лгать.
@@ -410,8 +448,19 @@ func (h *Handler) deleteServer(w http.ResponseWriter, r *http.Request) {
 		// health, tunnel_addresses, node_credentials и bootstrap_tokens уходят
 		// каскадом; connection_events.server_id — SET NULL, потому что история
 		// событий принадлежит пользователям и устройствам, а не серверу.
-		return tx.DeleteServer(r.Context(), id)
+		if err := tx.DeleteServer(r.Context(), id); noRows(err) {
+			return ErrServerUnknown
+		} else if err != nil {
+			return err
+		}
+		return nil
 	})
+	if errors.Is(err, errPeersActive) {
+		httpx.WriteError(w, r, http.StatusConflict, httpx.ErrConflict,
+			"на сервере ещё "+strconv.FormatInt(peersAfter, 10)+" активных профилей",
+			map[string]any{"peers_active": peersAfter})
+		return
+	}
 	if err != nil {
 		h.refuse(w, r, err)
 		return
@@ -423,16 +472,16 @@ func (h *Handler) deleteServer(w http.ResponseWriter, r *http.Request) {
 // строки нет. Уникальность (country_code, city, lat, lon) живёт в БД, а не в коде:
 // два админа, заводящие сервера в одном городе одновременно, не должны получать 500
 // из-за того, что один из них прочитал «нет» в тот же момент, что и другой.
-func ensureLocation(ctx context.Context, tx *db.Queries, in locationBody) (uuid.UUID, error) {
+func ensureLocation(ctx context.Context, tx *db.Queries, in locationBody) (db.ServerLocation, error) {
 	key := db.LocationByKeyParams{
 		CountryCode: in.CountryCode, City: in.City, Lat: in.Lat, Lon: in.Lon,
 	}
 	loc, err := tx.LocationByKey(ctx, key)
 	if err == nil {
-		return loc.ID, nil
+		return loc, nil
 	}
 	if !noRows(err) {
-		return uuid.Nil, err
+		return db.ServerLocation{}, err
 	}
 	loc, err = tx.InsertServerLocation(ctx, db.InsertServerLocationParams{
 		ID: uuid.New(), CountryCode: in.CountryCode, City: in.City,
@@ -443,13 +492,13 @@ func ensureLocation(ctx context.Context, tx *db.Queries, in locationBody) (uuid.
 		// это уже не гонка, а разрушенная ссылка, и притворяться ею незачем.
 		loc, err = tx.LocationByKey(ctx, key)
 		if noRows(err) {
-			return uuid.Nil, ErrLocationGone
+			return db.ServerLocation{}, ErrLocationGone
 		}
 	}
 	if err != nil {
-		return uuid.Nil, err
+		return db.ServerLocation{}, err
 	}
-	return loc.ID, nil
+	return loc, nil
 }
 
 func (h *Handler) canonicalKey(w http.ResponseWriter, r *http.Request, raw string) (string, bool) {

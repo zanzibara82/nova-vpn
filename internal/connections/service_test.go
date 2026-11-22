@@ -1,11 +1,44 @@
 package connections
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/novavpn/novavpn/internal/entitlements"
 )
+
+func TestIsUniqueViolationRequiresExpectedConstraint(t *testing.T) {
+	const activeIndex = "profiles_one_active_per_device_server"
+	unique := &pgconn.PgError{
+		Code:           "23505",
+		Message:        fmt.Sprintf(`duplicate key value violates unique constraint %q`, activeIndex),
+		ConstraintName: activeIndex,
+	}
+	cases := []struct {
+		name       string
+		err        error
+		constraint string
+		want       bool
+	}{
+		{"нужный индекс", unique, activeIndex, true},
+		{"нужный индекс во wrapped-ошибке", fmt.Errorf("вставка профиля: %w", unique), activeIndex, true},
+		{"чужой индекс", unique, "vpn_servers_name_key", false},
+		{"чужой индекс в той же транзакции", &pgconn.PgError{Code: "23505", ConstraintName: "vpn_servers_name_key"}, activeIndex, false},
+		{"не уникальное нарушение", &pgconn.PgError{Code: "23503", ConstraintName: activeIndex}, activeIndex, false},
+		{"не ошибка PostgreSQL", errors.New("duplicate key value violates unique constraint"), activeIndex, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isUniqueViolation(c.err, c.constraint); got != c.want {
+				t.Fatalf("isUniqueViolation = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
 
 func TestProfileExpiry(t *testing.T) {
 	// now фиксирован: сравнение с time.Now().Add(...) зависело бы от того, сколько

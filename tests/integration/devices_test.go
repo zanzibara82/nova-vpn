@@ -74,6 +74,41 @@ func TestDeviceLimitIsHard(t *testing.T) {
 	}
 }
 
+// Отозванный ключ остаётся дубликатом при исчерпанном лимите: уникальный индекс
+// (user_id, public_key) полный, и код ответа не должен зависеть от числа живых
+// устройств. До правки эта ветка отвечала device_limit_reached вместо duplicate_device.
+func TestRevokedKeyIsDuplicateEvenAtLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	svc, q := newDeviceSvc(t)
+	user := seedUser(t, ctx, q, true)
+
+	var first db.Device
+	for i := 0; i < 3; i++ {
+		d, err := svc.Register(ctx, user, devices.RegisterInput{
+			PublicKey: keyAt(500 + i), Platform: "linux", Name: "dev"})
+		if err != nil {
+			t.Fatalf("register %d: %v", i, err)
+		}
+		if i == 0 {
+			first = d
+		}
+	}
+	if err := q.RevokeDevice(ctx, first.ID); err != nil {
+		t.Fatalf("RevokeDevice: %v", err)
+	}
+	// Снова три живых: место, освобождённое отзывом, занято новым ключом.
+	if _, err := svc.Register(ctx, user, devices.RegisterInput{
+		PublicKey: keyAt(510), Platform: "linux", Name: "filler"}); err != nil {
+		t.Fatalf("filler: %v", err)
+	}
+	_, err := svc.Register(ctx, user, devices.RegisterInput{
+		PublicKey: first.PublicKey, Platform: "linux", Name: "again"})
+	if !errors.Is(err, devices.ErrDuplicateKey) {
+		t.Fatalf("отозванный ключ при полном лимите: err = %v, want ErrDuplicateKey", err)
+	}
+}
+
 func TestDeviceNameCountsCharacters(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

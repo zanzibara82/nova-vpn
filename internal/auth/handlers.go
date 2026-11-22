@@ -106,7 +106,7 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &in) {
 		return
 	}
-	email, ok := normalizeEmail(in.Email)
+	email, ok := NormalizeEmail(in.Email)
 	if !ok {
 		httpx.WriteError(w, r, http.StatusBadRequest, httpx.ErrInvalidRequest,
 			"email должен быть одним адресом не длиннее 254 символов",
@@ -341,10 +341,12 @@ func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// normalizeEmail — каноническая форма для uniqueness-ключа и для ключа задержки.
+// NormalizeEmail — каноническая форма для uniqueness-ключа и для ключа задержки.
 // citext делает UNIQUE независимым от регистра, но счётчик неудач должен считаться
-// по одному и тому же адресу, а не по каждому его написанию.
-func normalizeEmail(s string) (string, bool) {
+// по одному и тому же адресу, а не по каждому его написанию. Экспортируется, чтобы
+// админское создание проверяло ту же форму, что и регистрация: контракт объявляет
+// format: email, и «x» не должен становиться администратором.
+func NormalizeEmail(s string) (string, bool) {
 	v := strings.ToLower(strings.TrimSpace(s))
 	if !validEmail(v) {
 		return "", false

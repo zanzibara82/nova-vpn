@@ -201,6 +201,11 @@ func (h *Handler) revokeNodeToken(w http.ResponseWriter, r *http.Request) {
 		TargetType: "server", TargetID: id.String(),
 		Reason: reason, RequestID: requestIDForAction(r),
 	}, func(tx *db.Queries) error {
+		// Тот же замок, что у maintenance и удаления: иначе отзыв токена мог бы
+		// вернуть retired в draining уже после проверки соседней мутации.
+		if err := tx.LockServerRow(r.Context(), id.String()); err != nil {
+			return err
+		}
 		srv, err := tx.ServerByID(r.Context(), id)
 		if noRows(err) {
 			return ErrServerUnknown
@@ -216,13 +221,17 @@ func (h *Handler) revokeNodeToken(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.BumpServerConfigVersion(r.Context(), id); err != nil {
 			return err
 		}
-		if _, err := tx.SetServerMaintenance(r.Context(), db.SetServerMaintenanceParams{
-			ID: id, MaintenanceStatus: db.MaintenanceStatusDraining,
-		}); err != nil {
-			if noRows(err) {
-				return ErrServerUnknown
+		// retired — конец: отзыв токена гасит доступ, но не воскрешает выведенный
+		// узел в draining, иначе следующий переход в online стал бы возможен.
+		if srv.MaintenanceStatus != db.MaintenanceStatusRetired {
+			if _, err := tx.SetServerMaintenance(r.Context(), db.SetServerMaintenanceParams{
+				ID: id, MaintenanceStatus: db.MaintenanceStatusDraining,
+			}); err != nil {
+				if noRows(err) {
+					return ErrServerUnknown
+				}
+				return err
 			}
-			return err
 		}
 		// Вытеснение пишется только когда сервер был в раздачи. Повторный отзыв
 		// уже выведенного узла не обязан порождать вторую запись «вытеснение

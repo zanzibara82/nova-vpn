@@ -28,8 +28,10 @@ FROM vpn_servers WHERE id = $1;
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));
 
 -- name: BumpServerConfigVersion :one
--- Каждая смена набора пиеров поднимает версию: узел по ней отличает «ничего нового»
--- от «надо перечитать» и по ней же работает If-None-Match (§4.1).
+-- Каждая смена набора пиеров поднимает версию: по ней узел отчитывается в observed
+-- и оператор видит, какой набор применён. If-None-Match работает не по версии,
+-- а по хэшу содержимого набора (§4.1, задача A-2 №51): версия не меняется, когда
+-- overlap-окно закрывается по времени.
 UPDATE vpn_servers SET config_version = config_version + 1 WHERE id = $1
 RETURNING config_version;
 
@@ -39,6 +41,13 @@ SELECT config_version FROM vpn_servers WHERE id = $1;
 -- name: SetServerMaintenance :one
 UPDATE vpn_servers SET maintenance_status = $2 WHERE id = $1
 RETURNING id, name, maintenance_status;
+
+-- name: LocationByID :one
+-- Нужен формам ответа: ServerByID возвращает location_id, а карточка сервера обязана
+-- назвать country_code и city (AdminServerView).
+SELECT id, country_code, city, lat, lon, timezone
+FROM server_locations
+WHERE id = $1;
 
 -- name: LocationByKey :one
 SELECT id, country_code, city, lat, lon, timezone

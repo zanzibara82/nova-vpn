@@ -94,6 +94,12 @@ func (h *Handler) lockUser(w http.ResponseWriter, r *http.Request) {
 		TargetType: "user", TargetID: id.String(),
 		Reason: reason, RequestID: requestIDForAction(r),
 	}, func(tx *db.Queries) error {
+		// Замок пользователя переиспользуется из подсчёта устройств: он же сериализует
+		// регистрацию устройств. Без него две блокировки подряд увидели бы active и
+		// записали две причины, а последняя стёрла бы первую.
+		if err := tx.LockUserForDeviceCount(r.Context(), id.String()); err != nil {
+			return err
+		}
 		user, err := tx.UserByID(r.Context(), id)
 		if noRows(err) {
 			return ErrUserUnknown
@@ -192,6 +198,12 @@ func (h *Handler) unlockUser(w http.ResponseWriter, r *http.Request) {
 		TargetType: "user", TargetID: id.String(),
 		Reason: reason, RequestID: requestIDForAction(r),
 	}, func(tx *db.Queries) error {
+		// Замок пользователя переиспользуется из подсчёта устройств: он же сериализует
+		// регистрацию устройств. Без него две блокировки подряд увидели бы active и
+		// записали две причины, а последняя стёрла бы первую.
+		if err := tx.LockUserForDeviceCount(r.Context(), id.String()); err != nil {
+			return err
+		}
 		user, err := tx.UserByID(r.Context(), id)
 		if noRows(err) {
 			return ErrUserUnknown
@@ -227,9 +239,13 @@ func (h *Handler) createAdmin(w http.ResponseWriter, r *http.Request) {
 	if !h.decode(w, r, &in) {
 		return
 	}
-	email := strings.ToLower(strings.TrimSpace(in.Email))
-	if email == "" {
+	email, valid := auth.NormalizeEmail(in.Email)
+	if strings.TrimSpace(in.Email) == "" {
 		h.badField(w, r, "email", "обязательна")
+		return
+	}
+	if !valid {
+		h.badField(w, r, "email", "некорректный адрес")
 		return
 	}
 	hash, err := auth.HashPassword(in.Password)

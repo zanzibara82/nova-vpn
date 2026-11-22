@@ -78,6 +78,10 @@ type Querier interface {
 	// этот ключ был выдан. Ключи, которых нет в базе (снятый, но ещё видимый на узле),
 	// просто не возвращаются.
 	DevicesByPublicKeys(ctx context.Context, dollar_1 []string) ([]DevicesByPublicKeysRow, error)
+	// Контракт GET /devices обещает «все устройства пользователя, включая отозванные»
+	// (openapi.yaml, описание маршрута): отозванное устройство остаётся в ответе с
+	// заполненным revoked_at, иначе клиент не отличит «удалено» от «никогда не было».
+	DevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error)
 	// Порог приходит timestamptz'ом, вычисленным в Go (now.Add(-DormantAfter)), а не
 	// interval-параметром: override'а на interval в sqlc.yaml нет, и $1::interval стал бы
 	// pgtype.Interval — тот же сюрприз, что с InsertBootstrapToken в задаче 1.
@@ -114,6 +118,8 @@ type Querier interface {
 	InsertRefreshFamily(ctx context.Context, arg InsertRefreshFamilyParams) (uuid.UUID, error)
 	InsertServer(ctx context.Context, arg InsertServerParams) (VpnServer, error)
 	InsertServerLocation(ctx context.Context, arg InsertServerLocationParams) (ServerLocation, error)
+	// source — параметр, а не константа: выдача по trial_days — это 'trial', а
+	// бессрочная выдача по умолчанию — 'manual'; отчётность цикла D судит по этой метке.
 	InsertSubscription(ctx context.Context, arg InsertSubscriptionParams) (uuid.UUID, error)
 	InsertUser(ctx context.Context, arg InsertUserParams) (User, error)
 	// GET …/profiles/{server_id} обязан показать и отозванный профиль: человек имеет
@@ -128,9 +134,14 @@ type Querier interface {
 	// сорвётся при удалении», §7.6).
 	ListAllServers(ctx context.Context) ([]ListAllServersRow, error)
 	LiveBootstrapTokensOfServer(ctx context.Context, serverID uuid.UUID) ([]LiveBootstrapTokensOfServerRow, error)
+	// Живые нужны админскому просмотру и подсчёту лимита; список участника собирается
+	// DevicesByUser, чтобы не потерять историю устройств.
 	LiveDevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error)
 	LiveSubscriptionByUser(ctx context.Context, userID uuid.UUID) (LiveSubscriptionByUserRow, error)
 	LoadIdempotencyKey(ctx context.Context, arg LoadIdempotencyKeyParams) (IdempotencyKey, error)
+	// Нужен формам ответа: ServerByID возвращает location_id, а карточка сервера обязана
+	// назвать country_code и city (AdminServerView).
+	LocationByID(ctx context.Context, id uuid.UUID) (ServerLocation, error)
 	LocationByKey(ctx context.Context, arg LocationByKeyParams) (ServerLocation, error)
 	// Advisory lock на строку сервера: аллокация адреса обязана быть сериализованной
 	// по серверу, иначе две горутины выберут один свободный адрес (§6, §9.1).

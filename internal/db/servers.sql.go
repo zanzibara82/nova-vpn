@@ -246,6 +246,28 @@ func (q *Queries) InsertServerLocation(ctx context.Context, arg InsertServerLoca
 	return i, err
 }
 
+const locationByID = `-- name: LocationByID :one
+SELECT id, country_code, city, lat, lon, timezone
+FROM server_locations
+WHERE id = $1
+`
+
+// Нужен формам ответа: ServerByID возвращает location_id, а карточка сервера обязана
+// назвать country_code и city (AdminServerView).
+func (q *Queries) LocationByID(ctx context.Context, id uuid.UUID) (ServerLocation, error) {
+	row := q.db.QueryRow(ctx, locationByID, id)
+	var i ServerLocation
+	err := row.Scan(
+		&i.ID,
+		&i.CountryCode,
+		&i.City,
+		&i.Lat,
+		&i.Lon,
+		&i.Timezone,
+	)
+	return i, err
+}
+
 const locationByKey = `-- name: LocationByKey :one
 SELECT id, country_code, city, lat, lon, timezone
 FROM server_locations

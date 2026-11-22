@@ -79,10 +79,12 @@ func (s *Service) Register(ctx context.Context, userID uuid.UUID, in RegisterInp
 			return fmt.Errorf("advisory lock: %w", err)
 		}
 		// Дубликат проверяется до лимита: повторный запрос с тем же ключом обязан
-		// ответить ErrDuplicateKey, даже когда лимит уже исчерпан.
-		if existing, err := tx.DeviceByUserAndKey(ctx, db.DeviceByUserAndKeyParams{
+		// ответить ErrDuplicateKey, даже когда лимит уже исчерпан. Отозванный ключ —
+		// тоже дубликат: уникальный индекс (user_id, public_key) полный, и занять
+		// прежний ключ нельзя, поэтому код ответа не должен зависеть от лимита.
+		if _, err := tx.DeviceByUserAndKey(ctx, db.DeviceByUserAndKeyParams{
 			UserID: userID, PublicKey: in.PublicKey,
-		}); err == nil && existing.RevokedAt == nil {
+		}); err == nil {
 			return ErrDuplicateKey
 		} else if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("lookup by key: %w", err)
@@ -110,8 +112,10 @@ func (s *Service) Register(ctx context.Context, userID uuid.UUID, in RegisterInp
 	return created, nil
 }
 
+// List отдаёт все устройства, включая отозванные: контракт GET /devices обещает их
+// именно так, а null в revoked_at отличает отозванное от живого.
 func (s *Service) List(ctx context.Context, userID uuid.UUID) ([]db.Device, error) {
-	return s.q.LiveDevicesByUser(ctx, userID)
+	return s.q.DevicesByUser(ctx, userID)
 }
 
 // OwnedBy — проверка права на объект, а не только факта аутентификации (спецификация §5.2).

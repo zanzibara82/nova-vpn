@@ -71,6 +71,46 @@ func (q *Queries) DeviceByUserAndKey(ctx context.Context, arg DeviceByUserAndKey
 	return i, err
 }
 
+const devicesByUser = `-- name: DevicesByUser :many
+SELECT id, user_id, public_key, platform, name, rotation_of, created_at, last_seen_at, revoked_at
+FROM devices
+WHERE user_id = $1
+ORDER BY created_at
+`
+
+// Контракт GET /devices обещает «все устройства пользователя, включая отозванные»
+// (openapi.yaml, описание маршрута): отозванное устройство остаётся в ответе с
+// заполненным revoked_at, иначе клиент не отличит «удалено» от «никогда не было».
+func (q *Queries) DevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error) {
+	rows, err := q.db.Query(ctx, devicesByUser, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Device
+	for rows.Next() {
+		var i Device
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.PublicKey,
+			&i.Platform,
+			&i.Name,
+			&i.RotationOf,
+			&i.CreatedAt,
+			&i.LastSeenAt,
+			&i.RevokedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertDevice = `-- name: InsertDevice :one
 INSERT INTO devices (id, user_id, public_key, platform, name, rotation_of)
 VALUES ($1, $2, $3, $4, $5, $6)
@@ -117,6 +157,8 @@ WHERE user_id = $1 AND revoked_at IS NULL
 ORDER BY created_at
 `
 
+// Живые нужны админскому просмотру и подсчёту лимита; список участника собирается
+// DevicesByUser, чтобы не потерять историю устройств.
 func (q *Queries) LiveDevicesByUser(ctx context.Context, userID uuid.UUID) ([]Device, error) {
 	rows, err := q.db.Query(ctx, liveDevicesByUser, userID)
 	if err != nil {

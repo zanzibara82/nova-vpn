@@ -79,12 +79,18 @@ func GrantDefaultPlanTx(ctx context.Context, q *db.Queries, userID uuid.UUID, sl
 		return fmt.Errorf("plan %q: %w", slug, err)
 	}
 	var endsAt *time.Time
+	source := db.SubscriptionSourceManual
 	if plan.TrialDays > 0 {
-		e := time.Now().Add(time.Duration(plan.TrialDays) * 24 * time.Hour)
+		now := time.Now()
+		e := now.Add(time.Duration(plan.TrialDays) * 24 * time.Hour)
 		endsAt = &e
+		// Пробный срок и метка «пробный» — одно решение: отчётность цикла D не должна
+		// выводить trial из дат, когда рядом лежит явное поле.
+		source = db.SubscriptionSourceTrial
 	}
 	_, err = q.InsertSubscription(ctx, db.InsertSubscriptionParams{
-		ID: uuid.New(), UserID: userID, PlanID: plan.ID, EndsAt: endsAt,
+		ID: uuid.New(), UserID: userID, PlanID: plan.ID,
+		StartsAt: time.Now(), EndsAt: endsAt, Source: source,
 	})
 	return err
 }

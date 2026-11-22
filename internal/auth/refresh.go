@@ -161,9 +161,27 @@ func (s *SessionService) Rotate(ctx context.Context, raw string, ip *netip.Addr)
 // немедленно (logout); при отзыве снаружи активный access доживает не дольше TTL —
 // см. спецификацию §5.3.
 func (s *SessionService) Revoke(ctx context.Context, raw, access string) error {
-	fam, _, err := parseRefresh(raw)
+	fam, secret, err := parseRefresh(raw)
 	if err != nil {
 		return err
+	}
+	family, err := s.q.RefreshByID(ctx, uuid.MustParse(fam))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrInvalidRefreshToken
+	}
+	if err != nil {
+		return fmt.Errorf("load refresh family: %w", err)
+	}
+	// §5.2: доказательство владения сессией — refresh-токен в теле, а не один его
+	// идентификатор семьи. Без сверки секрета тот, кто видел обрезанный токен в
+	// журнале или скриншоте, гасил бы чужую сессию.
+	if subtle.ConstantTimeCompare(family.CurrentTokenHash, hashSecret(secret)) != 1 {
+		return ErrInvalidRefreshToken
+	}
+	if family.RevokedAt != nil {
+		// Повторный logout того же токена — идемпотентен: access уже мог дожить до
+		// конца TTL, и второй отказ здесь ничего не добавил бы.
+		return nil
 	}
 	if access != "" {
 		if cl, err := s.iss.Parse(access); err == nil {
@@ -176,7 +194,7 @@ func (s *SessionService) Revoke(ctx context.Context, raw, access string) error {
 	}
 	reason := "logout"
 	return s.q.RevokeRefreshFamily(ctx, db.RevokeRefreshFamilyParams{
-		ID: uuid.MustParse(fam), RevokeReason: &reason,
+		ID: family.ID, RevokeReason: &reason,
 	})
 }
 

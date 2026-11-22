@@ -829,7 +829,8 @@ paths:
       summary: Отзыв стартового токена.
       description: >
         Ноль обновлённых строк — не успех: «токена нет» и «токен уже сожжён узлом»
-        требуют разных продолжений, поэтому оба дают 409, а не 204.
+        требуют разных продолжений, поэтому оба дают 409, а не 204. Причина
+        необязательна в теле, но обязательна по смыслу: без неё — 400 по полю reason.
       security: [{ adminBearerAuth: [] }]
       requestBody:
         required: false
@@ -862,8 +863,10 @@ paths:
       summary: Отрезать узел.
       description: >
         Гасит все узловые токены сервера, поднимает config_version и переводит сервер в
-        draining. Ноль отозванных токенов — не ошибка: «отрежь узел, который ещё не
-        приходил» — штатный шаг раскатки.
+        draining (кроме retired: выведенный узел не воскресает). Ноль отозванных
+        токенов — не ошибка: «отрежь узел, который ещё не приходил» — штатный шаг
+        раскатки. Причина необязательна в теле, но обязательна по смыслу: без неё —
+        400 по полю reason.
       security: [{ adminBearerAuth: [] }]
       requestBody:
         required: false
@@ -1722,6 +1725,7 @@ components:
         config_version: { type: integer, format: int64 }
     ReasonRequest:
       type: object
+      required: [reason]
       properties:
         reason: { type: string, minLength: 3, maxLength: 500 }
     BootstrapTokenRequest:
@@ -1923,11 +1927,11 @@ components:
       type: object
       required: [agent_version, agent_uptime_sec, load1, cpu_pct, applied_config_version, stale]
       properties:
-        agent_version: { type: string }
-        agent_uptime_sec: { type: integer, format: int64 }
-        load1: { type: ["number", "null"], description: "null — не измеряли" }
-        cpu_pct: { type: ["number", "null"], description: "null — не измеряли" }
-        applied_config_version: { type: integer, format: int64 }
+        agent_version: { type: string, minLength: 1, maxLength: 64 }
+        agent_uptime_sec: { type: integer, format: int64, minimum: 0 }
+        load1: { type: ["number", "null"], minimum: 0, maximum: 999, description: "null — не измеряли" }
+        cpu_pct: { type: ["number", "null"], minimum: 0, maximum: 100, description: "null — не измеряли" }
+        applied_config_version: { type: integer, format: int64, minimum: 0 }
         stale:
           type: boolean
           description: >

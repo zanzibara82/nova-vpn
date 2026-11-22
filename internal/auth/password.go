@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -30,11 +31,11 @@ var (
 )
 
 func HashPassword(password string) (string, error) {
-	if len(password) < MinPasswordLen || len(password) > MaxPasswordLen {
+	if n := utf8.RuneCountInString(password); n < MinPasswordLen || n > MaxPasswordLen {
 		return "", ErrWeakPassword
 	}
-	// MinPasswordLen считается в байтах: для UTF-8 это нижняя граница, а не «10 символов».
-	// Увеличивать без замера стоимости проверки на целевом узле нельзя.
+	// Длина — в code points, как minLength/maxLength JSON Schema в контракте: байтовый
+	// счёт пропускал кириллический пароль из шести символов и отвергал допустимые 1024.
 	salt := make([]byte, argonSaltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("salt: %w", err)
@@ -50,7 +51,10 @@ func HashPassword(password string) (string, error) {
 // VerifyPassword возвращает false на любом malformed-хэше, не паникуя и не
 // подставляя параметры по умолчанию.
 func VerifyPassword(phc, password string) bool {
-	if !strings.HasPrefix(phc, phcPrefix) || len(password) < MinPasswordLen || len(password) > MaxPasswordLen {
+	if !strings.HasPrefix(phc, phcPrefix) {
+		return false
+	}
+	if n := utf8.RuneCountInString(password); n < MinPasswordLen || n > MaxPasswordLen {
 		return false
 	}
 	rest := strings.TrimPrefix(phc, phcPrefix)

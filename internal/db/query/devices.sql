@@ -11,7 +11,18 @@ FROM devices WHERE id = $1;
 SELECT id, user_id, public_key, platform, name, rotation_of, created_at, last_seen_at, revoked_at
 FROM devices WHERE user_id = $1 AND public_key = $2;
 
+-- name: DevicesByUser :many
+-- Контракт GET /devices обещает «все устройства пользователя, включая отозванные»
+-- (openapi.yaml, описание маршрута): отозванное устройство остаётся в ответе с
+-- заполненным revoked_at, иначе клиент не отличит «удалено» от «никогда не было».
+SELECT id, user_id, public_key, platform, name, rotation_of, created_at, last_seen_at, revoked_at
+FROM devices
+WHERE user_id = $1
+ORDER BY created_at;
+
 -- name: LiveDevicesByUser :many
+-- Живые нужны админскому просмотру и подсчёту лимита; список участника собирается
+-- DevicesByUser, чтобы не потерять историю устройств.
 SELECT id, user_id, public_key, platform, name, rotation_of, created_at, last_seen_at, revoked_at
 FROM devices
 WHERE user_id = $1 AND revoked_at IS NULL

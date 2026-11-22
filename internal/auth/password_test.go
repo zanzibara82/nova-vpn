@@ -40,6 +40,29 @@ func TestRejectsEmptyAndShort(t *testing.T) {
 	}
 }
 
+// Контракт объявляет minLength/maxLength в code points. Байтовый счёт пропускал
+// кириллический пароль из шести символов (12 байт) и отвергал допустимые 1024.
+func TestPasswordLengthCountsCodePoints(t *testing.T) {
+	short := strings.Repeat("я", MinPasswordLen-1)
+	if _, err := HashPassword(short); err == nil {
+		t.Fatalf("HashPassword(%d символов, %d байт) принят", MinPasswordLen-1, len(short))
+	}
+	ok := strings.Repeat("я", MinPasswordLen)
+	h, err := HashPassword(ok)
+	if err != nil {
+		t.Fatalf("HashPassword(%d символов, %d байт): %v", MinPasswordLen, len(ok), err)
+	}
+	if !VerifyPassword(h, ok) {
+		t.Fatal("пароль на нижней границе не подтвердился")
+	}
+	if VerifyPassword(h, strings.Repeat("я", MinPasswordLen-1)) {
+		t.Fatal("пароль короче нижней границы принят при проверке")
+	}
+	if _, err := HashPassword(strings.Repeat("я", MaxPasswordLen+1)); err == nil {
+		t.Error("HashPassword принял пароль длиннее верхней границы")
+	}
+}
+
 // Пропущенный параметр в строке хэша не должен превращаться в «тихо посчитали по умолчанию»:
 // это путь к проверке пароля с чужими настройками стойкости.
 func TestVerifyRejectsMalformedHash(t *testing.T) {

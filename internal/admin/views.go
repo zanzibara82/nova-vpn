@@ -155,9 +155,9 @@ func listView(row db.ListAllServersRow) serverRow {
 	}
 }
 
-// serverViewOf — форма из строки таблицы (после создания и правки): локация в ней не
-// читается, поэтому country_code/city остаются пустыми, если их не дозапросили.
-func serverViewOf(srv db.VpnServer, peersActive int32) serverRow {
+// serverViewOf — форма из строки таблицы плюс прочитанная локация: vpn_servers хранит
+// только location_id, а AdminServerView требует country_code и city строками.
+func serverViewOf(srv db.VpnServer, loc db.ServerLocation, peersActive int32) serverRow {
 	return serverRow{
 		ID: srv.ID.String(), Name: srv.Name, AdvertisedHost: srv.AdvertisedHost,
 		ListenPort: srv.ListenPort, PublicKey: srv.PublicKey,
@@ -165,7 +165,7 @@ func serverViewOf(srv db.VpnServer, peersActive int32) serverRow {
 		KeepaliveSec: srv.KeepaliveSec, ConfigVersion: srv.ConfigVersion,
 		MaintenanceStatus: string(srv.MaintenanceStatus), Provider: srv.Provider,
 		Region: srv.Region, CapacityMbps: srv.CapacityMbps,
-		PeersActive: peersActive,
+		CountryCode: loc.CountryCode, City: loc.City, PeersActive: peersActive,
 	}
 }
 

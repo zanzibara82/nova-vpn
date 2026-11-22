@@ -72,6 +72,7 @@ func seedUser(t *testing.T, ctx context.Context, q *db.Queries, withPlan bool) u
 			UserID:   id,
 			PlanID:   uuid.MustParse("00000000-0000-4000-8000-000000000a01"),
 			StartsAt: time.Now(),
+			Source:   db.SubscriptionSourceManual,
 		}); err != nil {
 			t.Fatalf("InsertSubscription: %v", err)
 		}
@@ -95,6 +96,7 @@ func seedUserWithPlan(t *testing.T, ctx context.Context, q *db.Queries, slug str
 		UserID:   id,
 		PlanID:   planID,
 		StartsAt: time.Now(),
+		Source:   db.SubscriptionSourceManual,
 	}); err != nil {
 		t.Fatalf("InsertSubscription: %v", err)
 	}

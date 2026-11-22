@@ -216,7 +216,7 @@ func isUniqueViolation(err error, constraint string) bool {
 	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
 		return false
 	}
-	return constraint == "" || strings.HasSuffix(pgErr.Message, constraint)
+	return constraint == "" || pgErr.ConstraintName == constraint
 }
 
 // noRows — «строки нет» в терминах pgx; отдельная функция нужна, чтобы каждый хендлер

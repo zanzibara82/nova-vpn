@@ -41,7 +41,7 @@ func (q *Queries) InsertPlan(ctx context.Context, arg InsertPlanParams) (uuid.UU
 
 const insertSubscription = `-- name: InsertSubscription :one
 INSERT INTO subscriptions (id, user_id, plan_id, status, starts_at, ends_at, source)
-VALUES ($1, $2, $3, 'active', $4, $5, 'manual')
+VALUES ($1, $2, $3, 'active', $4, $5, $6)
 RETURNING id
 `
 
@@ -51,8 +51,11 @@ type InsertSubscriptionParams struct {
 	PlanID   uuid.UUID
 	StartsAt time.Time
 	EndsAt   *time.Time
+	Source   SubscriptionSource
 }
 
+// source — параметр, а не константа: выдача по trial_days — это 'trial', а
+// бессрочная выдача по умолчанию — 'manual'; отчётность цикла D судит по этой метке.
 func (q *Queries) InsertSubscription(ctx context.Context, arg InsertSubscriptionParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, insertSubscription,
 		arg.ID,
@@ -60,6 +63,7 @@ func (q *Queries) InsertSubscription(ctx context.Context, arg InsertSubscription
 		arg.PlanID,
 		arg.StartsAt,
 		arg.EndsAt,
+		arg.Source,
 	)
 	var id uuid.UUID
 	err := row.Scan(&id)
