@@ -1341,7 +1341,7 @@ code=$?
 	&& grep -q 'Idempotency-Key: e2e-device-4' "$dir/state-run/run/device-4.hdr"
 check $? "лимит проходит: 201, 201, 409 с device_limit_reached (код $code)"
 
-# 43. Отказ, когда четвёртое устройство принят (201): лимит не проверяется.
+# 43. Отказ, когда четвёртое устройство принято (201): лимит не проверяется.
 dir="$TMPROOT/limit-accepted"; fake_tools "$dir"
 FAKE_DEVICE4_CODE=201 FAKE_DEVICE4_BODY='{"id":"e2e-extra-4"}' limit_run "$dir"
 code=$?

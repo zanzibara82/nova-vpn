@@ -77,7 +77,7 @@ func (f nodeFixture) secondServer(t *testing.T) db.VpnServer {
 // «все токены сервера». У узла может работать второй процесс со своим токеном
 // (перезапуск без ротации), и отзыв по server_id вырубил бы его молча.
 //
-// Поймывает подмену RevokeNodeCredential(id) на RevokeNodeCredentialsForServer(server_id):
+// Ловит подмену RevokeNodeCredential(id) на RevokeNodeCredentialsForServer(server_id):
 // при одном живом токене оба дают одинаковый результат, поэтому здесь их ровно два.
 func TestNodeRotateSparesOtherLiveCredential(t *testing.T) {
 	f := newNodeFixture(t)
@@ -660,7 +660,7 @@ func TestNodeEnrollValidatesPublicKeyShapeAndOwnership(t *testing.T) {
 // (burst 5) считается на тест, и шестой enroll в том же стенде упёрся бы в 429,
 // что выглядело бы как отказ по ключу.
 //
-// Поймывает мутацию «ConsumeBootstrapToken до сравнения ключей»: тогда первая же
+// Ловит мутацию «ConsumeBootstrapToken до сравнения ключей»: тогда первая же
 // попытка с чужим ключом сожгла бы стартовый токен и админ обязан перевыпускать его
 // из-за опечатки, то есть ровно то, что запрещает порядок проверок из комментария к enroll.
 func TestNodeEnrollKeyMismatchLeavesTokenUnspent(t *testing.T) {
@@ -1010,7 +1010,7 @@ func TestNodeObservedAndHeartbeatFillHealth(t *testing.T) {
 	}
 	if h.PeersConfigured != 1 || h.PeersHandshaked != 1 || h.InterfaceRxBytes != 1000 || h.InterfaceTxBytes != 500 ||
 		h.AppliedConfigVersion != 3 {
-		t.Fatalf("набраз живого узла: %+v", h)
+		t.Fatalf("образ живого узла: %+v", h)
 	}
 	if n := telemetryEventCount(t, f.server.ID, f.device.ID, "handshake_observed"); n != 1 {
 		t.Fatalf("событий handshake: %d, want 1", n)
@@ -1205,7 +1205,7 @@ func TestNodeDesiredRateLimitedPerServer(t *testing.T) {
 }
 
 // TestNodeRateLimitIsPerServer — бакет «на узел», а не «на сборку»: запросы одного
-// vpn-сервера не имеют права отнимать бюджет у другого. Поймывает обратный порядок
+// vpn-сервера не имеют права отнимать бюджет у другого. Ловит обратный порядок
 // обёрток (лимитер до аутентификации): тогда ключ бакета у обоих запросов — "unknown"
 // и второй узел получает 429 от чужого переполнения.
 //

@@ -679,7 +679,7 @@ func TestTelemetryDiscardsUnreadablePendingPacket(t *testing.T) {
 	f := newTelemetryFixture(t)
 	f.ingest(t, f.report(100, 50))
 	packetKey := "tsp:" + f.server.ID.String()
-	if err := f.rdb.Set(f.ctx, packetKey, "{telemetry: тело не разбореть", telemetry.PeerCountersTTL).Err(); err != nil {
+	if err := f.rdb.Set(f.ctx, packetKey, "{telemetry: тело не разобрать", telemetry.PeerCountersTTL).Err(); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.svc.IngestObserved(f.ctx, f.server.ID, f.report(150, 75), f.now); err != nil {

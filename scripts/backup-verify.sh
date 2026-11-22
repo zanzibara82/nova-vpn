@@ -21,7 +21,7 @@ if grep -aqE 'BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY' "$plain"; then
 fi
 
 # POSTGRES_PASSWORD=verify — пароль одноразовой локальной контейнерной базы, которую
-# скрипт создаёт и удавляет сам; это проверка восстановления дампа, а не секрет продукта.
+# скрипт создаёт и удаляет сам; это проверка восстановления дампа, а не секрет продукта.
 docker run -d --rm --name "$name" -e POSTGRES_PASSWORD=verify -e POSTGRES_DB=verify \
   postgres:17 >/dev/null
 # Ожидание базы с явным отказом: молчаливое истечение цикла уронило бы скрипт уже на
