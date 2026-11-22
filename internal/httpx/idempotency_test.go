@@ -48,7 +48,10 @@ func (m *memoryIdempotency) Complete(_ context.Context, userID uuid.UUID, route,
 }
 
 func (m *memoryIdempotency) Abandon(_ context.Context, userID uuid.UUID, route, key string) error {
-	delete(m.entries, memorySlot(userID, route, key))
+	slot := memorySlot(userID, route, key)
+	if entry, ok := m.entries[slot]; ok && entry.CompletedAt == nil {
+		delete(m.entries, slot)
+	}
 	m.abandoned++
 	return nil
 }
