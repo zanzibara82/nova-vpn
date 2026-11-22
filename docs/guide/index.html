@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NovaVPN — что умеет сервис: инструкция с живым прогоном</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="guide.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar__brand"><span class="topbar__mark"></span>NovaVPN <span class="topbar__sub">/ инструкция</span></div>
+  <nav class="topbar__nav" aria-label="Разделы руководства">
+    <a href="index.html" aria-current="page">Что умеет сервис</a>
+    <a href="protocol.html">Протокол прогона</a>
+    <a href="api.html">API-справочник</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <aside class="rail" aria-label="Оглавление">
+    <p class="rail__title">На странице</p>
+    <a href="#capabilities">Что умеет сегодня</a>
+    <a href="#quickstart">Быстрый старт</a>
+    <a href="#live">Живой прогон</a>
+    <a href="#api">API-справочник</a>
+    <a href="#plan">План и макет</a>
+    <a href="#limits">Чего нет</a>
+  </aside>
+
+  <main>
+    <div class="hero">
+      <h1>Что умеет NovaVPN сегодня</h1>
+      <p class="lede">Серверное управление доступом к WireGuard: аккаунты, устройства, профили, узлы и отзыв доступа. Эта страница показывает возможности на реальном локальном прогоне — не на макетах и не на обещаниях.</p>
+      <p>Всё, что ниже, подтверждено запросами к работающему API: 23 шага от регистрации до блокировки пользователя. Скриншоты сняты с этих же ответов, секреты в них скрыты.</p>
+      <div class="badges">
+        <span class="badge badge--success"><span class="badge__dot"></span>Живой прогон 2026-11-22</span>
+        <span class="badge badge--accent">Go 1.26 · PostgreSQL 17 · Redis 7</span>
+        <span class="badge">36 операций в OpenAPI</span>
+        <span class="badge badge--warning">Клиент ещё не выпущен</span>
+      </div>
+      <div class="summary-strip">
+        <div><dt>Шагов сценария</dt><dd>23</dd></div>
+        <div><dt>Секретов в протоколе</dt><dd class="ok">0</dd></div>
+        <div><dt>Пиеров на узле</dt><dd>1 → 0</dd></div>
+        <div><dt>Приватный ключ в конфиге</dt><dd class="ok">нет</dd></div>
+      </div>
+      <div class="note">
+        <strong>Граница честности.</strong> Это стенд разработки: HTTP, тестовые адреса и контейнеры. Он доказывает
+        работу протокола и жизненного цикла доступа, но не публичное развёртывание, не готовый клиент и не
+        производительность под нагрузкой.
+      </div>
+    </div>
+
+    <section id="capabilities">
+      <h2>Что умеет сегодня</h2>
+      <p class="section-lede">Восемь областей серверной части, каждая из которых прошла живой сценарий или интеграционные проверки.</p>
+      <div class="grid grid--2">
+        <div class="card">
+          <span class="card__kicker">Аккаунты и сессии</span>
+          <h3>Регистрация, вход и ротация токенов</h3>
+          <p>Пароли хранятся как Argon2id-хеш. Access-токен короткоживущий, refresh-токен ротируется; повторное использование старого refresh обнаруживается и закрывает семейство сессий.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Устройства</span>
+          <h3>Публичный ключ WireGuard и жёсткий лимит</h3>
+          <p>Устройство регистрируется по публичному ключу; приватный ключ на сервер не уходит. Лимит по тарифу — жёсткий; <code>Idempotency-Key</code> защищает от дублей при повторе.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Профили</span>
+          <h3>Выдача, конфигурация и отзыв</h3>
+          <p>Сервер выделяет туннельный адрес из пула и отдаёт конфиг <code>[Interface]/[Peer]</code> без строки <code>PrivateKey</code>. Ответ помечен <code>Cache-Control: no-store</code>. Отзыв профиля закрывает и выдачу конфига.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Каталог узлов</span>
+          <h3>Доступность по свежему heartbeat</h3>
+          <p>Новый сервер создаётся в <code>maintenance</code> и не принимает профили, пока администратор не переведёт его в <code>online</code>. В каталоге <code>availability</code> становится <code>available</code> только после свежего отчёта узла.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Контракт узла</span>
+          <h3>Желаемый набор с ETag и 304</h3>
+          <p>Одноразовый стартовый токен, привязка к публичному ключу сервера, узловой токен. Узел забирает набор пиеров, получает <code>304</code> при отсутствии изменений и присылает отчёт о счётчиках и heartbeat.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Администрирование</span>
+          <h3>Серверы, токены, блокировка и аудит</h3>
+          <p>Отдельный вход администратора, управление серверами, выдача и отзыв стартовых токенов, блокировка пользователя с отзывом профилей. Каждое действие попадает в журнал аудита с причиной и <code>request_id</code>.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Честные данные</span>
+          <h3>null вместо выдуманного нуля</h3>
+          <p>Задержка, нагрузка, <code>cpu_pct</code> и <code>latest_handshake</code> возвращаются как <code>null</code>, если их не измеряли. Ноль означал бы измеренный ноль и вводил бы в заблуждение.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Надёжность API</span>
+          <h3>Ошибки, лимиты и идемпотентность</h3>
+          <p>Единый конверт ошибки с <code>request_id</code>, ограничение частоты в Redis с fail-open, ограниченная идемпотентность критических операций и проверка живых ответов против OpenAPI в интеграционном наборе.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <h2>Быстрый старт на локальном стенде</h2>
+      <p class="section-lede">Путь из README: поднять PostgreSQL и Redis, применить миграции, запустить API. Go на хосте не нужен — Makefile использует контейнерный тулчейн.</p>
+      <ol class="steps">
+        <li>
+          <h3>Исходники и настройки</h3>
+          <p>Скопируйте образец окружения и заполните <code>NOVAVPN_JWT_SECRET</code> случайной base64-строкой не короче 32 байт. Секрет пишите прямо в файл, не в аргументы команд.</p>
+          <pre><code>git clone https://github.com/zanzibara82/nova-vpn.git
+cd nova-vpn
+cp -n infrastructure/docker/.env.dev.example infrastructure/docker/.env.dev</code></pre>
+        </li>
+        <li>
+          <h3>Зависимости, схема и API</h3>
+          <p>Порты в примере нестандартные, чтобы не задеть уже установленные PostgreSQL и Redis. Держите их одинаковыми для миграций и API.</p>
+          <pre><code>export POSTGRES_HOST_PORT=55433
+export REDIS_HOST_PORT=16380
+export MSYS_NO_PATHCONV=1
+make up-dev
+make migrate-up
+make run-dev</code></pre>
+        </li>
+        <li>
+          <h3>Проверка живости</h3>
+          <p>Отдельный <code>/debug/health</code> подтверждает только работу HTTP-процесса, а не доступность базы или тоннеля.</p>
+          <pre><code>curl --fail http://localhost:8080/debug/health</code></pre>
+        </li>
+        <li>
+          <h3>Администратор</h3>
+          <p>Администратор создаётся подкомандой CLI, пароль читается только из stdin. Рабочий пример со стендом, базой и созданием администратора — функция <code>setup</code> в <code>scripts/e2e.sh</code>. Не вставляйте пароль в аргументы команды или историю терминала.</p>
+        </li>
+      </ol>
+      <div class="note note--warning">
+        <strong>Остановка стенда.</strong> <code>docker compose -f infrastructure/docker/docker-compose.dev.yml stop</code>
+        останавливает контейнеры. <code>make down-dev</code> удаляет тома, а <code>make migrate-down</code> откатывает
+        миграции: это разрушительные команды, а не обычная остановка. Стенд не является резервной копией.
+      </div>
+    </section>
+
+    <section id="live">
+      <h2>Живой прогон: 23 шага</h2>
+      <p class="section-lede">Сценарий выполнен на локальном стенде 2026-11-22 по адресу <code>http://127.0.0.1:18080</code>. Ниже — кадры страницы <a href="protocol.html">полного протокола</a>; на ней каждый шаг раскрыт запросом, ответом, заголовками и пояснением.</p>
+
+      <h3 style="margin:26px 0 0;font-size:16px">Пользователь: аккаунт, устройство, профиль</h3>
+      <p style="margin:6px 0 0;color:var(--nv-text-2);font-size:14px">Регистрация, <code>/me</code> с планом <code>internal-default</code> (лимит 3 устройства), регистрация публичного ключа, выдача профиля и конфиг WireGuard без <code>PrivateKey</code>.</p>
+      <figure class="figure">
+        <img src="../images/guide/protocol-user.png" alt="Протокол прогона: шаги пользователя — регистрация, /me, устройство, профиль и конфигурация WireGuard без приватного ключа">
+        <figcaption><strong>Шаги 1–3, 8–10 и 18.</strong> Профиль получил адрес <code>10.99.7.2</code> из пула <code>10.99.7.0/24</code>. В конфиге есть <code>PublicKey</code> узла и нет <code>PrivateKey</code> — он остаётся на устройстве. <a href="protocol.html#s1">Открыть в протоколе</a></figcaption>
+      </figure>
+
+      <h3 style="margin:30px 0 0;font-size:16px">Администратор: узел, токен и аудит</h3>
+      <p style="margin:6px 0 0;color:var(--nv-text-2);font-size:14px">Сервер создаётся в <code>maintenance</code>, переводится в <code>online</code>, получает одноразовый стартовый токен. Аудит фиксирует каждое действие с причиной и <code>request_id</code>.</p>
+      <figure class="figure">
+        <img src="../images/guide/protocol-admin.png" alt="Протокол прогона: шаги администратора — создание сервера, перевод в online, стартовый токен, карточка сервера и журнал аудита">
+        <figcaption><strong>Шаги 4–7, 11, 17 и 19.</strong> «Зарегистрирован» не значит «работает»: до перевода в <code>online</code> выдача профилей отклоняется. Аудит хранит реальные действия, а не декоративные записи. <a href="protocol.html#s5">Открыть в протоколе</a></figcaption>
+      </figure>
+
+      <h3 style="margin:30px 0 0;font-size:16px">Узел: регистрация, набор пиеров и телеметрия</h3>
+      <p style="margin:6px 0 0;color:var(--nv-text-2);font-size:14px">Регистрация по стартовому токену и публичному ключу сервера, желаемый набор с сильным ETag, повтор с <code>If-None-Match</code> → <code>304</code>, отчёт о счётчиках и heartbeat.</p>
+      <figure class="figure">
+        <img src="../images/guide/protocol-node.png" alt="Протокол прогона: шаги узла — регистрация, желаемый набор пиеров с ETag, ответ 304, отчёт о счётчиках и heartbeat с null в нагрузке">
+        <figcaption><strong>Шаги 12–16.</strong> В наборе ровно один пиер — устройство пользователя. Повтор без изменений получает <code>304</code> без тела. После heartbeat карточка сервера заполняется <code>health</code>, а каталог переходит в <code>available</code>. <a href="protocol.html#s12">Открыть в протоколе</a></figcaption>
+      </figure>
+
+      <h3 style="margin:30px 0 0;font-size:16px">Отзыв доступа: блокировка пользователя</h3>
+      <p style="margin:6px 0 0;color:var(--nv-text-2);font-size:14px">Блокировка отзывает профиль, увеличивает <code>config_version</code> сервера и убирает пиер из желаемого набора. Конфиг отозванного профиля отвечает <code>409</code>.</p>
+      <figure class="figure">
+        <img src="../images/guide/protocol-revocation.png" alt="Протокол прогона: блокировка пользователя, пустой желаемый набор пиеров, статус профиля revoked и ответ 409 на выдачу конфигурации">
+        <figcaption><strong>Шаги 20–23.</strong> Пиеров на узле: 1 → 0. Профиль честно помечен <code>revoked</code>, а не скрыт за «успехом». Отзыв доступа — это изменение состояния узла, а не только строка в базе. <a href="protocol.html#s20">Открыть в протоколе</a></figcaption>
+      </figure>
+
+      <div class="note">
+        <strong>Порядок статусов.</strong> В прогоне встретились <code>201</code>, <code>200</code>, <code>304</code>,
+        <code>204</code> и <code>409</code>. Это не пересказ спецификации: коды взяты из фактических ответов стенда.
+        Значения паролей и токенов заменены пометкой «скрыт» ещё при записи протокола.
+      </div>
+    </section>
+
+    <section id="api">
+      <h2>API-справочник</h2>
+      <p class="section-lede">Контракт описан в <a href="../../api-spec/openapi.yaml">api-spec/openapi.yaml</a>: 29 путей и 36 операций. Страница ниже собрана из этого файла генератором Redoc и открывается локально без сервера.</p>
+      <div class="table-wrap" style="margin-bottom:20px">
+        <table>
+          <thead><tr><th>Группа</th><th>Операций</th><th>Что покрывает</th></tr></thead>
+          <tbody>
+            <tr><td><strong>auth</strong></td><td>5</td><td>Регистрация, вход, продление, выход, текущий профиль</td></tr>
+            <tr><td><strong>devices</strong></td><td>4</td><td>Регистрация и список устройств, отзыв, ротация ключа</td></tr>
+            <tr><td><strong>profiles</strong></td><td>5</td><td>Выдача, список, карточка, отзыв и конфигурация профиля</td></tr>
+            <tr><td><strong>servers</strong></td><td>1</td><td>Каталог доступных серверов</td></tr>
+            <tr><td><strong>admin</strong></td><td>16</td><td>Серверы, обслуживание, стартовые и узловые токены, пользователи, администраторы, аудит</td></tr>
+            <tr><td><strong>node</strong></td><td>5</td><td>Регистрация узла, желаемый набор, отчёт, heartbeat, ротация токена</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <figure class="figure">
+        <img src="../images/guide/api-reference.png" alt="Страница API-справочника Redoc: эндпоинты auth, devices, profiles, servers, admin и internal node">
+        <figcaption><strong>Redoc из OpenAPI.</strong> Схемы, коды ответов и примеры генерируются из контракта. Открыть целиком: <a href="api.html">API-справочник</a>.</figcaption>
+      </figure>
+    </section>
+
+    <section id="plan">
+      <h2>План и макет: что это не доказывает</h2>
+      <p class="section-lede">Дизайн-система существует и проверена отдельно, но клиентского приложения пока нет. Снимки ниже — витрина запланированного интерфейса, а не работающий VPN-клиент.</p>
+      <figure class="figure" style="margin-top:0">
+        <img src="../images/showcase-dark.png" alt="Витрина дизайн-системы NovaVPN, тёмная тема: палитра и компоненты запланированного клиента">
+        <figcaption><strong>Макет, не продукт.</strong> Кнопка соединения на витрине переключает только визуальное состояние и не создаёт туннель. Исходник — <a href="../../design/showcase.html">design/showcase.html</a>.</figcaption>
+      </figure>
+      <div class="grid grid--2" style="margin-top:20px">
+        <figure class="figure" style="margin:0">
+          <img src="../images/components-dark.png" alt="Компоненты будущего клиента в тёмной теме: кнопки, поля, состояния, демонстрационные устройства">
+          <figcaption><strong>Компоненты, тёмная тема.</strong> Устройства на кадре демонстрационные.</figcaption>
+        </figure>
+        <figure class="figure" style="margin:0">
+          <img src="../images/components-light.png" alt="Компоненты будущего клиента в светлой теме: те же элементы и демонстрационные устройства">
+          <figcaption><strong>Компоненты, светлая тема.</strong> Контраст проверен расчётом по WCAG AA.</figcaption>
+        </figure>
+      </div>
+      <div class="note note--warning">
+        <strong>Windows-клиент — первым, но позже.</strong> Установщика пока нет. Подключение к туннелю,
+        системная блокировка трафика при обрыве и раздельная маршрутизация приложений не реализованы и не
+        проверены сквозными испытаниями.
+      </div>
+    </section>
+
+    <section id="limits">
+      <h2>Чего нет и что не проверено</h2>
+      <p class="section-lede">Список намеренно не сокращён. Непроверенное не выдаётся за готовое, а неизмеренное — за ноль.</p>
+      <div class="grid grid--2">
+        <div class="card">
+          <span class="card__kicker">Не реализовано</span>
+          <ul>
+            <li>Клиентские приложения, в том числе Windows</li>
+            <li>Системная блокировка трафика (kill switch)</li>
+            <li>Раздельная маршрутизация по приложениям</li>
+            <li>Платежи и тарифные операции</li>
+            <li>Пользовательский веб-кабинет</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Не подтверждено испытаниями</span>
+          <ul>
+            <li>Публичное развёртывание узла на VPS — задача 19</li>
+            <li>Пропускная способность и показатели под нагрузкой</li>
+            <li>Худший случай интервала применения отзыва на реальной инфраструктуре</li>
+            <li>Работа с реальными сертификатами и внешним DNS за пределами стенда</li>
+          </ul>
+        </div>
+      </div>
+      <div class="note">
+        <strong>Где смотреть детали.</strong> Полная матрица доказательств и раздел <code>not-run</code> —
+        <a href="../testing-status.md">docs/testing-status.md</a>. Решения и ограничения — <a href="../../README.md">README</a>
+        и спецификации в <a href="../superpowers/specs/">docs/superpowers/specs</a>.
+      </div>
+    </section>
+
+    <footer>
+      <p>NovaVPN, цикл A-3. Инструкция собрана из живого прогона 2026-11-22. Секреты не публикуются: пароли и токены заменены пометкой, приватные ключи не покидают устройства и узел. Версия контракта — <a href="../../api-spec/openapi.yaml">OpenAPI</a>.</p>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

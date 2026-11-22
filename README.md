@@ -181,6 +181,7 @@ make api-lint
 
 ## Документация
 
+- [Инструкция: что умеет сервис, с живым прогоном и скриншотами](docs/guide/index.html)
 - [Спецификация ядра доступа и модель угроз](docs/superpowers/specs/2026-10-20-novavpn-cycle-a-access-core-design.md)
 - [Контракт API — OpenAPI](api-spec/openapi.yaml)
 - [Дизайн-система](docs/superpowers/specs/2026-10-22-novavpn-design-system-blue-black.md)

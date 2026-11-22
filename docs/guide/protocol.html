@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Полный протокол живого прогона — NovaVPN</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="guide.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar__brand"><span class="topbar__mark"></span>NovaVPN <span class="topbar__sub">/ инструкция</span></div>
+  <nav class="topbar__nav" aria-label="Разделы руководства">
+    <a href="index.html">Что умеет сервис</a>
+    <a href="protocol.html" aria-current="page">Протокол прогона</a>
+    <a href="api.html">API-справочник</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <aside class="rail" aria-label="Оглавление">
+    <p class="rail__title">Сценарий</p>
+    <a href="#summary">Сводка прогона</a>
+    <a href="#s1">Пользователь</a>
+    <a href="#s4">Администратор</a>
+    <a href="#s12">Узел</a>
+    <a href="#s19">Аудит</a>
+    <a href="#s20">Отзыв доступа</a>
+    <a href="#why">Почему на странице нет секретов</a>
+  </aside>
+
+  <main>
+    <div class="hero">
+      <h1>Полный протокол живого прогона</h1>
+      <p class="lede">Каждый блок ниже — реальный HTTP-запрос и реальный ответ локального стенда. Не макет и не пример из документации: прогон выполнен 2026-11-22T10:40:35+00:00 по адресу <code>http://127.0.0.1:18080</code>, порядок шагов сохранён.</p>
+      <p>Сценарий проходит весь путь сервиса: регистрация, устройство, выдача профиля, регистрация узла, применение желаемого набора пиеров, телеметрия, аудит и отзыв доступа блокировкой пользователя.</p>
+      <div class="summary-strip" id="summary">
+        <div><dt>Шагов</dt><dd>23</dd></div>
+        <div><dt>Секретов в протоколе</dt><dd class="ok">0</dd></div>
+        <div><dt>PrivateKey в конфиге</dt><dd class="ok">нет</dd></div>
+        <div><dt>Пиеров на узле</dt><dd>1 → 0</dd></div>
+      </div>
+      <div class="run-meta">
+        <span class="badge">UTC: 2026-11-22T10:40:35+00:00</span>
+        <span class="badge">Сервер: <code>6e1afe54-c92b-4e74-b8a5-1967a9d1fab1</code></span>
+        <span class="badge badge--success"><span class="badge__dot"></span>Пароли и токены скрыты</span>
+      </div>
+      <div class="filter" role="group" aria-label="Фильтр шагов по роли">
+        <button type="button" data-filter="all" aria-pressed="true">Все 23</button>
+        <button type="button" data-filter="user" aria-pressed="false">Пользователь</button>
+        <button type="button" data-filter="admin" aria-pressed="false">Администратор</button>
+        <button type="button" data-filter="node" aria-pressed="false">Узел</button>
+        <button type="button" data-filter="revoke" aria-pressed="false">Отзыв доступа</button>
+      </div>
+      <div class="note">
+        <strong>Как читать null.</strong> <code>null</code> в ответах — это «не измеряли», а не ноль. Свежесть
+        heartbeat, задержка, нагрузка и рукопожатия пиеров появляются только тогда, когда узел их действительно
+        прислал; сервис не подставляет нули вместо отсутствующих измерений.
+      </div>
+    </div>
+
+    <section id="timeline" style="padding-top:28px">
+      <h2>Хронология запросов</h2>
+      <p class="section-lede">Метка слева показывает, от чьего имени идёт запрос: пользователь, администратор или узел. Коды ответов — фактические.</p>
+<article class="step" id="s1" data-section="user" data-group="user">
+  <header class="step__head">
+    <span class="step__num">1</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Регистрация аккаунта</span>
+    <span class="badge badge--success">POST 201</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/auth/register</code>
+      <span class="status status--2xx">201</span>
+    </div>
+    <div class="headers"><span class="header-chip">Cache-Control: no-store</span></div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;email&quot;: &quot;user@demo.novavpn&quot;,
+  &quot;password&quot;: &quot;скрыт (секрет не публикуется)&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;access_token&quot;: &quot;скрыт (секрет не публикуется)&quot;,
+  &quot;refresh_token&quot;: &quot;скрыт (секрет не публикуется)&quot;,
+  &quot;token_type&quot;: &quot;Bearer&quot;,
+  &quot;access_expires_at&quot;: &quot;2026-11-22T10:50:35.257136036Z&quot;,
+  &quot;refresh_expires_at&quot;: &quot;2026-12-22T10:40:35.252162336Z&quot;
+}</code></pre>
+    <p class="step__note">Создаётся аккаунт и сессия: короткоживущий access-токен и ротируемый refresh-токен. Пароль хранится как argon2id-хеш; в ответе его нет.</p>
+  </div>
+</article>
+<article class="step" id="s2" data-section="user" data-group="user">
+  <header class="step__head">
+    <span class="step__num">2</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Кто я и какой у меня план</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/me</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="headers"><span class="header-chip">Cache-Control: no-store</span></div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;user&quot;: {
+    &quot;id&quot;: &quot;ee897a66-1f85-433c-9f80-be7bcd78e879&quot;,
+    &quot;email&quot;: &quot;user@demo.novavpn&quot;,
+    &quot;display_name&quot;: null,
+    &quot;status&quot;: &quot;active&quot;,
+    &quot;locale&quot;: &quot;ru&quot;,
+    &quot;created_at&quot;: &quot;2026-11-22T10:40:35.239011Z&quot;
+  },
+  &quot;plan&quot;: {
+    &quot;slug&quot;: &quot;internal-default&quot;,
+    &quot;device_limit&quot;: 3,
+    &quot;traffic_quota_bytes&quot;: null
+  },
+  &quot;devices&quot;: {
+    &quot;live&quot;: 0,
+    &quot;limit&quot;: 3
+  }
+}</code></pre>
+    <p class="step__note">Ответ описывает аккаунт и действующий план internal-default: лимит устройств 3. Полей с паролем или хешем в ответе нет.</p>
+  </div>
+</article>
+<article class="step" id="s3" data-section="user" data-group="user">
+  <header class="step__head">
+    <span class="step__num">3</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Регистрация устройства</span>
+    <span class="badge badge--success">POST 201</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/devices</code>
+      <span class="status status--2xx">201</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;public_key&quot;: &quot;7O8MKQTRUyFF7LQcztemRfMzfLW+dFFBvG5EPG/UbqQ=&quot;,
+  &quot;platform&quot;: &quot;windows&quot;,
+  &quot;name&quot;: &quot;Демо-ноутбук&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;01141193-8b3a-4a06-a205-02ec59b0b675&quot;,
+  &quot;public_key&quot;: &quot;7O8MKQTRUyFF7LQcztemRfMzfLW+dFFBvG5EPG/UbqQ=&quot;,
+  &quot;platform&quot;: &quot;windows&quot;,
+  &quot;name&quot;: &quot;Демо-ноутбук&quot;,
+  &quot;created_at&quot;: &quot;2026-11-22T10:40:35.291874Z&quot;,
+  &quot;last_seen_at&quot;: null,
+  &quot;revoked_at&quot;: null
+}</code></pre>
+    <p class="step__note">Устройство регистрируется по публичному ключу WireGuard. Приватный ключ на сервер не уходит. Idempotency-Key защищает от повторной регистрации при повторе запроса.</p>
+  </div>
+</article>
+<article class="step" id="s4" data-section="admin" data-group="admin">
+  <header class="step__head">
+    <span class="step__num">4</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Вход администратора</span>
+    <span class="badge badge--success">POST 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/admin/login</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;email&quot;: &quot;admin@demo.novavpn&quot;,
+  &quot;password&quot;: &quot;скрыт (секрет не публикуется)&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;access_token&quot;: &quot;скрыт (секрет не публикуется)&quot;,
+  &quot;token_type&quot;: &quot;bearer&quot;,
+  &quot;expires_in&quot;: 600
+}</code></pre>
+    <p class="step__note">Отдельный вход администратора. Токен участника не открывает /api/v1/admin/*.</p>
+  </div>
+</article>
+<article class="step" id="s5" data-section="admin" data-group="admin">
+  <header class="step__head">
+    <span class="step__num">5</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Создание VPN-сервера</span>
+    <span class="badge badge--success">POST 201</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/admin/servers</code>
+      <span class="status status--2xx">201</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;location&quot;: {
+    &quot;country_code&quot;: &quot;NL&quot;,
+    &quot;city&quot;: &quot;Амстердам&quot;,
+    &quot;lat&quot;: &quot;52.3676&quot;,
+    &quot;lon&quot;: &quot;4.9041&quot;,
+    &quot;timezone&quot;: &quot;Europe/Amsterdam&quot;
+  },
+  &quot;name&quot;: &quot;Демо-узел&quot;,
+  &quot;advertised_host&quot;: &quot;vpn.demo.novavpn.test&quot;,
+  &quot;listen_port&quot;: 51820,
+  &quot;public_key&quot;: &quot;Cjl/sHbaOuh0AfmtSvcSQTzIB0lD6N9wFr79u8yqfJ8=&quot;,
+  &quot;address_pool_v4&quot;: &quot;10.99.7.0/24&quot;,
+  &quot;mtu&quot;: 1420,
+  &quot;keepalive_sec&quot;: 25,
+  &quot;provider&quot;: &quot;demo&quot;,
+  &quot;reason&quot;: &quot;демонстрация возможностей сервиса&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;name&quot;: &quot;Демо-узел&quot;,
+  &quot;advertised_host&quot;: &quot;vpn.demo.novavpn.test&quot;,
+  &quot;listen_port&quot;: 51820,
+  &quot;public_key&quot;: &quot;Cjl/sHbaOuh0AfmtSvcSQTzIB0lD6N9wFr79u8yqfJ8=&quot;,
+  &quot;address_pool_v4&quot;: &quot;10.99.7.0/24&quot;,
+  &quot;mtu&quot;: 1420,
+  &quot;keepalive_sec&quot;: 25,
+  &quot;config_version&quot;: 0,
+  &quot;maintenance_status&quot;: &quot;maintenance&quot;,
+  &quot;provider&quot;: &quot;demo&quot;,
+  &quot;region&quot;: null,
+  &quot;capacity_mbps&quot;: null,
+  &quot;country_code&quot;: &quot;NL&quot;,
+  &quot;city&quot;: &quot;Амстердам&quot;,
+  &quot;peers_active&quot;: 0
+}</code></pre>
+    <p class="step__note">Сервер попадает в каталог. Публичный ключ узла создаётся на самом узле; здесь передан только он. Действие записывается в аудит.</p>
+  </div>
+</article>
+<article class="step" id="s6" data-section="admin" data-group="admin">
+  <header class="step__head">
+    <span class="step__num">6</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Перевод сервера в online</span>
+    <span class="badge badge--success">POST 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/admin/servers/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/maintenance</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;status&quot;: &quot;online&quot;,
+  &quot;reason&quot;: &quot;узел подготовлен к демонстрации&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;name&quot;: &quot;Демо-узел&quot;,
+  &quot;maintenance_status&quot;: &quot;online&quot;,
+  &quot;config_version&quot;: 1
+}</code></pre>
+    <p class="step__note">Созданный сервер находится в статусе maintenance: «зарегистрирован» не значит «работает». Только online принимает новые профили; draining ещё обслуживает текущих клиентов, но новых не берёт.</p>
+  </div>
+</article>
+<article class="step" id="s7" data-section="admin" data-group="admin">
+  <header class="step__head">
+    <span class="step__num">7</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Выдача стартового токена узла</span>
+    <span class="badge badge--success">POST 201</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/admin/servers/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/bootstrap-tokens</code>
+      <span class="status status--2xx">201</span>
+    </div>
+    <div class="headers"><span class="header-chip">Cache-Control: no-store</span></div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;ttl_sec&quot;: 3600
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;6946ee28-1f4d-4f0e-8b29-fe3eef4b8050&quot;,
+  &quot;server_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;created_at&quot;: &quot;2026-11-22T10:40:35.442711Z&quot;,
+  &quot;expires_at&quot;: &quot;2026-11-22T11:40:35.443529Z&quot;,
+  &quot;token&quot;: &quot;скрыт (секрет не публикуется)&quot;
+}</code></pre>
+    <p class="step__note">Одноразовый стартовый токен: значение показывается только в этом ответе, в базе лежит sha256. В протоколе значение скрыто.</p>
+  </div>
+</article>
+<article class="step" id="s8" data-section="user" data-group="user">
+  <header class="step__head">
+    <span class="step__num">8</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Каталог серверов до отчёта узла</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/servers</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;servers&quot;: [
+    {
+      &quot;id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+      &quot;name&quot;: &quot;Демо-узел&quot;,
+      &quot;country_code&quot;: &quot;NL&quot;,
+      &quot;city&quot;: &quot;Амстердам&quot;,
+      &quot;host&quot;: &quot;vpn.demo.novavpn.test&quot;,
+      &quot;port&quot;: 51820,
+      &quot;mtu&quot;: 1420,
+      &quot;latitude&quot;: 52.3676,
+      &quot;longitude&quot;: 4.9041,
+      &quot;availability&quot;: &quot;unknown&quot;,
+      &quot;latency_ms&quot;: null,
+      &quot;load&quot;: null,
+      &quot;capacity_mbps&quot;: null,
+      &quot;provider&quot;: &quot;demo&quot;,
+      &quot;region&quot;: &quot;&quot;
+    }
+  ]
+}</code></pre>
+    <p class="step__note">availability = unknown, пока нет свежего heartbeat. latency_ms и load = null: контроль-плейн их не измерял, и ноль здесь читался бы как измеренный ноль.</p>
+  </div>
+</article>
+<article class="step" id="s9" data-section="user" data-group="user">
+  <header class="step__head">
+    <span class="step__num">9</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Выдача профиля на сервер</span>
+    <span class="badge badge--success">POST 201</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/devices/01141193-8b3a-4a06-a205-02ec59b0b675/profiles</code>
+      <span class="status status--2xx">201</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;server_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;f49c48c2-29a4-4403-a440-bbb2c5ea7c16&quot;,
+  &quot;device_id&quot;: &quot;01141193-8b3a-4a06-a205-02ec59b0b675&quot;,
+  &quot;server_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;address_v4&quot;: &quot;10.99.7.2&quot;,
+  &quot;status&quot;: &quot;active&quot;,
+  &quot;issued_at&quot;: &quot;2026-11-22T10:40:35.482392Z&quot;,
+  &quot;expires_at&quot;: &quot;2026-12-22T10:40:35.48195Z&quot;,
+  &quot;overlap_valid_until&quot;: null,
+  &quot;revoked_at&quot;: null
+}</code></pre>
+    <p class="step__note">Сервер выделяет туннельный адрес из пула. Повтор с тем же ключом вернул бы тот же профиль с заголовком Idempotency-Replayed.</p>
+  </div>
+</article>
+<article class="step" id="s10" data-section="user" data-group="user">
+  <header class="step__head">
+    <span class="step__num">10</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Конфигурация WireGuard</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/devices/01141193-8b3a-4a06-a205-02ec59b0b675/profiles/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/config</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="headers"><span class="header-chip">Cache-Control: no-store</span></div>
+    <div class="kv-label">Тело ответа</div>
+    <pre><code>[Interface]
+Address = 10.99.7.2/32
+DNS = 10.99.7.1
+MTU = 1420
+
+[Peer]
+PublicKey = Cjl/sHbaOuh0AfmtSvcSQTzIB0lD6N9wFr79u8yqfJ8=
+AllowedIPs = 0.0.0.0/0
+Endpoint = vpn.demo.novavpn.test:51820
+PersistentKeepalive = 25
+</code></pre>
+    <p class="step__note">Сервер отдаёт [Interface]/[Peer] без строки PrivateKey: приватный ключ устройства не покидает устройство. Клиент добавляет его локально. Ответ помечен Cache-Control: no-store.</p>
+  </div>
+</article>
+<article class="step" id="s11" data-section="admin" data-group="admin">
+  <header class="step__head">
+    <span class="step__num">11</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Карточка сервера до отчёта узла</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/admin/servers/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;name&quot;: &quot;Демо-узел&quot;,
+  &quot;advertised_host&quot;: &quot;vpn.demo.novavpn.test&quot;,
+  &quot;listen_port&quot;: 51820,
+  &quot;public_key&quot;: &quot;Cjl/sHbaOuh0AfmtSvcSQTzIB0lD6N9wFr79u8yqfJ8=&quot;,
+  &quot;address_pool_v4&quot;: &quot;10.99.7.0/24&quot;,
+  &quot;mtu&quot;: 1420,
+  &quot;keepalive_sec&quot;: 25,
+  &quot;config_version&quot;: 2,
+  &quot;maintenance_status&quot;: &quot;online&quot;,
+  &quot;provider&quot;: &quot;demo&quot;,
+  &quot;region&quot;: null,
+  &quot;capacity_mbps&quot;: null,
+  &quot;country_code&quot;: &quot;NL&quot;,
+  &quot;city&quot;: &quot;Амстердам&quot;,
+  &quot;peers_active&quot;: 1,
+  &quot;health&quot;: null
+}</code></pre>
+    <p class="step__note">health = null: узел ещё не присылал heartbeat, и это честное «не измеряли», а не ноль пиеров.</p>
+  </div>
+</article>
+<article class="step" id="s12" data-section="node" data-group="node">
+  <header class="step__head">
+    <span class="step__num">12</span>
+    <span class="section-tag section-tag--node">Узел</span>
+    <span class="step__title">Регистрация узла по стартовому токену</span>
+    <span class="badge badge--success">POST 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/internal/v1/nodes/enroll</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="headers"><span class="header-chip">Cache-Control: no-store</span></div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;bootstrap_token&quot;: &quot;скрыт (секрет не публикуется)&quot;,
+  &quot;public_key&quot;: &quot;Cjl/sHbaOuh0AfmtSvcSQTzIB0lD6N9wFr79u8yqfJ8=&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;server_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;node_token&quot;: &quot;скрыт (секрет не публикуется)&quot;
+}</code></pre>
+    <p class="step__note">Узел предъявляет тот публичный ключ, который администратор зарегистрировал вместе с сервером; несовпадение даёт 401. Расход стартового токена, отзыв прежнего узлового токена и вставка нового идут одной транзакцией. Ответ содержит секрет и помечен Cache-Control: no-store; в протоколе токен скрыт.</p>
+  </div>
+</article>
+<article class="step" id="s13" data-section="node" data-group="node">
+  <header class="step__head">
+    <span class="step__num">13</span>
+    <span class="section-tag section-tag--node">Узел</span>
+    <span class="step__title">Желаемый набор пиеров</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/internal/v1/nodes/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/desired</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="headers"><span class="header-chip">ETag: &quot;fd339499f68e69d776092ac66d171d929235f2971199eeaeadc3a0af954894cf&quot;</span></div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;server_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;config_version&quot;: 2,
+  &quot;mtu&quot;: 1420,
+  &quot;listen_port&quot;: 51820,
+  &quot;tunnel_address&quot;: &quot;10.99.7.1/24&quot;,
+  &quot;dns_servers&quot;: [
+    &quot;10.99.7.1&quot;
+  ],
+  &quot;keepalive_sec&quot;: 25,
+  &quot;peers&quot;: [
+    {
+      &quot;public_key&quot;: &quot;7O8MKQTRUyFF7LQcztemRfMzfLW+dFFBvG5EPG/UbqQ=&quot;,
+      &quot;allowed_ips&quot;: [
+        &quot;10.99.7.2/32&quot;
+      ],
+      &quot;expires_at&quot;: &quot;2026-12-22T10:40:35.48195Z&quot;,
+      &quot;state&quot;: &quot;active&quot;
+    }
+  ],
+  &quot;measured_at&quot;: &quot;2026-11-22T10:40:35.627401836Z&quot;
+}</code></pre>
+    <p class="step__note">ETag — сильный валидатор от содержимого набора, а не от config_version. В наборе ровно один пиер — устройство пользователя с выданным адресом.</p>
+  </div>
+</article>
+<article class="step" id="s14" data-section="node" data-group="node">
+  <header class="step__head">
+    <span class="step__num">14</span>
+    <span class="section-tag section-tag--node">Узел</span>
+    <span class="step__title">Повторный запрос набора с ETag</span>
+    <span class="badge badge--accent">GET 304</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/internal/v1/nodes/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/desired</code>
+      <span class="status status--3xx">304</span>
+    </div>
+    <div class="headers"><span class="header-chip">ETag: &quot;fd339499f68e69d776092ac66d171d929235f2971199eeaeadc3a0af954894cf&quot;</span></div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>— тела нет</code></pre>
+    <p class="step__note">Набор не изменился — 304 без тела. Это единственный ответ без тела во всём контракте.</p>
+  </div>
+</article>
+<article class="step" id="s15" data-section="node" data-group="node">
+  <header class="step__head">
+    <span class="step__num">15</span>
+    <span class="section-tag section-tag--node">Узел</span>
+    <span class="step__title">Отчёт о наблюдаемых счётчиках</span>
+    <span class="badge badge--success">POST 204</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/internal/v1/nodes/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/observed</code>
+      <span class="status status--2xx">204</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;config_version&quot;: 2,
+  &quot;interface_rx_bytes&quot;: 152340,
+  &quot;interface_tx_bytes&quot;: 98120,
+  &quot;peers&quot;: [
+    {
+      &quot;public_key&quot;: &quot;7O8MKQTRUyFF7LQcztemRfMzfLW+dFFBvG5EPG/UbqQ=&quot;,
+      &quot;latest_handshake&quot;: null,
+      &quot;rx_bytes&quot;: 0,
+      &quot;tx_bytes&quot;: 0
+    }
+  ]
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>— тела нет</code></pre>
+    <p class="step__note">Счётчики и отсутствие handshake — данные узла. latest_handshake = null значит «рукопожатия ещё не было», а не «давно».</p>
+  </div>
+</article>
+<article class="step" id="s16" data-section="node" data-group="node">
+  <header class="step__head">
+    <span class="step__num">16</span>
+    <span class="section-tag section-tag--node">Узел</span>
+    <span class="step__title">Heartbeat узла</span>
+    <span class="badge badge--success">POST 204</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/internal/v1/nodes/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/heartbeat</code>
+      <span class="status status--2xx">204</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;agent_version&quot;: &quot;novavpn-node/0.1.0-demo&quot;,
+  &quot;agent_uptime_sec&quot;: 42,
+  &quot;load1&quot;: null,
+  &quot;cpu_pct&quot;: null,
+  &quot;applied_config_version&quot;: 2,
+  &quot;stale&quot;: false
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>— тела нет</code></pre>
+    <p class="step__note">load1 и cpu_pct = null: агент их не измерял, и контракт запрещает подменять это нулём. Свежесть heartbeat решает availability в каталоге (окно 90 с).</p>
+  </div>
+</article>
+<article class="step" id="s17" data-section="admin" data-group="admin">
+  <header class="step__head">
+    <span class="step__num">17</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Карточка сервера после отчёта узла</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/admin/servers/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;name&quot;: &quot;Демо-узел&quot;,
+  &quot;advertised_host&quot;: &quot;vpn.demo.novavpn.test&quot;,
+  &quot;listen_port&quot;: 51820,
+  &quot;public_key&quot;: &quot;Cjl/sHbaOuh0AfmtSvcSQTzIB0lD6N9wFr79u8yqfJ8=&quot;,
+  &quot;address_pool_v4&quot;: &quot;10.99.7.0/24&quot;,
+  &quot;mtu&quot;: 1420,
+  &quot;keepalive_sec&quot;: 25,
+  &quot;config_version&quot;: 2,
+  &quot;maintenance_status&quot;: &quot;online&quot;,
+  &quot;provider&quot;: &quot;demo&quot;,
+  &quot;region&quot;: null,
+  &quot;capacity_mbps&quot;: null,
+  &quot;country_code&quot;: &quot;NL&quot;,
+  &quot;city&quot;: &quot;Амстердам&quot;,
+  &quot;peers_active&quot;: 1,
+  &quot;health&quot;: {
+    &quot;observed_at&quot;: &quot;2026-11-22T10:40:35.735852Z&quot;,
+    &quot;peers_configured&quot;: 1,
+    &quot;peers_handshaked&quot;: 0,
+    &quot;interface_rx_bytes&quot;: 152340,
+    &quot;interface_tx_bytes&quot;: 98120,
+    &quot;load1&quot;: null,
+    &quot;cpu_pct&quot;: null,
+    &quot;applied_config_version&quot;: 2,
+    &quot;status&quot;: &quot;ok&quot;,
+    &quot;agent_version&quot;: &quot;novavpn-node/0.1.0-demo&quot;,
+    &quot;agent_uptime_sec&quot;: 42
+  }
+}</code></pre>
+    <p class="step__note">Теперь health заполнен: узел отчитался. peers_configured = 1, статус ok, а load1/cpu_pct остаются null — их не измеряли.</p>
+  </div>
+</article>
+<article class="step" id="s18" data-section="user" data-group="user">
+  <header class="step__head">
+    <span class="step__num">18</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Каталог серверов после heartbeat</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/servers</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;servers&quot;: [
+    {
+      &quot;id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+      &quot;name&quot;: &quot;Демо-узел&quot;,
+      &quot;country_code&quot;: &quot;NL&quot;,
+      &quot;city&quot;: &quot;Амстердам&quot;,
+      &quot;host&quot;: &quot;vpn.demo.novavpn.test&quot;,
+      &quot;port&quot;: 51820,
+      &quot;mtu&quot;: 1420,
+      &quot;latitude&quot;: 52.3676,
+      &quot;longitude&quot;: 4.9041,
+      &quot;availability&quot;: &quot;available&quot;,
+      &quot;latency_ms&quot;: null,
+      &quot;load&quot;: null,
+      &quot;capacity_mbps&quot;: null,
+      &quot;provider&quot;: &quot;demo&quot;,
+      &quot;region&quot;: &quot;&quot;
+    }
+  ]
+}</code></pre>
+    <p class="step__note">availability стала available благодаря свежему heartbeat. latency_ms и load по-прежнему null: сервис не выдумывает измерения.</p>
+  </div>
+</article>
+<article class="step" id="s19" data-section="admin" data-group="admin">
+  <header class="step__head">
+    <span class="step__num">19</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Журнал действий администратора</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/admin/audit</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;audit&quot;: [
+    {
+      &quot;id&quot;: 3,
+      &quot;admin_id&quot;: &quot;4eae3f60-b4c7-4b03-86cc-e54213d83a39&quot;,
+      &quot;action&quot;: &quot;bootstrap_token_issued&quot;,
+      &quot;target_type&quot;: &quot;bootstrap_token&quot;,
+      &quot;target_id&quot;: &quot;6946ee28-1f4d-4f0e-8b29-fe3eef4b8050&quot;,
+      &quot;reason&quot;: &quot;действие «bootstrap_token_issued» из админской консоли&quot;,
+      &quot;request_id&quot;: &quot;276a96ea7bbca09a&quot;,
+      &quot;created_at&quot;: &quot;2026-11-22T10:40:35.442711Z&quot;
+    },
+    {
+      &quot;id&quot;: 2,
+      &quot;admin_id&quot;: &quot;4eae3f60-b4c7-4b03-86cc-e54213d83a39&quot;,
+      &quot;action&quot;: &quot;server_updated&quot;,
+      &quot;target_type&quot;: &quot;server&quot;,
+      &quot;target_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+      &quot;reason&quot;: &quot;узел подготовлен к демонстрации&quot;,
+      &quot;request_id&quot;: &quot;0962da23997777c9&quot;,
+      &quot;created_at&quot;: &quot;2026-11-22T10:40:35.41759Z&quot;
+    },
+    {
+      &quot;id&quot;: 1,
+      &quot;admin_id&quot;: &quot;4eae3f60-b4c7-4b03-86cc-e54213d83a39&quot;,
+      &quot;action&quot;: &quot;server_created&quot;,
+      &quot;target_type&quot;: &quot;server&quot;,
+      &quot;target_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+      &quot;reason&quot;: &quot;демонстрация возможностей сервиса&quot;,
+      &quot;request_id&quot;: &quot;2ef5ff9276fab97b&quot;,
+      &quot;created_at&quot;: &quot;2026-11-22T10:40:35.393711Z&quot;
+    }
+  ]
+}</code></pre>
+    <p class="step__note">Аудит фиксирует создание сервера, выдачу стартового токена и регистрацию узла — с причиной и идентификатором запроса.</p>
+  </div>
+</article>
+<article class="step" id="s20" data-section="admin" data-group="revoke">
+  <header class="step__head">
+    <span class="step__num">20</span>
+    <span class="section-tag section-tag--admin">Администратор</span>
+    <span class="step__title">Блокировка пользователя</span>
+    <span class="badge badge--success">POST 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--post">POST</span>
+      <code>/api/v1/admin/users/ee897a66-1f85-433c-9f80-be7bcd78e879/lock</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Запрос</div>
+    <pre><code>{
+  &quot;reason&quot;: &quot;демонстрация отзыва доступа&quot;
+}</code></pre>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;ee897a66-1f85-433c-9f80-be7bcd78e879&quot;,
+  &quot;status&quot;: &quot;locked&quot;,
+  &quot;profiles_revoked&quot;: 1,
+  &quot;servers_bumped&quot;: 1
+}</code></pre>
+    <p class="step__note">Блокировка отзывает активные профили и увеличивает config_version затронутых серверов. Доступ закрывается на уровне желаемого набора пиеров.</p>
+  </div>
+</article>
+<article class="step" id="s21" data-section="node" data-group="revoke">
+  <header class="step__head">
+    <span class="step__num">21</span>
+    <span class="section-tag section-tag--node">Узел</span>
+    <span class="step__title">Набор пиеров после блокировки</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/internal/v1/nodes/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/desired</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="headers"><span class="header-chip">ETag: &quot;c3b7e8b28a5f54bcae3d4d3ac5aafc76d6ab76ccf81744ea9eff6197c9df0f20&quot;</span></div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;server_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;config_version&quot;: 3,
+  &quot;mtu&quot;: 1420,
+  &quot;listen_port&quot;: 51820,
+  &quot;tunnel_address&quot;: &quot;10.99.7.1/24&quot;,
+  &quot;dns_servers&quot;: [
+    &quot;10.99.7.1&quot;
+  ],
+  &quot;keepalive_sec&quot;: 25,
+  &quot;peers&quot;: [],
+  &quot;measured_at&quot;: &quot;2026-11-22T10:40:35.887286336Z&quot;
+}</code></pre>
+    <p class="step__note">Пиер пользователя исчез из желаемого набора: узел применит удаление в следующем цикле. ETag изменился, потому что изменилось содержимое набора.</p>
+  </div>
+</article>
+<article class="step" id="s22" data-section="user" data-group="revoke">
+  <header class="step__head">
+    <span class="step__num">22</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Профиль после блокировки</span>
+    <span class="badge badge--success">GET 200</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/devices/01141193-8b3a-4a06-a205-02ec59b0b675/profiles/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1</code>
+      <span class="status status--2xx">200</span>
+    </div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;id&quot;: &quot;f49c48c2-29a4-4403-a440-bbb2c5ea7c16&quot;,
+  &quot;device_id&quot;: &quot;01141193-8b3a-4a06-a205-02ec59b0b675&quot;,
+  &quot;server_id&quot;: &quot;6e1afe54-c92b-4e74-b8a5-1967a9d1fab1&quot;,
+  &quot;address_v4&quot;: &quot;10.99.7.2&quot;,
+  &quot;status&quot;: &quot;revoked&quot;,
+  &quot;issued_at&quot;: &quot;2026-11-22T10:40:35.482392Z&quot;,
+  &quot;expires_at&quot;: &quot;2026-12-22T10:40:35.48195Z&quot;,
+  &quot;overlap_valid_until&quot;: null,
+  &quot;revoked_at&quot;: &quot;2026-11-22T10:40:35.8212Z&quot;
+}</code></pre>
+    <p class="step__note">Профиль в состоянии revoked: сервер хранит настоящий статус, а не молчаливый успех.</p>
+  </div>
+</article>
+<article class="step" id="s23" data-section="user" data-group="revoke">
+  <header class="step__head">
+    <span class="step__num">23</span>
+    <span class="section-tag section-tag--user">Пользователь</span>
+    <span class="step__title">Конфигурация после блокировки</span>
+    <span class="badge badge--danger">GET 409</span>
+  </header>
+  <div class="step__body">
+    <div class="request-line">
+      <span class="method method--get">GET</span>
+      <code>/api/v1/devices/01141193-8b3a-4a06-a205-02ec59b0b675/profiles/6e1afe54-c92b-4e74-b8a5-1967a9d1fab1/config</code>
+      <span class="status status--4xx">409</span>
+    </div>
+    <div class="kv-label">Ответ</div>
+    <pre><code>{
+  &quot;error&quot;: {
+    &quot;code&quot;: &quot;conflict&quot;,
+    &quot;message&quot;: &quot;профиль не активен&quot;,
+    &quot;details&quot;: {
+      &quot;status&quot;: &quot;revoked&quot;
+    },
+    &quot;request_id&quot;: &quot;45b1c084c2d2adae&quot;
+  }
+}</code></pre>
+    <p class="step__note">Конфиг отозванного профиля больше не выдаётся: отзыв доступа — это не только запись в базе.</p>
+  </div>
+</article>
+    </section>
+
+    <section id="why">
+      <h2>Почему на странице нет секретов</h2>
+      <p class="section-lede">Протокол собран из ответов стенда автоматически. Всё, что является секретом, заменено пометкой «скрыт (секрет не публикуется)» ещё на этапе записи, до записи файла.</p>
+      <div class="grid grid--2">
+        <div class="card">
+          <span class="card__kicker">Скрыто в протоколе</span>
+          <p><code>access_token</code>, <code>refresh_token</code>, <code>token</code>, <code>node_token</code>, <code>bootstrap_token</code>, пароли пользователя и администратора. Сканирование транскрипта подтвердило: значений паролей и строк, похожих на JWT, в файле нет.</p>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Что видно намеренно</span>
+          <p>Публичные ключи WireGuard, идентификаторы, пул адресов, статусы, ETag и журнал аудита. Это не секреты: публичный ключ узла и устройства передаётся по контракту, приватные ключи не покидают устройства и узла.</p>
+        </div>
+      </div>
+      <div class="note note--warning">
+        <strong>Границы прогона.</strong> Стенд локальный, с HTTP и тестовыми адресами вида <code>demo.novavpn.test</code>.
+        Это доказательство работы протокола и жизненного цикла доступа, а не публичного развёртывания и не замеров
+        производительности.
+      </div>
+    </section>
+
+    <footer>
+      <p>NovaVPN, цикл A-3. Протокол — выдержка из локального прогона 2026-11-22. Полный список проверенного и непроверенного: <a href="../testing-status.md">docs/testing-status.md</a>. Вернуться к <a href="index.html">инструкции</a>.</p>
+    </footer>
+  </main>
+</div>
+<script>
+(function () {
+  var buttons = document.querySelectorAll('.filter [data-filter]');
+  var steps = document.querySelectorAll('.step');
+  function apply(filter) {
+    steps.forEach(function (step) {
+      var show = filter === 'all' || step.dataset.group === filter;
+      step.hidden = !show;
+    });
+    buttons.forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b.dataset.filter === filter));
+    });
+    var url = new URL(window.location.href);
+    if (filter === 'all') { url.searchParams.delete('filter'); } else { url.searchParams.set('filter', filter); }
+    history.replaceState(null, '', url);
+  }
+  buttons.forEach(function (b) {
+    b.addEventListener('click', function () { apply(b.dataset.filter); });
+  });
+  var initial = new URLSearchParams(window.location.search).get('filter');
+  if (initial) { apply(initial); }
+})();
+</script>
+</body>
+</html>
