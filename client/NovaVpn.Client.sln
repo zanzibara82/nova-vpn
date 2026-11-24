@@ -11,6 +11,10 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NovaVpn.Client.Core.Tests", "tests\NovaVpn.Client.Core.Tests\NovaVpn.Client.Core.Tests.csproj", "{A264CDBC-6BBC-4AEB-B020-D85C4B2C5368}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NovaVpn.Client.App", "src\NovaVpn.Client.App\NovaVpn.Client.App.csproj", "{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "NovaVpn.Client.App.Tests", "tests\NovaVpn.Client.App.Tests\NovaVpn.Client.App.Tests.csproj", "{40D414E1-769F-472C-B482-1DF1C08F49EB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -45,6 +49,30 @@ Global
 		{A264CDBC-6BBC-4AEB-B020-D85C4B2C5368}.Release|x64.Build.0 = Release|Any CPU
 		{A264CDBC-6BBC-4AEB-B020-D85C4B2C5368}.Release|x86.ActiveCfg = Release|Any CPU
 		{A264CDBC-6BBC-4AEB-B020-D85C4B2C5368}.Release|x86.Build.0 = Release|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Debug|x64.Build.0 = Debug|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Debug|x86.Build.0 = Debug|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Release|x64.ActiveCfg = Release|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Release|x64.Build.0 = Release|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Release|x86.ActiveCfg = Release|Any CPU
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A}.Release|x86.Build.0 = Release|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Debug|x64.Build.0 = Debug|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Debug|x86.Build.0 = Debug|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Release|x64.ActiveCfg = Release|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Release|x64.Build.0 = Release|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Release|x86.ActiveCfg = Release|Any CPU
+		{40D414E1-769F-472C-B482-1DF1C08F49EB}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -52,5 +80,7 @@ Global
 	GlobalSection(NestedProjects) = preSolution
 		{F301D02C-E68F-4E34-9B33-843ADE70F43D} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{A264CDBC-6BBC-4AEB-B020-D85C4B2C5368} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{37F77FBF-E8A5-494F-B3E6-C8E869E7588A} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{40D414E1-769F-472C-B482-1DF1C08F49EB} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal
