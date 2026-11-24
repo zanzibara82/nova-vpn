@@ -7,4 +7,7 @@
     <PackageReference Include="BouncyCastle.Cryptography" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="NovaVpn.Client.Core.Tests" />
+  </ItemGroup>
 </Project>
