@@ -452,6 +452,10 @@ async function refreshDiagnostics() {
 async function loadSignedIn() {
   const account = await attempt("account.get");
   if (!account.ok) {
+    state.session = null;
+    state.me = null;
+    state.devices = null;
+    state.currentDeviceId = null;
     showScreen("auth");
     return;
   }

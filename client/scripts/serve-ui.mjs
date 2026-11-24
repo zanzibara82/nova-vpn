@@ -13,8 +13,15 @@ const types = {
 };
 
 createServer(async (request, response) => {
-  const path = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
-  const file = normalize(join(root, path === "/" ? "index.html" : path));
+  let pathname;
+  try {
+    pathname = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
+  } catch {
+    response.writeHead(400);
+    response.end("bad request");
+    return;
+  }
+  const file = normalize(join(root, pathname === "/" ? "index.html" : pathname));
   if (!file.startsWith(root + sep)) {
     response.writeHead(403);
     response.end("forbidden");

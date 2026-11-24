@@ -24,6 +24,19 @@ public sealed class UiContractTests
 
     private static string Read(string name) => File.ReadAllText(Path.Combine(UiDir, name));
 
+    private static string RouterSource()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            var candidate = Path.Combine(dir.FullName, "client", "src",
+                "NovaVpn.Client.App", "Bridge", "BridgeRouter.cs");
+            if (File.Exists(candidate)) return File.ReadAllText(candidate);
+            dir = dir.Parent;
+        }
+        throw new InvalidOperationException("BridgeRouter.cs не найден выше каталога тестов.");
+    }
+
     [Theory]
     [InlineData("index.html")]
     [InlineData("help.html")]
@@ -34,8 +47,8 @@ public sealed class UiContractTests
         Assert.Contains($"content=\"{Csp}\"", html);
         Assert.DoesNotMatch(@"<script(?![^>]*\ssrc=)", html);
         Assert.DoesNotMatch(@"<style", html);
-        Assert.DoesNotMatch(@"\sstyle=""", html);
-        Assert.DoesNotMatch(@"\son[a-z]+=""", html);
+        Assert.DoesNotMatch(@"\sstyle\s*=\s*[""']", html);
+        Assert.DoesNotMatch(@"\son[a-z]+\s*=\s*[""']", html);
         Assert.DoesNotMatch(@"<(?:script|link)[^>]+https?://", html);
     }
 
@@ -66,11 +79,17 @@ public sealed class UiContractTests
             "profiles.export", "diagnostics.get",
         };
 
-        var attempted = Regex.Matches(js, "attempt\\(\"([a-z.]+)\"")
+        var attempted = Regex.Matches(js, "(?:attempt|bridge\\.send)\\(\\s*[\"']([a-z0-9._]+)[\"']")
             .Select(m => m.Groups[1].Value);
-        var stubCases = Regex.Matches(js, "case \"([a-z.]+)\":")
+        var stubCases = Regex.Matches(js, "case\\s+[\"']([a-z0-9._]+)[\"']\\s*:")
             .Select(m => m.Groups[1].Value);
         var used = attempted.Concat(stubCases).ToHashSet(StringComparer.Ordinal);
+
+        var router = Regex.Matches(RouterSource(), "\\[\"([a-z.]+)\"\\]\\s*=")
+            .Select(m => m.Groups[1].Value)
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(whitelist.Count, router.Count);
+        Assert.Subset(whitelist, router);
 
         Assert.Subset(whitelist, used);
         Assert.Contains("account.get", used);
@@ -90,6 +109,7 @@ public sealed class UiContractTests
         Assert.Contains("активного плана нет", js);
         Assert.Contains("Демонстрационные данные (заглушка моста)", html);
         Assert.Contains("туннель не поднимает", html);
+        Assert.Contains("Туннель не поднимает", Read("help.html"));
     }
 
     [Fact]
@@ -114,7 +134,37 @@ public sealed class UiContractTests
             File.ReadAllText(Path.Combine(UiDir, "fonts", "OFL-Inter.txt")));
         Assert.Contains("SIL OPEN FONT LICENSE",
             File.ReadAllText(Path.Combine(UiDir, "fonts", "OFL-JetBrainsMono.txt")));
+        Assert.Contains("JetBrains",
+            File.ReadAllText(Path.Combine(UiDir, "fonts", "OFL-JetBrainsMono.txt")));
         Assert.Contains("wireguard.com/install", Read("help.html"));
         Assert.Contains("rel=\"noopener\"", Read("help.html"));
+    }
+
+    [Fact]
+    public void Page_loads_local_script_and_styles()
+    {
+        var html = Read("index.html");
+        Assert.Matches(@"<link[^>]*rel=""stylesheet""[^>]*href=""app\.css""", html);
+        Assert.Matches(@"<script[^>]*src=""app\.js""[^>]*defer", html);
+    }
+
+    [Fact]
+    public void Styles_use_only_local_fonts_and_assets()
+    {
+        var css = Read("app.css");
+        Assert.DoesNotContain("http://", css);
+        Assert.DoesNotContain("https://", css);
+        Assert.DoesNotContain("@import", css);
+        Assert.Equal(8, Regex.Matches(css, "@font-face").Count);
+
+        var urls = Regex.Matches(css, "url\\(\"([^\"]+)\"\\)")
+            .Select(m => m.Groups[1].Value)
+            .ToList();
+        Assert.Equal(8, urls.Count);
+        foreach (var url in urls)
+        {
+            Assert.StartsWith("fonts/", url);
+            Assert.True(File.Exists(Path.Combine(UiDir, url)), $"нет файла {url}");
+        }
     }
 }
