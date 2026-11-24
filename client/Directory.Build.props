@@ -7,6 +7,10 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <Deterministic>true</Deterministic>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- Клиент публикуется только под win-x64. RID объявлен явно: иначе NuGet
+         пишет в packages.lock.json секцию win-x64 (restore с RID, publish), а
+         последующий restore в режиме locked без RID падает с NU1004. -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 </Project>
