@@ -39,6 +39,22 @@ jobs:
       - uses: actions/checkout@v4
       - run: make unit
 
+  # Клиент Windows собирается только на windows-latest: WinForms и WebView2 на
+  # linux-раннере не восстанавливаются. Версии пакетов закреплены в
+  # client/Directory.Packages.props, а --locked-mode превращает расхождение
+  # packages.lock.json с проектом в ошибку, а не в тихое обновление зависимостей.
+  windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Восстановление (locked)
+        run: dotnet restore client/NovaVpn.Client.sln --locked-mode
+      - name: Тесты
+        run: dotnet test client/NovaVpn.Client.sln -c Release --no-restore
+
   integration:
     runs-on: ubuntu-latest
     services:

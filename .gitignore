@@ -55,3 +55,11 @@ apps/admin/dist/
 .vscode/
 Thumbs.db
 .DS_Store
+
+# Клиент Windows (.NET)
+client/**/bin/
+client/**/obj/
+client/**/TestResults/
+client/**/*.user
+client/.vs/
+client/dist/
