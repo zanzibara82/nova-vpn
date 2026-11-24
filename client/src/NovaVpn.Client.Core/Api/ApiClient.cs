@@ -107,6 +107,19 @@ public sealed class ApiClient : IDisposable
 
     public void Dispose() => _http.Dispose();
 
+    /// <summary>
+    /// Тело JSON с точным media type <c>application/json</c>: <see cref="JsonContent"/>
+    /// дописывает <c>; charset=utf-8</c>, а API сверяет заголовок посимвольно
+    /// (<c>internal/httpx/json.go</c>) и на параметр charset отвечает 400 invalid_request.
+    /// Живой E2E это и поймал: без сброса charset отвергались все POST'ы с телом.
+    /// </summary>
+    internal static JsonContent JsonBody(object payload)
+    {
+        var content = JsonContent.Create(payload, options: JsonDefaults.Options);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        return content;
+    }
+
     private async Task<T> SendAsync<T>(HttpMethod method, string path, object? body,
         string? accessToken, string? idempotencyKey, CancellationToken ct, bool noContent = false)
     {
@@ -116,7 +129,7 @@ public sealed class ApiClient : IDisposable
         if (idempotencyKey is not null)
             req.Headers.TryAddWithoutValidation("Idempotency-Key", idempotencyKey);
         if (body is not null)
-            req.Content = JsonContent.Create(body, options: JsonDefaults.Options);
+            req.Content = JsonBody(body);
 
         var started = Stopwatch.StartNew();
         HttpResponseMessage resp;

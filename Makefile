@@ -191,6 +191,12 @@ node-help:
 # исходники только для чтения, Docker socket только ему, защищённый том
 # novavpn-e2e-control в /state. Службы стенда socket не получают. run-make.sh
 # передаёт CURDIR путём хоста Docker, поэтому том исходников строится от него.
+# Клиентский E2E идёт через свой скрипт: ему нужны dev-стенд и собственный
+# контейнер API, а не сетевой стенд узлов make e2e.
+.PHONY: client-e2e
+client-e2e:
+	bash client/scripts/e2e.sh
+
 E2E_CONTROL_VOL  := novavpn-e2e-control
 E2E_RUNNER       := novavpn-e2e-runner
 E2E_RUNNER_DOWN  := novavpn-e2e-runner-down
