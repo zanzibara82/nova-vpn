@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
 using NovaVpn.Client.App.Export;
@@ -16,6 +17,7 @@ internal static class SelfTestRunner
 
     public static int Run()
     {
+        Console.OutputEncoding = Encoding.UTF8;
         var dataDir = Path.Combine(Path.GetTempPath(), "novavpn-selftest-" + Guid.NewGuid().ToString("N"));
         var code = 5;
         try
@@ -98,6 +100,11 @@ internal static class SelfTestRunner
                 if (mode is "live" or "stub") break;
                 await Task.Delay(250);
             }
+            if (mode == "stub")
+            {
+                Fail(setCode, form, 5, "интерфейс открылся в режиме заглушки вместо живого моста.");
+                return;
+            }
             if (mode != "live")
             {
                 Fail(setCode, form, 3, $"интерфейс не загрузился за {BootTimeout.TotalSeconds:0} с (режим: {mode}).");
@@ -165,7 +172,7 @@ internal static class SelfTestRunner
 
     private static void Cleanup(string dataDir)
     {
-        for (var attempt = 0; attempt < 10; attempt++)
+        for (var attempt = 0; attempt < 60; attempt++)
         {
             try
             {
@@ -173,8 +180,8 @@ internal static class SelfTestRunner
                 Directory.Delete(dataDir, recursive: true);
                 return;
             }
-            catch (IOException) { Thread.Sleep(300); }
-            catch (UnauthorizedAccessException) { Thread.Sleep(300); }
+            catch (IOException) { Thread.Sleep(500); }
+            catch (UnauthorizedAccessException) { Thread.Sleep(500); }
         }
         Console.Error.WriteLine("selftest: временный каталог не удалён: " + dataDir);
     }
