@@ -132,7 +132,7 @@ dotnet test client/NovaVpn.Client.sln -c Release</code></pre>
         </li>
         <li>
           <h3>Опубликовать portable-каталог</h3>
-          <p>lock-файл УЖЕ содержит секцию <code>win-x64</code>; восстановление выполняется в locked-режиме:</p>
+          <p>lock-файл УЖЕ содержит секцию <code>win-x64</code>; восстановление идёт обычным <code>dotnet restore</code>, locked-режим включается на шаге публикации флагом <code>-p:RestoreLockedMode=true</code>:</p>
           <pre><code>dotnet restore client/NovaVpn.Client.sln -r win-x64
 dotnet publish client/src/NovaVpn.Client.App -c Release -r win-x64 \
   --self-contained false -p:RestoreLockedMode=true -o client/dist/win-x64</code></pre>
