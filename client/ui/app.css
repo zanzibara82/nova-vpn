@@ -243,6 +243,8 @@ input:disabled, select:disabled { opacity: .6; cursor: not-allowed; }
 .row:last-child { border-bottom: 0; }
 .row-main { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
 .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.saved-config { flex-basis: 100%; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.saved-config .hint { margin: 0; }
 .row .muted { font-size: 13px; line-height: 20px; }
 
 .issue-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }

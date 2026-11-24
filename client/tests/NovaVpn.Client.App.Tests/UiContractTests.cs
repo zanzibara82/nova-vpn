@@ -107,6 +107,14 @@ public sealed class UiContractTests
         Assert.Contains("не заявлена", js);
         Assert.Contains("без квоты", js);
         Assert.Contains("активного плана нет", js);
+        Assert.Contains(
+            "Конфиг сохранён. Подключение выполняет WireGuard; этот клиент туннелем не управляет.",
+            js);
+        Assert.Contains("Как подключить", js);
+        Assert.Contains("help.href = \"help.html\"", js);
+        Assert.Contains("superseded", js);
+        Assert.Contains("stubMode && !hasNative", js);
+        Assert.Contains("id=\"host-banner\"", html);
         Assert.Contains("Демонстрационные данные (заглушка моста)", html);
         Assert.Contains("туннель не поднимает", html);
         Assert.Contains("Туннель не поднимает", Read("help.html"));

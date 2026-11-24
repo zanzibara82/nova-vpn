@@ -1,8 +1,19 @@
 "use strict";
 
 const stubMode = new URLSearchParams(location.search).get("stub") === "1";
-const native = window.chrome && window.chrome.webview;
-const bridge = native && !stubMode ? liveBridge(native) : stubBridge();
+const hasNative = Boolean(window.chrome && window.chrome.webview);
+const bridge = stubMode && !hasNative
+  ? stubBridge()
+  : hasNative ? liveBridge(window.chrome.webview) : missingBridge();
+
+function missingBridge() {
+  const failure = {
+    code: "internal",
+    message: "Интерфейс открыт вне приложения NovaVPN. Запустите NovaVpn.Client.App.exe.",
+    requestId: null,
+  };
+  return { mode: "missing", send: () => Promise.reject(failure) };
+}
 
 const state = {
   screen: null,
@@ -13,6 +24,7 @@ const state = {
   devices: null,
   servers: [],
   profiles: [],
+  savedProfiles: new Set(),
   diagnostics: null,
   currentDeviceId: null,
 };
@@ -54,13 +66,13 @@ function profileStatus(status) {
     active: "активен",
     revoked: "отозван",
     expired: "истёк",
-    replaced: "заменён",
+    superseded: "заменён",
   }[status] || status;
 }
 
 function profileStatusClass(status) {
   if (status === "active") return "badge badge-ok";
-  if (status === "revoked" || status === "expired" || status === "replaced") return "badge badge-danger";
+  if (status === "revoked" || status === "expired" || status === "superseded") return "badge badge-danger";
   return "badge badge-muted";
 }
 
@@ -370,6 +382,15 @@ function renderProfiles() {
       revoke.dataset.server = profile.server_id;
       actions.append(save, revoke);
       row.append(actions);
+      if (state.savedProfiles.has(profile.server_id)) {
+        const saved = el("div", "saved-config");
+        saved.append(el("p", "hint",
+          "Конфиг сохранён. Подключение выполняет WireGuard; этот клиент туннелем не управляет."));
+        const help = el("a", "btn", "Как подключить");
+        help.href = "help.html";
+        saved.append(help);
+        row.append(saved);
+      }
     }
     list.append(row);
   }
@@ -587,6 +608,8 @@ async function exportProfile(serverId) {
     toast("Сохранение отменено.", "info");
     return;
   }
+  state.savedProfiles.add(serverId);
+  renderProfiles();
   toast("Файл сохранён: " + result.data.file_name, "ok");
 }
 
@@ -623,6 +646,7 @@ document.addEventListener("click", (event) => {
 
 async function boot() {
   if (bridge.mode === "stub") $("stub-banner").hidden = false;
+  if (bridge.mode === "missing") $("host-banner").hidden = false;
   const info = await attempt("app.info");
   if (info.ok) {
     state.appInfo = info.data;

@@ -232,6 +232,64 @@ public sealed class AppServicesTests
     }
 
     [Fact]
+    public async Task Delete_of_current_device_makes_list_empty_without_auto_create()
+    {
+        var gets = 0;
+        string? publicKey = null;
+        await using var env = await SignedInAsync((req, body, _) =>
+        {
+            var path = req.RequestUri!.AbsolutePath;
+            if (path == "/api/v1/devices" && req.Method == HttpMethod.Get)
+            {
+                gets++;
+                if (gets == 1) return Json(HttpStatusCode.OK, """{"devices":[]}""");
+                return gets == 2
+                    ? Json(HttpStatusCode.OK, $$"""{"devices":[{{DeviceJson(publicKey!)}}]}""")
+                    : Json(HttpStatusCode.OK, """{"devices":[]}""");
+            }
+            if (path == "/api/v1/devices" && req.Method == HttpMethod.Post)
+            {
+                publicKey = JsonDocument.Parse(body!).RootElement.GetProperty("public_key").GetString();
+                return Json(HttpStatusCode.Created, DeviceJson(publicKey!));
+            }
+            if (path == $"/api/v1/devices/{DeviceId}" && req.Method == HttpMethod.Delete)
+                return new HttpResponseMessage(HttpStatusCode.NoContent);
+            return Json(HttpStatusCode.NotFound, "{}");
+        });
+
+        var first = await env.Services.ListDevicesAsync(default);
+        Assert.Equal(DeviceId, first.CurrentDeviceId);
+
+        await env.Services.DeleteDeviceAsync(DeviceId, default);
+        var after = await env.Services.ListDevicesAsync(default);
+
+        Assert.Null(after.CurrentDeviceId);
+        Assert.Empty(after.Devices);
+        Assert.Equal(1, env.Handler.Requests.Count(r => r.Method == "POST" && r.Path == "/api/v1/devices"));
+    }
+
+    [Fact]
+    public async Task Delete_of_foreign_id_keeps_current_device_and_restores_auto_create()
+    {
+        await using var env = await SignedInAsync(WithRegisteredDevice());
+
+        var first = await env.Services.ListDevicesAsync(default);
+        Assert.Equal(DeviceId, first.CurrentDeviceId);
+
+        var foreign = Guid.Parse("44444444-4444-4444-8444-444444444444");
+        await env.Services.DeleteDeviceAsync(foreign, default);
+        var afterDelete = await env.Services.ListDevicesAsync(default);
+
+        Assert.Equal(DeviceId, afterDelete.CurrentDeviceId);
+        Assert.Single(afterDelete.Devices);
+
+        var again = await env.Services.ListDevicesAsync(default);
+        Assert.Equal(DeviceId, again.CurrentDeviceId);
+        Assert.Single(again.Devices);
+        Assert.Equal(1, env.Handler.Requests.Count(r => r.Method == "POST" && r.Path == "/api/v1/devices"));
+    }
+
+    [Fact]
     public async Task Export_cancel_warns_and_writes_nothing()
     {
         await using var env = await SignedInAsync(WithRegisteredDevice());

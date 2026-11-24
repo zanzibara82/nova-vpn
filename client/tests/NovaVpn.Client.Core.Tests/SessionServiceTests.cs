@@ -112,6 +112,41 @@ public sealed class SessionServiceTests
     }
 
     [Fact]
+    public async Task Second_401_after_refresh_ends_session()
+    {
+        using var dir = new TempDir();
+        var store = new SessionStore(dir.Path);
+        var handler = new StubHandler(req => req.RequestUri!.AbsolutePath switch
+        {
+            "/api/v1/auth/login" => StubHandler.Json(HttpStatusCode.OK, ApiJson(Session("a1", "r1"))),
+            "/api/v1/auth/refresh" => StubHandler.Json(HttpStatusCode.OK, ApiJson(Session("a2", "r2"))),
+            "/api/v1/me" => MeUnauthorized(),
+            _ => StubHandler.Json(HttpStatusCode.NotFound, "{}"),
+        });
+        using var api = new ApiClient(Base, handler);
+        var svc = new SessionService(api, Base, store);
+        await svc.LoginAsync("a@b.c", "0123456789", default);
+        var changes = 0;
+        svc.Changed += () => changes++;
+
+        var ex = await Assert.ThrowsAsync<ApiException>(() =>
+            svc.AuthorizedAsync((t, c) => api.GetMeAsync(t, c), default));
+
+        Assert.Equal("unauthenticated", ex.Code);
+        Assert.Equal("Сессия истекла. Войдите снова.", ex.Message);
+        Assert.False(store.Exists);
+        Assert.Null(svc.Current);
+        Assert.Equal(2, changes); // refresh подключил сессию, повторный 401 её стёр
+        Assert.Equal(1, handler.Requests.Count(r => r.Path == "/api/v1/auth/refresh"));
+        Assert.Equal(2, handler.Requests.Count(r => r.Path == "/api/v1/me"));
+
+        var again = await Assert.ThrowsAsync<ApiException>(() =>
+            svc.AuthorizedAsync((t, c) => api.GetMeAsync(t, c), default));
+        Assert.Equal("unauthenticated", again.Code);
+        Assert.Contains("Сессия не открыта.", again.Message);
+    }
+
+    [Fact]
     public async Task Logout_clears_locally_even_when_api_is_unreachable()
     {
         using var dir = new TempDir();

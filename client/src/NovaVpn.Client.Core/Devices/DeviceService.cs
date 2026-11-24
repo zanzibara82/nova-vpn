@@ -25,6 +25,9 @@ public sealed class DeviceService
     public DeviceIdentity? CurrentIdentity =>
         _session is { BaseUrl: var b, Email: { } e } ? _store.Get(DeviceIdentityStore.AccountKey(b, e)) : null;
 
+    /// <summary>Автосоздание запрещено после «забыть устройство»: список не должен его отменять.</summary>
+    public bool AutoCreateSuppressed => _autoCreateSuppressed;
+
     public static string IdempotencyKeyFor(string publicKey) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("device-create\n" + publicKey)))
             .ToLowerInvariant();
@@ -52,6 +55,32 @@ public sealed class DeviceService
 
         identity ??= NewIdentity(baseUrl, email);
         return await RegisterAsync(identity, accountKey, retryDuplicate: true, ct);
+    }
+
+    /// <summary>
+    /// Список без автосоздания: после «забыть устройство» UI обязан показать пустой список
+    /// и «Сначала создайте устройство», а не молча зарегистрировать новое.
+    /// Найденное живое устройство снимает запрет: удаление чужого id не ломает список навсегда.
+    /// </summary>
+    public async Task<(IReadOnlyList<DeviceView> Devices, Guid? CurrentId)> ListReadOnlyAsync(
+        CancellationToken ct)
+    {
+        var (baseUrl, email) = Location();
+        var accountKey = DeviceIdentityStore.AccountKey(baseUrl, email);
+        var identity = _store.Get(accountKey);
+        var devices = await ListWireAsync(ct);
+        Guid? currentId = null;
+        if (identity is not null)
+        {
+            var live = devices.FirstOrDefault(d => d.PublicKey == identity.PublicKey && d.RevokedAt is null);
+            if (live is not null)
+            {
+                if (identity.DeviceId != live.Id) _store.Put(accountKey, identity with { DeviceId = live.Id });
+                currentId = live.Id;
+                _autoCreateSuppressed = false;
+            }
+        }
+        return (devices, currentId);
     }
 
     public async Task<DeviceView> CreateAsync(string name, CancellationToken ct)

@@ -54,11 +54,27 @@ public sealed class BridgeRouterTests
         var (router, _) = Create();
 
         var malformed = Parse(await router.HandleAsync("{", default));
-        var deep = Parse(await router.HandleAsync(
-            """{"id":"x","command":"app.info","args":{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":1}}}}}}}}}}""", default));
+        var atBoundary = Parse(await router.HandleAsync(Nested(8), default));
+        var beyond = Parse(await router.HandleAsync(Nested(9), default));
 
         Assert.Equal("bad_args", malformed.GetProperty("error").GetProperty("code").GetString());
-        Assert.Equal("bad_args", deep.GetProperty("error").GetProperty("code").GetString());
+        Assert.True(atBoundary.GetProperty("ok").GetBoolean(),
+            $"8 вложенных объектов (глубина {BridgeRouter.MaxDepth}) должны приниматься: {atBoundary}");
+        Assert.Equal("bad_args", beyond.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    /// <summary>
+    /// <paramref name="objects"/> — общее число JSON-объектов, включая корень запроса:
+    /// ровно столько уровней видит <see cref="JsonDocument"/> при разборе.
+    /// </summary>
+    private static string Nested(int objects)
+    {
+        var sb = new StringBuilder("{\"id\":\"x\",\"command\":\"app.info\",\"args\":");
+        var depth = objects - 1;
+        for (var i = 0; i < depth; i++) sb.Append("{\"").Append((char)('a' + i)).Append("\":");
+        sb.Append('1');
+        sb.Append('}', depth + 1);
+        return sb.ToString();
     }
 
     [Fact]

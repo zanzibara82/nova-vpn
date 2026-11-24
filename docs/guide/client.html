@@ -89,12 +89,12 @@
       <p class="section-lede">Пять экранов: подключение к API, главный, каталог, настройки, диагностика. Ниже — четыре кадра заглушки; данные в них демонстрационные.</p>
       <div class="grid grid--2">
         <figure class="figure" style="margin:0">
-          <img src="../images/guide/client-home-dark.png" alt="Главный экран клиента в тёмной теме: план internal-default, устройство DEMO-WS, выданный профиль ams-1 и кнопка сохранения .conf; сверху баннер заглушки">
-          <figcaption><strong>Главный, тёмная тема.</strong> План <code>internal-default</code>, устройство <code>DEMO-WS</code>, профиль активен. Кнопка сохраняет файл, но туннель не поднимает.</figcaption>
+          <img src="../images/guide/client-home-dark.png" alt="Главный экран клиента в тёмной теме: план internal-default, устройство DEMO-WS, выданный профиль ams-1, состояние «конфиг сохранён» с кнопкой «Как подключить» и кнопка сохранения .conf; сверху баннер заглушки">
+          <figcaption><strong>Главный, тёмная тема.</strong> План <code>internal-default</code>, устройство <code>DEMO-WS</code>, профиль активен. После сохранения файла карточка показывает состояние «конфиг сохранён» и кнопку «Как подключить»: файл сохраняет клиент, туннель поднимает WireGuard.</figcaption>
         </figure>
         <figure class="figure" style="margin:0">
-          <img src="../images/guide/client-home-light.png" alt="Тот же главный экран клиента в светлой теме: те же демонстрационные данные и баннер заглушки">
-          <figcaption><strong>Главный, светлая тема.</strong> Тема выбирается по <code>prefers-color-scheme</code>; контраст проверен по WCAG AA.</figcaption>
+          <img src="../images/guide/client-home-light.png" alt="Тот же главный экран клиента в светлой теме: те же демонстрационные данные, состояние «конфиг сохранён» с кнопкой «Как подключить» и баннер заглушки">
+          <figcaption><strong>Главный, светлая тема.</strong> Тема выбирается по <code>prefers-color-scheme</code>; контраст проверен по WCAG AA. Состояние «конфиг сохранён» и кнопка «Как подключить» те же, что в тёмной теме.</figcaption>
         </figure>
       </div>
       <div class="grid grid--2" style="margin-top:20px">
@@ -132,11 +132,11 @@ dotnet test client/NovaVpn.Client.sln -c Release</code></pre>
         </li>
         <li>
           <h3>Опубликовать portable-каталог</h3>
-          <p>Сначала восстановить пакеты под RID <code>win-x64</code>, иначе закреплённый lock-файл не содержит нужных ресурсов и публикация с <code>RestoreLockedMode</code> остановится.</p>
-          <pre><code>dotnet restore client/NovaVpn.Client.sln -r win-x64 --force-evaluate
+          <p>lock-файл УЖЕ содержит секцию <code>win-x64</code>; восстановление выполняется в locked-режиме:</p>
+          <pre><code>dotnet restore client/NovaVpn.Client.sln -r win-x64
 dotnet publish client/src/NovaVpn.Client.App -c Release -r win-x64 \
   --self-contained false -p:RestoreLockedMode=true -o client/dist/win-x64</code></pre>
-          <p>Каталог <code>client/dist/win-x64</code> и zip <code>NovaVpn-Client-0.1.0-preview-win-x64.zip</code> в репозиторий не входят. Это framework-dependent сборка: .NET Desktop Runtime 10 и WebView2 Runtime должны быть установлены.</p>
+          <p>Каталог <code>client/dist/win-x64</code> и zip <code>NovaVpn-Client-0.1.0-preview-win-x64.zip</code> в репозиторий не входят. Это framework-dependent сборка: .NET Desktop Runtime 10 и WebView2 Runtime должны быть установлены. zip собирается вручную (<code>Compress-Archive</code>); скрипта упаковки в репозитории нет.</p>
         </li>
         <li>
           <h3>Запустить и подключить API</h3>

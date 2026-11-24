@@ -28,6 +28,9 @@ public static class ApiExceptionFactory
 
 public sealed class ApiClient : IDisposable
 {
+    /// <summary>Потолок тела ответа: больше клиент не читает и не разбирает.</summary>
+    private const int MaxBodyBytes = 1024 * 1024;
+
     private readonly HttpClient _http;
     private readonly IApiObserver? _observer;
 
@@ -151,25 +154,70 @@ public sealed class ApiClient : IDisposable
             var status = (int)resp.StatusCode;
             if (status is >= 300 and < 400)
             {
-                _observer?.OnRequestCompleted(new ApiCall(method.Method, path, status, null, started.Elapsed));
+                var requestId = RequestId(resp, null);
+                _observer?.OnRequestCompleted(new ApiCall(method.Method, path, status, requestId, started.Elapsed));
                 throw new ApiException(ClientErrorCodes.Network, status,
-                    "API перенаправляет запросы; переадресация запрещена.");
+                    "API перенаправляет запросы; переадресация запрещена.", requestId: requestId);
             }
             if (status is >= 200 and < 300)
             {
                 var requestId = RequestId(resp, null);
                 _observer?.OnRequestCompleted(new ApiCall(method.Method, path, status, requestId, started.Elapsed));
                 if (noContent || status == 204) return default!;
-                var text = await resp.Content.ReadAsStringAsync(ct);
+                var text = await ReadBodyAsync(resp, status, ct);
                 if (typeof(T) == typeof(string)) return (T)(object)text;
-                return JsonSerializer.Deserialize<T>(text, JsonDefaults.Options)
-                    ?? throw new ApiException("internal", status, "Пустой ответ API.", requestId: requestId);
+                try
+                {
+                    return JsonSerializer.Deserialize<T>(text, JsonDefaults.Options)
+                        ?? throw new ApiException("internal", status, "Пустой ответ API.",
+                            requestId: requestId);
+                }
+                catch (JsonException)
+                {
+                    throw new ApiException("internal", status, "Некорректный ответ API.",
+                        requestId: requestId);
+                }
             }
 
-            var raw = await resp.Content.ReadAsStringAsync(ct);
+            var raw = await ReadBodyAsync(resp, status, ct);
             var ex = ParseError(resp, raw, status);
             _observer?.OnRequestCompleted(new ApiCall(method.Method, path, status, ex.RequestId, started.Elapsed));
             throw ex;
+        }
+    }
+
+    /// <summary>
+    /// Читает тело ответа под защитой: потолок размера, таймаут и обрыв связи превращаются
+    /// в <see cref="ApiException"/> с устойчивым кодом, а не в необработанное исключение.
+    /// </summary>
+    private static async Task<string> ReadBodyAsync(HttpResponseMessage resp, int status,
+        CancellationToken ct)
+    {
+        try
+        {
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            using var buffer = new MemoryStream();
+            var chunk = new byte[16 * 1024];
+            int read;
+            while ((read = await stream.ReadAsync(chunk, ct)) > 0)
+            {
+                if (buffer.Length + read > MaxBodyBytes)
+                    throw new ApiException(ClientErrorCodes.Network, status, "Ответ API слишком большой.");
+                buffer.Write(chunk, 0, read);
+            }
+            return System.Text.Encoding.UTF8.GetString(buffer.ToArray());
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new ApiException(ClientErrorCodes.Timeout, status, "Истекло время ожидания ответа API.");
+        }
+        catch (IOException)
+        {
+            throw new ApiException(ClientErrorCodes.Network, status, "Нет связи с API.");
+        }
+        catch (HttpRequestException)
+        {
+            throw new ApiException(ClientErrorCodes.Network, status, "Нет связи с API.");
         }
     }
 
@@ -190,7 +238,10 @@ public sealed class ApiClient : IDisposable
         }
         catch (JsonException) { }
 
-        var retryAfter = resp.Headers.RetryAfter?.Delta;
+        var retry = resp.Headers.RetryAfter;
+        var retryAfter = retry?.Delta
+            ?? (retry?.Date is { } date ? date - DateTimeOffset.UtcNow : null);
+        if (retryAfter is { } span && span < TimeSpan.Zero) retryAfter = TimeSpan.Zero;
         return new ApiException(
             code ?? ApiExceptionFactory.CodeForStatus(status),
             status,

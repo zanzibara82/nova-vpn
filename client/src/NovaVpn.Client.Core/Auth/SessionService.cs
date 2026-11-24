@@ -92,7 +92,16 @@ public sealed class SessionService
         catch (ApiException ex) when (ex.StatusCode == 401)
         {
             var fresh = await RefreshOnceAsync(used, ct);
-            return await call(fresh, ct);
+            try
+            {
+                return await call(fresh, ct);
+            }
+            catch (ApiException retry) when (retry.StatusCode == 401)
+            {
+                // Сессию стираем, только если её не заменил параллельный успешный refresh.
+                if (_access == fresh) ClearLocal();
+                throw new ApiException("unauthenticated", 401, "Сессия истекла. Войдите снова.");
+            }
         }
     }
 

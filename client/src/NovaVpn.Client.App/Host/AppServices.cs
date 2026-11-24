@@ -135,6 +135,11 @@ public sealed class AppServices : IBridgeBackend, IAsyncDisposable
     {
         var session = RequireSession();
         var devices = _devices!;
+        if (devices.AutoCreateSuppressed)
+        {
+            var (existing, currentId) = await devices.ListReadOnlyAsync(ct);
+            return new DevicesView(existing, currentId);
+        }
         var current = await devices.EnsureRegisteredAsync(ct);
         var all = await session.AuthorizedAsync((t, c) => _api!.ListDevicesAsync(t, c), ct);
         return new DevicesView(all, current.Id);

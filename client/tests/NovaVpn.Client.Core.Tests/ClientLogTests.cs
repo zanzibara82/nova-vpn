@@ -20,12 +20,28 @@ public sealed class ClientLogTests
     [Fact]
     public void Lines_do_not_accept_arbitrary_fields()
     {
-        using var dir = new TempDir();
-        var log = new ClientLog(dir.Path);
-        log.Write("GET /api/v1/me 401 req=9a1b2c3d4e5f6071 12ms");
+        using (var dir = new TempDir())
+        {
+            var log = new ClientLog(dir.Path);
+            log.Write("a\r\nb");
 
-        var text = File.ReadAllText(Directory.GetFiles(dir.Path).Single());
-        Assert.Contains("GET /api/v1/me", text);
-        Assert.DoesNotContain("Bearer ", text);
+            var lines = File.ReadAllLines(Directory.GetFiles(dir.Path).Single());
+            Assert.Single(lines);
+            Assert.DoesNotContain('\r', lines[0]);
+            Assert.Contains("a", lines[0]);
+            Assert.Contains("b", lines[0]);
+            Assert.DoesNotContain("Bearer ", lines[0]);
+        }
+
+        using (var dir = new TempDir())
+        {
+            var log = new ClientLog(dir.Path);
+            log.Write("x\nInjected: y");
+
+            var lines = File.ReadAllLines(Directory.GetFiles(dir.Path).Single());
+            Assert.Single(lines);
+            Assert.DoesNotContain(lines,
+                l => l.StartsWith("Injected:", StringComparison.Ordinal));
+        }
     }
 }

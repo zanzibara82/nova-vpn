@@ -149,10 +149,120 @@ public sealed class ApiClientTests
     }
 
     [Fact]
+    public async Task Body_read_failure_is_network_error()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ThrowingContent(),
+        });
+        using var api = Client(handler);
+
+        var ex = await Assert.ThrowsAsync<ApiException>(() => api.GetMeAsync("a", default));
+
+        Assert.Equal(ClientErrorCodes.Network, ex.Code);
+        Assert.Equal("Нет связи с API.", ex.Message);
+    }
+
+    [Fact]
+    public async Task Invalid_json_on_success_keeps_request_id()
+    {
+        var handler = new StubHandler(_ =>
+        {
+            var r = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{", Encoding.UTF8, "application/json"),
+            };
+            r.Headers.Add("X-Request-Id", "req-77");
+            return r;
+        });
+        using var api = Client(handler);
+
+        var ex = await Assert.ThrowsAsync<ApiException>(() => api.GetMeAsync("a", default));
+
+        Assert.Equal("internal", ex.Code);
+        Assert.Equal("Некорректный ответ API.", ex.Message);
+        Assert.Equal("req-77", ex.RequestId);
+    }
+
+    [Fact]
+    public async Task Oversized_success_body_is_refused_before_parsing()
+    {
+        var payload = "{\"pad\":\"" + new string('x', 1024 * 1024 + 1) + "\"}";
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
+        });
+        using var api = Client(handler);
+
+        var ex = await Assert.ThrowsAsync<ApiException>(() => api.GetMeAsync("a", default));
+
+        Assert.Equal(ClientErrorCodes.Network, ex.Code);
+        Assert.Equal("Ответ API слишком большой.", ex.Message);
+    }
+
+    [Fact]
+    public async Task Retry_after_http_date_is_parsed()
+    {
+        var handler = new StubHandler(_ =>
+        {
+            var r = StubHandler.Json((HttpStatusCode)429,
+                """{"error":{"code":"rate_limited","message":"m","request_id":"0000000000000001"}}""");
+            r.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(
+                DateTimeOffset.UtcNow.AddMinutes(5));
+            return r;
+        });
+        using var api = Client(handler);
+
+        var ex = await Assert.ThrowsAsync<ApiException>(() => api.GetMeAsync("a", default));
+
+        Assert.NotNull(ex.RetryAfter);
+        Assert.True(ex.RetryAfter > TimeSpan.Zero, $"RetryAfter = {ex.RetryAfter}");
+    }
+
+    [Fact]
+    public async Task Redirect_keeps_request_id()
+    {
+        var handler = new StubHandler(_ =>
+        {
+            var r = new HttpResponseMessage(HttpStatusCode.Redirect);
+            r.Headers.Location = new Uri("https://evil.example/");
+            r.Headers.Add("X-Request-Id", "req-42");
+            return r;
+        });
+        using var api = Client(handler);
+
+        var ex = await Assert.ThrowsAsync<ApiException>(() =>
+            api.LoginAsync("a@b.c", "0123456789", default));
+
+        Assert.Equal(ClientErrorCodes.Network, ex.Code);
+        Assert.Equal("req-42", ex.RequestId);
+    }
+
+    [Fact]
     public void Base_lowercase_code_falls_back_by_status()
     {
         Assert.Equal("internal", ApiExceptionFactory.CodeForStatus(500));
         Assert.Equal("unauthenticated", ApiExceptionFactory.CodeForStatus(401));
         Assert.Equal("conflict", ApiExceptionFactory.CodeForStatus(409));
+    }
+
+    /// <summary>
+    /// Тело, которое отдаёт первый байт и рвётся на чтении: так ловится отсутствие
+    /// защиты вокруг чтения потока ответа, а не только вокруг десериализации.
+    /// </summary>
+    private sealed class ThrowingContent : HttpContent
+    {
+        protected override async Task SerializeToStreamAsync(Stream stream,
+            System.Net.TransportContext? context)
+        {
+            await stream.WriteAsync(new byte[] { (byte)'{' }, 0, 1);
+            throw new IOException("обрыв на чтении тела");
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
     }
 }
