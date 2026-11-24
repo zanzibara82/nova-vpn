@@ -41,6 +41,20 @@ public sealed class ApiClientTests
     }
 
     [Fact]
+    public async Task Register_sends_exact_json_content_type()
+    {
+        var handler = new StubHandler(_ => StubHandler.Json(HttpStatusCode.Created,
+            """{"access_token":"a","refresh_token":"r","token_type":"Bearer","access_expires_at":"2026-11-24T10:00:00Z","refresh_expires_at":"2026-12-24T10:00:00Z"}"""));
+        using var api = Client(handler);
+
+        await api.RegisterAsync("a@b.c", "0123456789", default);
+
+        var captured = handler.Requests.Single();
+        Assert.False(string.IsNullOrEmpty(captured.Body));
+        Assert.Equal("application/json", captured.ContentType);
+    }
+
+    [Fact]
     public async Task Redirect_is_not_followed_and_becomes_network_error()
     {
         var handler = new StubHandler(_ =>

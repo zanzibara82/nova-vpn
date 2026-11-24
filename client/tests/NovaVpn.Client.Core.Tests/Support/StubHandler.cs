@@ -15,7 +15,8 @@ internal sealed class StubHandler : HttpMessageHandler
 
     public List<Captured> Requests { get; } = new();
 
-    internal sealed record Captured(string Method, string Path, string? Auth, string? Idem, string? Body);
+    internal sealed record Captured(string Method, string Path, string? Auth, string? Idem, string? Body,
+        string? ContentType);
 
     public static HttpResponseMessage Json(HttpStatusCode status, string body) =>
         new(status) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
@@ -34,7 +35,8 @@ internal sealed class StubHandler : HttpMessageHandler
                 request.RequestUri!.PathAndQuery,
                 request.Headers.Authorization?.ToString(),
                 request.Headers.TryGetValues("Idempotency-Key", out var v) ? v.Single() : null,
-                body));
+                body,
+                request.Content?.Headers.ContentType?.ToString()));
             ordinal = Requests.Count;
         }
         return _respond(request, ordinal);
