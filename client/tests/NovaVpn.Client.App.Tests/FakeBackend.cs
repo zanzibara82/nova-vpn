@@ -11,6 +11,7 @@ internal class FakeBackend : IBridgeBackend
     public DiagnosticRing Ring { get; } = new();
     public AppInfoView LastAppInfo { get; } = new("0.1.0-preview", "windows", "120.0.0", "preview");
     public bool ExportCancelled { get; set; }
+    public string? LastDeviceName { get; private set; }
 
     public Task<AppInfoView> GetAppInfoAsync(CancellationToken ct) => Task.FromResult(LastAppInfo);
     public SettingsView GetSettings() => new("https://api.example/", 900, 700);
@@ -33,7 +34,12 @@ internal class FakeBackend : IBridgeBackend
     public Task<DevicesView> ListDevicesAsync(CancellationToken ct) =>
         Task.FromResult(new DevicesView(new[] { Device() }, DeviceId));
 
-    public Task<DeviceView> CreateDeviceAsync(string name, CancellationToken ct) => Task.FromResult(Device());
+    public Task<DeviceView> CreateDeviceAsync(string name, CancellationToken ct)
+    {
+        LastDeviceName = name;
+        return Task.FromResult(Device());
+    }
+
     public Task DeleteDeviceAsync(Guid deviceId, CancellationToken ct) => Task.CompletedTask;
 
     public Task<IReadOnlyList<ServerView>> ListServersAsync(CancellationToken ct) =>

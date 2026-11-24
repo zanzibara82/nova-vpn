@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using NovaVpn.Client.Core.Api;
 using NovaVpn.Client.Core.Diagnostics;
+using NovaVpn.Client.Core.Storage;
 
 namespace NovaVpn.Client.App.Bridge;
 
@@ -10,15 +11,10 @@ public sealed class BridgeRouter
     public const int MaxMessageBytes = 64 * 1024;
     public const int MaxDepth = 8;
 
-    private static readonly HashSet<string> Commands = new(StringComparer.Ordinal)
-    {
-        "app.info", "settings.get", "settings.set", "session.state", "account.get",
-        "auth.login", "auth.register", "auth.logout",
-        "devices.list", "devices.create", "devices.delete",
-        "servers.list", "profiles.list", "profiles.issue", "profiles.revoke", "profiles.export",
-        "diagnostics.get",
-    };
+    private const string StorageCorruptedMessage =
+        "Хранилище повреждено или принадлежит другому пользователю. Войдите заново.";
 
+    private readonly Dictionary<string, Func<JsonElement, CancellationToken, Task<object?>>> _commands;
     private readonly IBridgeBackend _backend;
     private readonly DiagnosticRing _ring;
     private readonly ClientLog? _log;
@@ -28,12 +24,47 @@ public sealed class BridgeRouter
         _backend = backend;
         _ring = ring;
         _log = log;
+        // Единственный перечень команд: ключи словаря — это и есть белый список.
+        _commands = new(StringComparer.Ordinal)
+        {
+            ["app.info"] = (_, ct) => AsObject(_backend.GetAppInfoAsync(ct)),
+            ["settings.get"] = (_, _) => Task.FromResult<object?>(_backend.GetSettings()),
+            ["settings.set"] = (args, ct) => AsObject(_backend.SetSettingsAsync(
+                RequireString(args, "api_base_url", 1, 2048), ct)),
+            ["session.state"] = (_, ct) => AsObject(_backend.GetSessionStateAsync(ct)),
+            ["account.get"] = (_, ct) => AsObject(_backend.GetAccountAsync(ct)),
+            ["auth.login"] = (args, ct) => AsObject(_backend.LoginAsync(
+                RequireString(args, "email", 1, 254),
+                RequireString(args, "password", 10, 1024), ct)),
+            ["auth.register"] = (args, ct) => AsObject(_backend.RegisterAsync(
+                RequireString(args, "email", 1, 254),
+                RequireString(args, "password", 10, 1024), ct)),
+            ["auth.logout"] = (_, ct) => AsEmpty(_backend.LogoutAsync(ct)),
+            ["devices.list"] = (_, ct) => AsObject(_backend.ListDevicesAsync(ct)),
+            ["devices.create"] = (args, ct) => AsObject(_backend.CreateDeviceAsync(
+                RequireTrimmedString(args, "name", 1, 64), ct)),
+            ["devices.delete"] = (args, ct) => AsEmpty(_backend.DeleteDeviceAsync(
+                RequireGuid(args, "device_id"), ct)),
+            ["servers.list"] = (_, ct) => AsObject(_backend.ListServersAsync(ct)),
+            ["profiles.list"] = (args, ct) => AsObject(_backend.ListProfilesAsync(
+                RequireGuid(args, "device_id"), ct)),
+            ["profiles.issue"] = (args, ct) => AsObject(_backend.IssueProfileAsync(
+                RequireGuid(args, "device_id"), RequireGuid(args, "server_id"), ct)),
+            ["profiles.revoke"] = (args, ct) => AsEmpty(_backend.RevokeProfileAsync(
+                RequireGuid(args, "device_id"), RequireGuid(args, "server_id"), ct)),
+            ["profiles.export"] = (args, ct) => AsObject(_backend.ExportProfileAsync(
+                RequireGuid(args, "device_id"), RequireGuid(args, "server_id"), ct)),
+            ["diagnostics.get"] = (_, ct) => AsObject(_backend.GetDiagnosticsAsync(ct)),
+        };
     }
 
     public async Task<string> HandleAsync(string json, CancellationToken ct)
     {
         if (Encoding.UTF8.GetByteCount(json) > MaxMessageBytes)
+        {
+            _ring.Add("oversized", ClientErrorCodes.BadArgs, null);
             return Fail(null, "bad_args", "Сообщение слишком велико.", null, "oversized");
+        }
 
         string? id = null;
         string command = "unknown";
@@ -42,16 +73,23 @@ public sealed class BridgeRouter
             using var doc = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = MaxDepth });
             var root = doc.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
+            {
+                // Команда ещё не разобрана — в кольце пустая строка, журнальная строка без изменений.
+                _ring.Add("", ClientErrorCodes.BadArgs, null);
                 return Fail(null, "bad_args", "Ожидался объект запроса.", null, command);
+            }
 
             id = OptionalId(root);
             if (id is null)
+            {
+                _ring.Add("", ClientErrorCodes.BadArgs, null);
                 return Fail(null, "bad_args", "В запросе нет корректного id.", null, command);
+            }
 
             command = root.TryGetProperty("command", out var c) && c.ValueKind == JsonValueKind.String
                 ? c.GetString() ?? ""
                 : "";
-            if (!Commands.Contains(command))
+            if (!_commands.TryGetValue(command, out var handler))
             {
                 _ring.Add(command, ClientErrorCodes.UnknownCommand, null);
                 return Fail(id, ClientErrorCodes.UnknownCommand, "Неизвестная команда.", null, command);
@@ -60,7 +98,7 @@ public sealed class BridgeRouter
             var args = root.TryGetProperty("args", out var a) && a.ValueKind == JsonValueKind.Object
                 ? a
                 : default;
-            var data = await DispatchAsync(command, args, ct);
+            var data = await handler(args, ct);
             _ring.Add(command, "ok", null);
             return JsonSerializer.Serialize(new BridgeOk(id, true, data), JsonDefaults.Options);
         }
@@ -84,46 +122,17 @@ public sealed class BridgeRouter
             _ring.Add(command, "network", null);
             return Fail(id, ClientErrorCodes.Network, "Операция прервана.", null, command);
         }
-        catch (Exception)
+        catch (StorageCorruptedException)
         {
-            _ring.Add(command, "internal", null);
+            _ring.Add(command, ClientErrorCodes.StorageCorrupted, null);
+            return Fail(id, ClientErrorCodes.StorageCorrupted, StorageCorruptedMessage, null, command);
+        }
+        catch (Exception ex)
+        {
+            _ring.Add(command, $"internal:{ex.GetType().Name}", null);
             return Fail(id, "internal", "Внутренняя ошибка клиента.", null, command);
         }
     }
-
-    private Task<object?> DispatchAsync(string command, JsonElement args, CancellationToken ct) =>
-        command switch
-        {
-            "app.info" => AsObject(_backend.GetAppInfoAsync(ct)),
-            "settings.get" => Task.FromResult<object?>(_backend.GetSettings()),
-            "settings.set" => AsObject(_backend.SetSettingsAsync(
-                RequireString(args, "api_base_url", 1, 2048), ct)),
-            "session.state" => AsObject(_backend.GetSessionStateAsync(ct)),
-            "account.get" => AsObject(_backend.GetAccountAsync(ct)),
-            "auth.login" => AsObject(_backend.LoginAsync(
-                RequireString(args, "email", 1, 254),
-                RequireString(args, "password", 10, 1024), ct)),
-            "auth.register" => AsObject(_backend.RegisterAsync(
-                RequireString(args, "email", 1, 254),
-                RequireString(args, "password", 10, 1024), ct)),
-            "auth.logout" => AsEmpty(_backend.LogoutAsync(ct)),
-            "devices.list" => AsObject(_backend.ListDevicesAsync(ct)),
-            "devices.create" => AsObject(_backend.CreateDeviceAsync(
-                RequireString(args, "name", 1, 64).Trim(), ct)),
-            "devices.delete" => AsEmpty(_backend.DeleteDeviceAsync(
-                RequireGuid(args, "device_id"), ct)),
-            "servers.list" => AsObject(_backend.ListServersAsync(ct)),
-            "profiles.list" => AsObject(_backend.ListProfilesAsync(
-                RequireGuid(args, "device_id"), ct)),
-            "profiles.issue" => AsObject(_backend.IssueProfileAsync(
-                RequireGuid(args, "device_id"), RequireGuid(args, "server_id"), ct)),
-            "profiles.revoke" => AsEmpty(_backend.RevokeProfileAsync(
-                RequireGuid(args, "device_id"), RequireGuid(args, "server_id"), ct)),
-            "profiles.export" => AsObject(_backend.ExportProfileAsync(
-                RequireGuid(args, "device_id"), RequireGuid(args, "server_id"), ct)),
-            "diagnostics.get" => AsObject(_backend.GetDiagnosticsAsync(ct)),
-            _ => throw new CommandArgumentException("Неизвестная команда."),
-        };
 
     private static async Task<object?> AsObject<T>(Task<T> task) => await task;
     private static async Task<object?> AsEmpty(Task task) { await task; return null; }
@@ -137,14 +146,28 @@ public sealed class BridgeRouter
 
     private static string RequireString(JsonElement args, string name, int min, int max)
     {
+        var value = RequireRawString(args, name);
+        if (value.Length < min || value.Length > max)
+            throw new CommandArgumentException($"Поле {name} имеет недопустимую длину.");
+        return value;
+    }
+
+    /// <summary>Обрезка выполняется до проверки длины: имя из одних пробелов не проходит лимит 1..64.</summary>
+    private static string RequireTrimmedString(JsonElement args, string name, int min, int max)
+    {
+        var value = RequireRawString(args, name).Trim();
+        if (value.Length < min || value.Length > max)
+            throw new CommandArgumentException($"Поле {name} имеет недопустимую длину.");
+        return value;
+    }
+
+    private static string RequireRawString(JsonElement args, string name)
+    {
         if (args.ValueKind != JsonValueKind.Object
             || !args.TryGetProperty(name, out var p)
             || p.ValueKind != JsonValueKind.String)
             throw new CommandArgumentException($"Поле {name} обязательно.");
-        var value = p.GetString() ?? "";
-        if (value.Length < min || value.Length > max)
-            throw new CommandArgumentException($"Поле {name} имеет недопустимую длину.");
-        return value;
+        return p.GetString() ?? "";
     }
 
     private static Guid RequireGuid(JsonElement args, string name)
@@ -190,7 +213,7 @@ public sealed class BridgeRouter
             "internal" => "Внутренняя ошибка API.",
             "network" => "Нет связи с API.",
             "timeout" => "Истекло время ожидания ответа API.",
-            "storage_corrupted" => "Хранилище повреждено или принадлежит другому пользователю. Войдите заново.",
+            "storage_corrupted" => StorageCorruptedMessage,
             _ => "Ошибка операции.",
         };
     }

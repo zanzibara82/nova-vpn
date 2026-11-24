@@ -1,12 +1,17 @@
+using System.Text;
 using System.Text.Json;
 using NovaVpn.Client.App.Bridge;
 using NovaVpn.Client.Core.Api;
 using NovaVpn.Client.Core.Diagnostics;
+using NovaVpn.Client.Core.Storage;
 
 namespace NovaVpn.Client.App.Tests;
 
 public sealed class BridgeRouterTests
 {
+    private const string ProfileArgs =
+        """{"device_id":"22222222-2222-4222-8222-222222222222","server_id":"33333333-3333-4333-8333-333333333333"}""";
+
     private static (BridgeRouter Router, FakeBackend Backend) Create()
     {
         var backend = new FakeBackend();
@@ -162,6 +167,161 @@ public sealed class BridgeRouterTests
         Assert.Equal(2, events.Count);
         Assert.Equal(("app.info", "ok"), (events[0].Command, events[0].Code));
         Assert.Equal("unknown_command", events[1].Code);
+    }
+
+    [Fact]
+    public async Task Corrupted_storage_is_reported_as_storage_corrupted()
+    {
+        var backend = new ThrowingBackend
+        {
+            Failure = new StorageCorruptedException(@"C:\data\session.bin", new InvalidDataException("dpapi")),
+        };
+        var ring = new DiagnosticRing();
+        var router = new BridgeRouter(backend, ring);
+
+        var json = await router.HandleAsync(Req("profiles.issue", ProfileArgs), default);
+        var doc = Parse(json);
+
+        Assert.False(doc.GetProperty("ok").GetBoolean());
+        Assert.Equal(ClientErrorCodes.StorageCorrupted, doc.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("Хранилище повреждено или принадлежит другому пользователю. Войдите заново.",
+            doc.GetProperty("error").GetProperty("message").GetString());
+        Assert.Equal(JsonValueKind.Null, doc.GetProperty("error").GetProperty("request_id").ValueKind);
+        Assert.DoesNotContain("session.bin", json);
+        Assert.DoesNotContain("dpapi", json);
+
+        var ev = Assert.Single(ring.Snapshot());
+        Assert.Equal(("profiles.issue", ClientErrorCodes.StorageCorrupted), (ev.Command, ev.Code));
+    }
+
+    [Fact]
+    public async Task Unexpected_exception_keeps_type_name_in_diagnostics_only()
+    {
+        var backend = new ThrowingBackend { Failure = new InvalidOperationException("boom") };
+        var ring = new DiagnosticRing();
+        var router = new BridgeRouter(backend, ring);
+
+        var json = await router.HandleAsync(Req("profiles.issue", ProfileArgs), default);
+        var doc = Parse(json);
+
+        Assert.False(doc.GetProperty("ok").GetBoolean());
+        Assert.Equal("internal", doc.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("Внутренняя ошибка клиента.", doc.GetProperty("error").GetProperty("message").GetString());
+        Assert.DoesNotContain("boom", json);
+
+        var ev = Assert.Single(ring.Snapshot());
+        Assert.Equal("internal:InvalidOperationException", ev.Code);
+    }
+
+    [Fact]
+    public async Task Early_rejections_reach_diagnostics_ring()
+    {
+        var (router, backend) = Create();
+        var oversized = new string('x', 70 * 1024);
+
+        var tooBig = Parse(await router.HandleAsync(
+            $$$"""{"id":"x","command":"app.info","args":{"pad":"{{{oversized}}}"}}""", default));
+        var notObject = Parse(await router.HandleAsync("\"not an object\"", default));
+        var noId = Parse(await router.HandleAsync("""{"command":"app.info"}""", default));
+
+        Assert.Equal("bad_args", tooBig.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("bad_args", notObject.GetProperty("error").GetProperty("code").GetString());
+        Assert.Equal("bad_args", noId.GetProperty("error").GetProperty("code").GetString());
+
+        var events = backend.Ring.Snapshot();
+        Assert.Equal(3, events.Count);
+        Assert.Equal(("oversized", "bad_args"), (events[0].Command, events[0].Code));
+        Assert.Equal(("", "bad_args"), (events[1].Command, events[1].Code));
+        Assert.Equal(("", "bad_args"), (events[2].Command, events[2].Code));
+    }
+
+    [Theory]
+    [InlineData("   ")]
+    [InlineData(" \t\r\n ")]
+    public async Task Whitespace_only_device_name_is_bad_args(string name)
+    {
+        var (router, backend) = Create();
+
+        var doc = Parse(await router.HandleAsync(
+            Req("devices.create", JsonSerializer.Serialize(new { name })), default));
+
+        Assert.False(doc.GetProperty("ok").GetBoolean());
+        Assert.Equal("bad_args", doc.GetProperty("error").GetProperty("code").GetString());
+        Assert.Contains("недопустимую длину", doc.GetProperty("error").GetProperty("message").GetString());
+        Assert.Null(backend.LastDeviceName);
+    }
+
+    [Fact]
+    public async Task Device_name_is_trimmed_before_backend_call()
+    {
+        var (router, backend) = Create();
+
+        var doc = Parse(await router.HandleAsync(Req("devices.create", """{"name":"  pc  "}"""), default));
+
+        Assert.True(doc.GetProperty("ok").GetBoolean());
+        Assert.Equal("pc", backend.LastDeviceName);
+    }
+
+    [Fact]
+    public async Task Message_of_exactly_max_bytes_is_accepted()
+    {
+        var (router, _) = Create();
+        var prefix = "{\"id\":\"x\",\"command\":\"app.info\",\"args\":{\"pad\":\"";
+        var suffix = "\"}}";
+        var overhead = Encoding.UTF8.GetByteCount(prefix) + Encoding.UTF8.GetByteCount(suffix);
+        var message = prefix + new string('a', BridgeRouter.MaxMessageBytes - overhead) + suffix;
+
+        Assert.Equal(BridgeRouter.MaxMessageBytes, Encoding.UTF8.GetByteCount(message));
+
+        var doc = Parse(await router.HandleAsync(message, default));
+
+        Assert.True(doc.GetProperty("ok").GetBoolean());
+        Assert.Equal("0.1.0-preview", doc.GetProperty("data").GetProperty("version").GetString());
+    }
+
+    [Fact]
+    public async Task Multibyte_message_over_max_bytes_is_bad_args()
+    {
+        var (router, _) = Create();
+        var prefix = "{\"id\":\"x\",\"command\":\"app.info\",\"args\":{\"pad\":\"";
+        var suffix = "\"}}";
+        var overhead = Encoding.UTF8.GetByteCount(prefix) + Encoding.UTF8.GetByteCount(suffix);
+        const int chars = 40000; // кириллическая «а» занимает 2 байта в UTF-8
+        var message = prefix + new string('а', chars) + suffix;
+
+        Assert.Equal(chars * 2 + overhead, Encoding.UTF8.GetByteCount(message));
+        Assert.Equal(chars + overhead, message.Length);
+        Assert.True(message.Length < BridgeRouter.MaxMessageBytes);
+        Assert.True(Encoding.UTF8.GetByteCount(message) > BridgeRouter.MaxMessageBytes);
+
+        var doc = Parse(await router.HandleAsync(message, default));
+
+        Assert.False(doc.GetProperty("ok").GetBoolean());
+        Assert.Equal(ClientErrorCodes.BadArgs, doc.GetProperty("error").GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Every_whitelisted_command_is_dispatched()
+    {
+        var (router, _) = Create();
+        var calls = new (string Command, string? Args)[]
+        {
+            ("app.info", null), ("settings.get", null), ("settings.set", """{"api_base_url":"https://api.example/"}"""),
+            ("session.state", null), ("account.get", null),
+            ("auth.login", """{"email":"a@b.c","password":"0123456789"}"""),
+            ("auth.register", """{"email":"a@b.c","password":"0123456789"}"""),
+            ("auth.logout", null), ("devices.list", null), ("devices.create", """{"name":"pc"}"""),
+            ("devices.delete", ProfileArgs), ("servers.list", null), ("profiles.list", ProfileArgs),
+            ("profiles.issue", ProfileArgs), ("profiles.revoke", ProfileArgs), ("profiles.export", ProfileArgs),
+            ("diagnostics.get", null),
+        };
+
+        Assert.Equal(17, calls.Length);
+        foreach (var (command, args) in calls)
+        {
+            var doc = Parse(await router.HandleAsync(Req(command, args), default));
+            Assert.True(doc.GetProperty("ok").GetBoolean(), $"команда {command} не диспатчится");
+        }
     }
 
     private sealed class ThrowingBackend : FakeBackend
