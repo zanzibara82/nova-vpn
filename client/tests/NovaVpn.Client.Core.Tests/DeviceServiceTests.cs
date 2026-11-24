@@ -87,10 +87,17 @@ public sealed class DeviceServiceTests
         using var dir = new TempDir();
         Guid? createdId = null;
         string? postedKey = null;
+        string? storedKeyAtPost = null;
+        Guid? storedIdAtPost = null;
         var env = await CreateAsync(dir, body =>
         {
             using var doc = JsonDocument.Parse(body);
             postedKey = doc.RootElement.GetProperty("public_key").GetString();
+            // Пара обязана быть уже на диске в момент POST, иначе повтор уйдёт с другим ключом.
+            var atPost = new DeviceIdentityStore(dir.Path)
+                .Get(DeviceIdentityStore.AccountKey(Base, "a@b.c"));
+            storedKeyAtPost = atPost?.PublicKey;
+            storedIdAtPost = atPost?.DeviceId;
             createdId = Guid.NewGuid();
             return StubHandler.Json(HttpStatusCode.Created, DeviceJson(createdId.Value, postedKey!));
         });
@@ -101,6 +108,8 @@ public sealed class DeviceServiceTests
         var stored = env.Store.Get(env.AccountKey)!;
         Assert.Equal(createdId, stored.DeviceId);
         Assert.Equal(postedKey, stored.PublicKey);
+        Assert.Equal(postedKey, storedKeyAtPost);
+        Assert.Null(storedIdAtPost); // id появляется только после ответа сервера
     }
 
     [Fact]
@@ -214,6 +223,8 @@ public sealed class DeviceServiceTests
 
         await env.Devices.DeleteAsync(deviceId, default);
 
+        Assert.Contains(env.Handler.Requests,
+            r => r.Method == "DELETE" && r.Path == $"/api/v1/devices/{deviceId}");
         Assert.Null(env.Store.Get(env.AccountKey));
     }
 
