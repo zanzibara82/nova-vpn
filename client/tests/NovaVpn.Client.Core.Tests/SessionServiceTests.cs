@@ -58,6 +58,9 @@ public sealed class SessionServiceTests
         using var dir = new TempDir();
         var store = new SessionStore(dir.Path);
         var refreshCalls = 0;
+        // Барьер гарантирует перекрытие: первый refresh не может начаться, пока все три
+        // вызова /api/v1/me не получили 401 со старым access.
+        using var barrier = new Barrier(3);
         var handler = new StubHandler(req => req.RequestUri!.AbsolutePath switch
         {
             "/api/v1/auth/login" => StubHandler.Json(HttpStatusCode.OK, ApiJson(Session("a1", "r1"))),
@@ -66,7 +69,7 @@ public sealed class SessionServiceTests
                 : Interlocked.Increment(ref refreshCalls) == 2
                     ? StubHandler.Json(HttpStatusCode.OK, ApiJson(Session("a3", "r3")))
                     : StubHandler.Json(HttpStatusCode.OK, ApiJson(Session("a4", "r4"))),
-            "/api/v1/me" when req.Headers.Authorization!.Parameter == "a1" => MeUnauthorized(),
+            "/api/v1/me" when req.Headers.Authorization!.Parameter == "a1" => FirstWaveUnauthorized(barrier),
             "/api/v1/me" => SuccessMe(),
             _ => StubHandler.Json(HttpStatusCode.NotFound, "{}"),
         });
@@ -75,9 +78,10 @@ public sealed class SessionServiceTests
         await svc.LoginAsync("a@b.c", "0123456789", default);
 
         var results = await Task.WhenAll(Enumerable.Range(0, 3)
-            .Select(_ => svc.AuthorizedAsync((t, c) => api.GetMeAsync(t, c), default)));
+            .Select(_ => Task.Run(() => svc.AuthorizedAsync((t, c) => api.GetMeAsync(t, c), default))));
 
         Assert.All(results, m => Assert.Equal("a@b.c", m.User.Email));
+        Assert.Equal(3, handler.Requests.Count(r => r.Path == "/api/v1/me" && r.Auth == "Bearer a1"));
         Assert.Equal(1, refreshCalls);
         Assert.Equal(1, handler.Requests.Count(r => r.Path == "/api/v1/auth/refresh"));
     }
@@ -157,11 +161,20 @@ public sealed class SessionServiceTests
             _ => StubHandler.Json(HttpStatusCode.NotFound, "{}"),
         });
         using var api = new ApiClient(Base, handler);
-        var svc = new SessionService(api, Base, store);
+        var clock = new FakeClock(DateTimeOffset.Parse("2026-11-24T10:00:00Z"));
+        var svc = new SessionService(api, Base, store, clock);
 
         Assert.True(await svc.TryRestoreAsync(default));
         Assert.Equal("a@b.c", svc.Current!.Email);
         Assert.Equal("r2", store.Load()!.RefreshToken);
+    }
+
+    private static HttpResponseMessage FirstWaveUnauthorized(Barrier barrier)
+    {
+        if (!barrier.SignalAndWait(TimeSpan.FromSeconds(10)))
+            throw new InvalidOperationException(
+                "Не все три параллельных /api/v1/me с access=a1 дошли до барьера за 10 с: перекрытие не состоялось.");
+        return MeUnauthorized();
     }
 
     private static HttpResponseMessage MeUnauthorized() => StubHandler.Json(HttpStatusCode.Unauthorized,
