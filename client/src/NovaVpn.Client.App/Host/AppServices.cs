@@ -55,9 +55,11 @@ public sealed class AppServices : IBridgeBackend, IAsyncDisposable
     public string? StartupError { get; private set; }
     public string WebViewVersion { get; set; }
     public DiagnosticRing Ring { get; } = new();
+    internal ClientLog Log => _log;
 
     public async Task InitializeAsync(CancellationToken ct)
     {
+        StartupError = null;
         if (Settings.ApiBaseUrl is null) return;
         Build(Settings.ApiBaseUrl);
         try
@@ -247,8 +249,15 @@ public sealed class AppServices : IBridgeBackend, IAsyncDisposable
 
     private sealed class LogObserver(ClientLog log) : IApiObserver
     {
-        public void OnRequestCompleted(ApiCall call) =>
-            log.Write($"{DateTimeOffset.UtcNow:O} {call.Method} {call.Path} {call.Status} " +
-                      $"{call.RequestId ?? "-"} {call.Duration.TotalMilliseconds:F0}ms");
+        public void OnRequestCompleted(ApiCall call)
+        {
+            // Сбой журнала не должен подменять результат вызова API.
+            try
+            {
+                log.Write($"{DateTimeOffset.UtcNow:O} {call.Method} {call.Path} {call.Status} " +
+                          $"{call.RequestId ?? "-"} {call.Duration.TotalMilliseconds:F0}ms");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        }
     }
 }

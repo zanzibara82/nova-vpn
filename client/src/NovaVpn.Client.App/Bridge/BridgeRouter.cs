@@ -180,7 +180,8 @@ public sealed class BridgeRouter
 
     private string Fail(string? id, string code, string message, string? requestId, string command)
     {
-        _log?.Write($"{DateTimeOffset.UtcNow:O} {command} {code} {requestId ?? "-"}");
+        try { _log?.Write($"{DateTimeOffset.UtcNow:O} {command} {code} {requestId ?? "-"}"); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         return JsonSerializer.Serialize(new BridgeFail(id, false, null,
             new BridgeError(code, message, requestId)), JsonDefaults.Options);
     }

@@ -22,9 +22,20 @@ internal static class Program
         Application.SetCompatibleTextRenderingDefault(false);
         var dataDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NovaVPN");
+        AppServices services;
+        try
+        {
+            services = new AppServices(dataDir, new FileSavePicker());
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Не удалось подготовить каталог данных NovaVPN: " + ex.Message,
+                "NovaVPN", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+
         // AppServices реализует только IAsyncDisposable, а точка входа WinForms синхронна:
         // освобождаем явно, в finally, не заводя второй синхронный Dispose.
-        var services = new AppServices(dataDir, new FileSavePicker());
         try
         {
             using var form = new MainForm(services);

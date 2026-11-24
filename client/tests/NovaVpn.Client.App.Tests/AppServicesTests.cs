@@ -300,4 +300,22 @@ public sealed class AppServicesTests
         Assert.False(File.Exists(Path.Combine(env.Dir.Path, "never.conf")));
         Assert.DoesNotContain(env.Handler.Requests, r => r.Path.EndsWith("/config"));
     }
+
+    [Fact]
+    public async Task Export_of_foreign_device_is_rejected_without_picker_or_config()
+    {
+        await using var env = await SignedInAsync(WithRegisteredDevice());
+        await env.Services.ListDevicesAsync(default);
+        env.Picker.NextPath = Path.Combine(env.Dir.Path, "foreign.conf");
+        var foreign = Guid.Parse("44444444-4444-4444-8444-444444444444");
+
+        var ex = await Assert.ThrowsAsync<ApiException>(() =>
+            env.Services.ExportProfileAsync(foreign, ServerId, default));
+
+        Assert.Equal("bad_args", ex.Code);
+        Assert.Contains("не является текущим", ex.Message);
+        Assert.Equal(0, env.Picker.Calls);
+        Assert.DoesNotContain(env.Handler.Requests, r => r.Path.EndsWith("/config"));
+        Assert.False(File.Exists(Path.Combine(env.Dir.Path, "foreign.conf")));
+    }
 }

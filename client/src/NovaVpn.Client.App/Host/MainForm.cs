@@ -5,7 +5,7 @@ using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 using NovaVpn.Client.App.Bridge;
 using NovaVpn.Client.Core;
-using NovaVpn.Client.Core.Diagnostics;
+using NovaVpn.Client.Core.Api;
 
 namespace NovaVpn.Client.App.Host;
 
@@ -32,8 +32,7 @@ public sealed class MainForm : Form
     public MainForm(AppServices services)
     {
         _services = services;
-        _router = new BridgeRouter(services, services.Ring,
-            new ClientLog(Path.Combine(services.DataDir, "logs")));
+        _router = new BridgeRouter(services, services.Ring, services.Log);
         Text = $"NovaVPN {ClientVersion.Value}";
         Width = Math.Max(services.Settings.WindowWidth, 720);
         Height = Math.Max(services.Settings.WindowHeight, 600);
@@ -77,13 +76,32 @@ public sealed class MainForm : Form
             core.Navigate(Origin + "/index.html");
             Ready.TrySetResult(core);
         }
-        catch (Exception ex) when (ex is WebView2RuntimeNotFoundException or InvalidOperationException
-                                       or IOException)
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
+            // Окно закрывают во время восстановления сессии: показывать нечего.
+        }
+        catch (WebView2RuntimeNotFoundException ex)
         {
             Fail(
                 "Не найден WebView2 Runtime. Установите его и запустите NovaVPN снова.\n" +
                 "https://developer.microsoft.com/microsoft-edge/webview2/",
                 ex);
+        }
+        catch (ApiException ex)
+        {
+            Fail("Не удалось восстановить сессию: " + ex.Message, ex);
+        }
+        catch (IOException ex)
+        {
+            Fail("Не удалось прочитать данные NovaVPN: " + ex.Message, ex);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Fail("Нет доступа к данным NovaVPN: " + ex.Message, ex);
+        }
+        catch (Exception ex)
+        {
+            Fail("Не удалось запустить NovaVPN: " + ex.Message, ex);
         }
     }
 
@@ -194,7 +212,8 @@ public sealed class MainForm : Form
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
         _shutdown.Cancel();
-        _services.SaveWindowSize(Width, Height);
+        var bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+        _services.SaveWindowSize(bounds.Width, bounds.Height);
     }
 
     protected override void Dispose(bool disposing)
