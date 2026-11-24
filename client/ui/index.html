@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NovaVPN — менеджер доступа</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<p class="banner banner-warning" id="stub-banner" role="status" hidden>Демонстрационные данные (заглушка моста)</p>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-name">NovaVPN</span>
+    <span class="badge badge-muted" id="version-badge">—</span>
+  </div>
+  <nav class="nav" id="nav" aria-label="Экраны" hidden>
+    <button type="button" class="nav-btn" data-action="screen" data-screen="home">Главный</button>
+    <button type="button" class="nav-btn" data-action="screen" data-screen="catalog">Каталог</button>
+    <button type="button" class="nav-btn" data-action="screen" data-screen="settings">Настройки</button>
+    <button type="button" class="nav-btn" data-action="screen" data-screen="diagnostics">Диагностика</button>
+    <a class="nav-btn" href="help.html">Справка</a>
+  </nav>
+</header>
+<main class="app">
+  <p class="banner banner-danger" id="startup-error" role="alert" hidden></p>
+
+  <section class="screen" id="screen-auth" hidden>
+    <h1>Подключение к API</h1>
+    <p class="muted">NovaVPN — менеджер доступа: приложение выдаёт профиль и файл .conf, туннель не поднимает. Туннель поднимает официальный клиент WireGuard из импортированного файла.</p>
+    <article class="card">
+      <h2>Адрес API</h2>
+      <label class="field">
+        <span>Адрес</span>
+        <input id="auth-origin" type="url" autocomplete="off" spellcheck="false" maxlength="2048" placeholder="https://api.example.com">
+      </label>
+      <p class="hint" id="auth-origin-hint"></p>
+      <button type="button" class="btn btn-primary" data-action="save-origin">Сохранить адрес</button>
+    </article>
+    <article class="card" id="auth-credentials" hidden>
+      <h2>Вход и регистрация</h2>
+      <label class="field">
+        <span>Email</span>
+        <input id="auth-email" type="email" autocomplete="username" spellcheck="false" maxlength="254">
+      </label>
+      <label class="field">
+        <span>Пароль</span>
+        <input id="auth-password" type="password" autocomplete="current-password" maxlength="1024">
+      </label>
+      <p class="hint">Пароль от 10 до 1024 символов. Пароль не сохраняется и не журналируется.</p>
+      <div class="buttons">
+        <button type="button" class="btn btn-primary" data-action="login">Войти</button>
+        <button type="button" class="btn" data-action="register">Зарегистрироваться</button>
+      </div>
+    </article>
+    <p class="hint"><a class="link" href="help.html">Справка: импорт .conf в официальный WireGuard</a></p>
+  </section>
+
+  <section class="screen" id="screen-home" hidden>
+    <h1>Главный</h1>
+    <div class="columns">
+      <article class="card">
+        <h2>Аккаунт</h2>
+        <dl class="facts">
+          <dt>Email</dt><dd id="account-email">—</dd>
+          <dt>Статус</dt><dd id="account-status">—</dd>
+          <dt>План</dt><dd id="account-plan">—</dd>
+          <dt>Устройства</dt><dd id="account-devices">—</dd>
+          <dt>Трафик</dt><dd id="account-quota">—</dd>
+        </dl>
+        <p class="banner banner-warning" id="account-warning" hidden></p>
+      </article>
+      <article class="card">
+        <h2>Устройство</h2>
+        <ul class="list" id="device-list"></ul>
+        <label class="field">
+          <span>Имя нового устройства</span>
+          <input id="device-name" type="text" maxlength="64" placeholder="Windows">
+        </label>
+        <div class="buttons">
+          <button type="button" class="btn btn-primary" data-action="create-device">Создать устройство</button>
+          <button type="button" class="btn btn-danger" data-action="forget-device" hidden>Забыть это устройство</button>
+        </div>
+        <p class="hint">Пересоздание отзывает текущее устройство: его профили и сохранённые .conf перестанут работать.</p>
+      </article>
+    </div>
+    <article class="card">
+      <h2>Профили доступа</h2>
+      <ul class="list" id="profile-list"></ul>
+      <div class="issue-row">
+        <label class="field">
+          <span>Сервер</span>
+          <select id="issue-select"></select>
+        </label>
+        <button type="button" class="btn btn-primary" data-action="issue" id="issue-button">Выдать профиль</button>
+      </div>
+      <p class="hint" id="issue-hint"></p>
+      <p class="hint">Конфиг не показывается в приложении: выберите «Сохранить .conf» и импортируйте файл в официальный WireGuard.</p>
+    </article>
+  </section>
+
+  <section class="screen" id="screen-catalog" hidden>
+    <h1>Каталог серверов</h1>
+    <p class="muted">Доступность показана буквально: «доступен» или «неизвестно». Незамеренные показатели — «не измерялось» и «не заявлена», а не ноль.</p>
+    <p class="muted" id="catalog-empty" hidden>Каталог пуст.</p>
+    <div class="columns" id="catalog-list"></div>
+  </section>
+
+  <section class="screen" id="screen-settings" hidden>
+    <h1>Настройки</h1>
+    <article class="card">
+      <h2>Адрес API</h2>
+      <label class="field">
+        <span>Адрес</span>
+        <input id="settings-origin" type="url" autocomplete="off" spellcheck="false" maxlength="2048">
+      </label>
+      <p class="hint" id="settings-hint"></p>
+      <button type="button" class="btn btn-primary" data-action="save-settings" id="settings-save">Сохранить</button>
+    </article>
+    <article class="card">
+      <h2>Устройство и сессия</h2>
+      <p class="muted">Ключ устройства хранится локально под защитой DPAPI и переживает выход из аккаунта, чтобы не тратить лимит устройств.</p>
+      <div class="buttons">
+        <button type="button" class="btn btn-danger" data-action="forget-device" hidden>Забыть это устройство</button>
+        <button type="button" class="btn" data-action="logout" id="logout" hidden>Выйти из аккаунта</button>
+      </div>
+    </article>
+    <article class="card">
+      <h2>О приложении</h2>
+      <dl class="facts">
+        <dt>Версия</dt><dd id="settings-version">—</dd>
+        <dt>Режим</dt><dd>preview: без туннеля и без фоновых служб</dd>
+      </dl>
+    </article>
+  </section>
+
+  <section class="screen" id="screen-diagnostics" hidden>
+    <h1>Диагностика</h1>
+    <p class="muted">Последние команды моста без тел запросов и секретов. Версия: <span id="diagnostics-version">—</span>.</p>
+    <button type="button" class="btn" data-action="refresh-diagnostics">Обновить</button>
+    <p class="muted" id="diagnostics-empty" hidden>Событий пока нет.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Время</th><th>Команда</th><th>Код</th><th>request_id</th></tr></thead>
+        <tbody id="diagnostics-body"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<p class="toast" id="toast" role="status" aria-live="polite" hidden></p>
+<div class="busy" id="busy" role="status" hidden>Загрузка…</div>
+</body>
+</html>

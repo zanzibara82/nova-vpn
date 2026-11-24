@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NovaVPN — справка по импорту .conf</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-name">NovaVPN</span><span class="badge badge-muted">справка</span></div>
+  <nav class="nav" aria-label="Навигация"><a class="nav-btn" href="index.html">Назад к приложению</a></nav>
+</header>
+<main class="app">
+  <h1>Импорт .conf в официальный WireGuard</h1>
+  <p class="muted">NovaVPN выдаёт профиль и сохраняет готовый файл конфигурации. Туннель поднимает официальный клиент WireGuard — приложение не управляет сетью и не устанавливает драйвер.</p>
+
+  <article class="card">
+    <h2>Порядок действий</h2>
+    <ol class="steps">
+      <li>На главном экране выберите активный профиль и нажмите «Сохранить .conf»; в системном диалоге укажите папку. Приложение предупредит, что файл содержит приватный ключ.</li>
+      <li>Установите официальный клиент WireGuard для Windows со страницы <a href="https://www.wireguard.com/install/" target="_blank" rel="noopener">wireguard.com/install</a>. Ссылка откроется в системном браузере.</li>
+      <li>В клиенте WireGuard выберите «Импорт туннеля из файла» и укажите сохранённый .conf.</li>
+      <li>Включите туннель кнопкой «Подключить». Проверка связи выполняется средствами WireGuard, а не NovaVPN.</li>
+      <li>При отзыве профиля или устройства старый .conf перестаёт работать; выдайте новый профиль и повторите импорт.</li>
+    </ol>
+  </article>
+
+  <article class="card">
+    <h2>Границы приложения</h2>
+    <ul class="list">
+      <li class="row"><span class="row-main">Не поднимает туннель, не меняет маршруты, DNS и сетевые адаптеры.</span></li>
+      <li class="row"><span class="row-main">Текст конфига не показывается на экране и не копируется в буфер обмена.</span></li>
+      <li class="row"><span class="row-main">Пароль не сохраняется; refresh-токен и ключ устройства хранятся локально под защитой DPAPI.</span></li>
+      <li class="row"><span class="row-main">Нет автоматических обновлений и фоновых служб; версия 0.1.0-preview.</span></li>
+    </ul>
+  </article>
+
+  <article class="card">
+    <h2>Безопасность файла</h2>
+    <p class="muted">Файл .conf содержит приватный ключ устройства. Храните его как секрет: не пересылайте в мессенджерах и не публикуйте. Для другого компьютера выдайте отдельное устройство и отдельный профиль.</p>
+  </article>
+</main>
+</body>
+</html>
