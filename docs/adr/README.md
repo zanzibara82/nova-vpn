@@ -12,6 +12,7 @@
 |---|---|---|
 | 004 | [0004-wireguard-peer-apply.md](0004-wireguard-peer-apply.md) | принят, подтверждён измерениями |
 | 009 | [0009-node-network-operations.md](0009-node-network-operations.md) | принят, подтверждён стендом (прогон задачи 18 от 2026-11-05: фазы `tunnel`, `dns` и `lifecycle` в журнале `task-18-e2e.log` каталога `.superpowers/sdd/2026-10-27-novavpn-cycle-a3-node-runtime`) |
+| 010 | [0010-windows-client-shell.md](0010-windows-client-shell.md) | принят 2026-11-24; оболочка Windows-клиента E-1: WebView2 без локального сервера |
 
 Не принятые молча: перед изменением любого ADR из этой папки сверяться с картой в
 спецификации — она источник истины для остальных ADR.

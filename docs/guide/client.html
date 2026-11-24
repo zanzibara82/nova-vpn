@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NovaVPN — Windows-клиент preview: менеджер доступа и .conf</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="guide.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar__brand"><span class="topbar__mark"></span>NovaVPN <span class="topbar__sub">/ инструкция</span></div>
+  <nav class="topbar__nav" aria-label="Разделы руководства">
+    <a href="index.html">Что умеет сервис</a>
+    <a href="protocol.html">Протокол прогона</a>
+    <a href="client.html" aria-current="page">Клиент</a>
+    <a href="api.html">API-справочник</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <aside class="rail" aria-label="Оглавление">
+    <p class="rail__title">На странице</p>
+    <a href="#what">Что это</a>
+    <a href="#screens">Экраны</a>
+    <a href="#run">Сборка и запуск</a>
+    <a href="#privacy">Приватность</a>
+    <a href="#limits">Чего нет</a>
+  </aside>
+
+  <main>
+    <div class="hero">
+      <h1>Windows-клиент 0.1.0-preview: менеджер доступа</h1>
+      <p class="lede">Приложение входит в аккаунт NovaVPN, регистрирует устройство, выдаёт и отзывает профиль и сохраняет готовый <code>.conf</code> для официального клиента WireGuard. Собственного туннеля в нём нет, и состояний «подключено» или «защищено» он не показывает.</p>
+      <p>Страница отвечает на три вопроса: что клиент делает, как собрать и запустить preview и где проходит граница честности. Кадры сняты с заглушки моста — на каждом виден баннер «Демонстрационные данные (заглушка моста)».</p>
+      <div class="badges">
+        <span class="badge badge--accent">Версия 0.1.0-preview</span>
+        <span class="badge">Windows 10/11 x64</span>
+        <span class="badge">.NET 10 · WebView2</span>
+        <span class="badge badge--warning">Туннель не управляется</span>
+      </div>
+      <div class="summary-strip">
+        <div><dt>Экранов</dt><dd>5</dd></div>
+        <div><dt>Команд моста</dt><dd>17</dd></div>
+        <div><dt>Собственных портов</dt><dd class="ok">0</dd></div>
+        <div><dt>Приватный ключ на сервере</dt><dd class="ok">нет</dd></div>
+      </div>
+      <div class="note">
+        <strong>Граница честности.</strong> Preview — portable-каталог и zip без установщика и подписи кода.
+        Импорт сохранённого файла в официальный WireGuard на машине сборки не проигрывался, Windows 10
+        и второй пользователь Windows не проверялись. Полный список — в
+        <a href="../testing-status.md">статусе проверок</a>.
+      </div>
+    </div>
+
+    <section id="what">
+      <h2>Что делает и чего не делает</h2>
+      <p class="section-lede">Клиент — это пульт управления доступом. Шифрование и передачу трафика выполняет WireGuard, а не это приложение.</p>
+      <div class="grid grid--2">
+        <div class="card">
+          <span class="card__kicker">Делает</span>
+          <ul>
+            <li>Регистрация и вход; access-токен только в памяти, refresh — под DPAPI.</li>
+            <li>Устройство с локальной парой X25519; публичный ключ уходит на сервер, приватный остаётся на машине под DPAPI.</li>
+            <li>Каталог серверов с буквальной доступностью и «не измерялось» вместо нуля.</li>
+            <li>Выдача и отзыв профиля; лимит устройств и окно перекрытия ключа соблюдает сервер.</li>
+            <li>Сборка <code>.conf</code> с локальным <code>PrivateKey</code> и сохранение системным диалогом.</li>
+            <li>Диагностика: имена команд моста, коды и <code>request_id</code>, без тел запросов и секретов.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Не делает</span>
+          <ul>
+            <li>Не поднимает туннель и не управляет сетевыми интерфейсами.</li>
+            <li>Не включает kill switch и раздельную маршрутизацию.</li>
+            <li>Не устанавливается установщиком, не подписана и не обновляется сама.</li>
+            <li>Не работает в трее и не запускается с системой.</li>
+            <li>Не показывает конфиг на экране, в журнале или буфере обмена.</li>
+            <li>Не открывает локальный HTTP-порт: интерфейс живёт на виртуальном origin <code>https://app.novavpn.local/</code>.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section id="screens">
+      <h2>Экраны</h2>
+      <p class="section-lede">Пять экранов: подключение к API, главный, каталог, настройки, диагностика. Ниже — четыре кадра заглушки; данные в них демонстрационные.</p>
+      <div class="grid grid--2">
+        <figure class="figure" style="margin:0">
+          <img src="../images/guide/client-home-dark.png" alt="Главный экран клиента в тёмной теме: план internal-default, устройство DEMO-WS, выданный профиль ams-1 и кнопка сохранения .conf; сверху баннер заглушки">
+          <figcaption><strong>Главный, тёмная тема.</strong> План <code>internal-default</code>, устройство <code>DEMO-WS</code>, профиль активен. Кнопка сохраняет файл, но туннель не поднимает.</figcaption>
+        </figure>
+        <figure class="figure" style="margin:0">
+          <img src="../images/guide/client-home-light.png" alt="Тот же главный экран клиента в светлой теме: те же демонстрационные данные и баннер заглушки">
+          <figcaption><strong>Главный, светлая тема.</strong> Тема выбирается по <code>prefers-color-scheme</code>; контраст проверен по WCAG AA.</figcaption>
+        </figure>
+      </div>
+      <div class="grid grid--2" style="margin-top:20px">
+        <figure class="figure" style="margin:0">
+          <img src="../images/guide/client-catalog.png" alt="Каталог серверов: ams-1 доступен, fra-2 неизвестен, задержка и нагрузка не измерялись, пропускная способность не заявлена">
+          <figcaption><strong>Каталог.</strong> «Доступен» — свежий heartbeat; «неизвестно» — связность не измерялась. Задержка и нагрузка — «не измерялось», а не ноль.</figcaption>
+        </figure>
+        <figure class="figure" style="margin:0">
+          <img src="../images/guide/client-diagnostics.png" alt="Диагностика: таблица команд моста с временем, именем команды, кодом и request_id">
+          <figcaption><strong>Диагностика.</strong> Кольцо команд без тел запросов, токенов и ключей; поля — время, команда, код, <code>request_id</code>.</figcaption>
+        </figure>
+      </div>
+      <div class="note note--warning">
+        <strong>Что доказывают кадры.</strong> Только вёрстку и состояния интерфейса на заглушке: баннер на кадре — часть
+        доказательства. Работу моста, CSP и загрузку настоящих ассетов подтверждает <code>--selftest</code> в WebView2,
+        живой путь до <code>.conf</code> — отдельный E2E на dev-стенде.
+      </div>
+    </section>
+
+    <section id="run">
+      <h2>Сборка и запуск preview</h2>
+      <p class="section-lede">Нужны Windows 10/11 x64, .NET SDK 10.0.204, WebView2 Evergreen Runtime. Для запуска опубликованной сборки — .NET Desktop Runtime 10.</p>
+      <ol class="steps">
+        <li>
+          <h3>Собрать и прогнать тесты</h3>
+          <p>Версии пакетов закреплены lock-файлами; восстановление идёт в locked-режиме.</p>
+          <pre><code>dotnet restore client/NovaVpn.Client.sln --locked-mode
+dotnet test client/NovaVpn.Client.sln -c Release</code></pre>
+        </li>
+        <li>
+          <h3>Самопроверка WebView2</h3>
+          <p>Режим открывает скрытое окно, загружает настоящие ассеты, сверяет CSP, <code>app.info</code> и консоль и завершает процесс.</p>
+          <pre><code>dotnet run --project client/src/NovaVpn.Client.App -c Release -- --selftest</code></pre>
+          <p>Ожидаемая последняя строка — <code>selftest: ok</code>, код возврата 0. В CI этот режим не запускается: там нет WebView2 и интерактивной сессии.</p>
+        </li>
+        <li>
+          <h3>Опубликовать portable-каталог</h3>
+          <p>Сначала восстановить пакеты под RID <code>win-x64</code>, иначе закреплённый lock-файл не содержит нужных ресурсов и публикация с <code>RestoreLockedMode</code> остановится.</p>
+          <pre><code>dotnet restore client/NovaVpn.Client.sln -r win-x64 --force-evaluate
+dotnet publish client/src/NovaVpn.Client.App -c Release -r win-x64 \
+  --self-contained false -p:RestoreLockedMode=true -o client/dist/win-x64</code></pre>
+          <p>Каталог <code>client/dist/win-x64</code> и zip <code>NovaVpn-Client-0.1.0-preview-win-x64.zip</code> в репозиторий не входят. Это framework-dependent сборка: .NET Desktop Runtime 10 и WebView2 Runtime должны быть установлены.</p>
+        </li>
+        <li>
+          <h3>Запустить и подключить API</h3>
+          <p>Запустите <code>NovaVpn.Client.App.exe</code>, укажите адрес API и войдите. Адрес — только origin: <code>https://</code> с любым хостом; <code>http://</code> разрешён только для <code>127.0.0.1</code>, <code>localhost</code> и <code>[::1]</code>. Путь, query и fragment запрещены; редиректы не выполняются.</p>
+        </li>
+        <li>
+          <h3>Импортировать .conf</h3>
+          <p>Приложение сохраняет файл, в котором уже стоит локальный <code>PrivateKey</code>. Импортируйте его в официальный WireGuard: «Добавить туннель» → «Импорт из файла». Подключение выполняет WireGuard; этот клиент туннелем не управляет. Отзыв профиля на сервере делает сохранённый файл нерабочим, но не удаляет его с диска.</p>
+        </li>
+      </ol>
+      <div class="note">
+        <strong>Живой путь без GUI.</strong> <code>make client-e2e</code> поднимает dev-стенд, создаёт временного
+        администратора, сервер и пользователя, выдаёт профиль, собирает и сохраняет <code>.conf</code>, проверяет отзыв
+        и удаляет за собой временные данные. Пароли передаются только через stdin.
+      </div>
+    </section>
+
+    <section id="privacy">
+      <h2>Приватность и границы</h2>
+      <p class="section-lede">Секреты остаются на машине, а страница получает только те команды, которые перечислены в мосте.</p>
+      <div class="grid grid--2">
+        <div class="card">
+          <span class="card__kicker">Хранение</span>
+          <ul>
+            <li>Пароль не сохраняется и не журналируется.</li>
+            <li>Refresh-токен — DPAPI <code>CurrentUser</code>, энтропия <code>NovaVPN/session/v1</code>.</li>
+            <li>Приватные ключи устройств — DPAPI <code>CurrentUser</code>, энтропия <code>NovaVPN/devices/v1</code>.</li>
+            <li>Access-токен — только в памяти процесса.</li>
+            <li>В журнале — <code>account_id</code> из <code>/me</code>, не email.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Изоляция</span>
+          <ul>
+            <li>Виртуальный origin, без слушающего порта и без локального сервера.</li>
+            <li>Только <code>postMessage</code>; <code>AddHostObjectToScript</code> не используется.</li>
+            <li>Белый список команд; сообщение не больше 64 КиБ, глубина JSON не больше 8.</li>
+            <li>CSP запрещает inline-код, внешние скрипты и любые <code>connect-src</code>.</li>
+            <li>Переходы за пределы origin и новые окна отменяются.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="note">
+        <strong>Текст конфига.</strong> <code>.conf</code> собирается в ядре приложения и уходит прямо в системный диалог
+        сохранения. Он не показывается в интерфейсе, не пишется в журнал, не копируется в буфер обмена и не
+        возвращается странице по мосту.
+      </div>
+    </section>
+
+    <section id="limits">
+      <h2>Чего нет и что не проверено</h2>
+      <p class="section-lede">Список не сокращён: непроверенное не выдаётся за готовое, а неизмеренное — за ноль.</p>
+      <div class="grid grid--2">
+        <div class="card">
+          <span class="card__kicker">Не реализовано</span>
+          <ul>
+            <li>Собственный туннель в клиенте (E-2, после спайка S4)</li>
+            <li>Системная блокировка трафика при обрыве</li>
+            <li>Раздельная маршрутизация по приложениям</li>
+            <li>Установщик, подпись кода и автообновление (E-3)</li>
+            <li>Трей, автозапуск и фоновые службы</li>
+          </ul>
+        </div>
+        <div class="card">
+          <span class="card__kicker">Не подтверждено испытаниями</span>
+          <ul>
+            <li>Импорт сохранённого <code>.conf</code> в официальный WireGuard на этой машине</li>
+            <li>Windows 10 и второй пользователь Windows для DPAPI</li>
+            <li>Клиент против публичного HTTPS API с настоящим сертификатом</li>
+            <li><code>--selftest</code> и Windows-джоба CI на GitHub-раннере</li>
+            <li>Пиксельная отрисовка окна WebView2 без человека</li>
+          </ul>
+        </div>
+      </div>
+      <div class="note">
+        <strong>Где смотреть детали.</strong> Матрица доказательств и <code>not-run</code> —
+        <a href="../testing-status.md">docs/testing-status.md</a>; решение об оболочке —
+        <a href="../adr/0010-windows-client-shell.md">ADR-0010</a>; исходники и тесты —
+        <code>client/</code>. Приватный ключ на сервер не уходит: это одна из причин,
+        по которой <code>.conf</code> собирается локально.
+      </div>
+    </section>
+
+    <footer>
+      <p>NovaVPN, цикл E-1. Страница собрана 2026-11-24. Кадры сняты с заглушки моста, а не с работающего API; секреты в них не публикуются. Туннель поднимает официальный WireGuard из импортированного файла.</p>
+    </footer>
+  </main>
+</div>
+</body>
+</html>
