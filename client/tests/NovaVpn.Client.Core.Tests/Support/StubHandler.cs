@@ -20,6 +20,9 @@ internal sealed class StubHandler : HttpMessageHandler
     public static HttpResponseMessage Json(HttpStatusCode status, string body) =>
         new(status) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
 
+    public static HttpResponseMessage Text(HttpStatusCode status, string body) =>
+        new(status) { Content = new StringContent(body, Encoding.UTF8, "text/plain") };
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
         var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(ct);
